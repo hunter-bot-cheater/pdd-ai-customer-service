@@ -1,0 +1,62 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.exe
+*.spec
+!scripts/*.spec
+browser_data/*
+*.log
+examples/
+logs/
+dist
+build
+.venv
+user_data/
+*.db
+*.db
+config.json
+temp/
+.claude/
+
+# Backup directories
+backup/
+*.backup
+.bak/
+
+# Serena project files
+.serena/
+
+# Temporary and cache files
+temp/
+tmp/
+*.tmp
+*.temp
+test/
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+.DS_Store
+.spec-workflow/
+chroma_db/
+CLAUDE.md
+# CI/CD：忽略 .github/ 下其他内容，但放行 workflows（自动化打包需要）
+.github/*
+!.github/workflows/
+!.github/workflows/**
