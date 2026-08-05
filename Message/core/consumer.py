@@ -98,6 +98,7 @@ class MessageConsumer:
                         metadata['shop_id'] = getattr(kwargs, 'shop_id', None)
                         metadata['user_id'] = getattr(kwargs, 'user_id', None)
                         metadata['from_uid'] = getattr(kwargs, 'from_uid', None)
+                        metadata['shop_name'] = getattr(kwargs, 'shop_name', None)
                 except Exception:
                     pass
                 # 保留用于日志的用户键
