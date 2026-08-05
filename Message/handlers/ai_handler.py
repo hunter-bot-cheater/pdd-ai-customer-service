@@ -9,6 +9,8 @@ from bridge.context import Context, ContextType
 from .base import BaseHandler
 from .preprocessor import MessagePreprocessor
 from Agent.bot import Bot
+from core.session_state import SessionState
+from Agent.CustomerAgent.tools.move_conversation import transfer_conversation, TransferConversationParams
 
 
 class AIReplyHandler(BaseHandler):
@@ -41,6 +43,16 @@ class AIReplyHandler(BaseHandler):
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """处理AI回复（支持分句发送）"""
         try:
+            # ===== 0. 转人工状态检测：有效期内禁止 AI 抢答 =====
+            shop_id = metadata.get('shop_id')
+            from_uid = metadata.get('from_uid')
+            if shop_id and from_uid:
+                session_key = f"{shop_id}:{from_uid}"
+                if SessionState().is_handoff(session_key):
+                    self.logger.info(f"会话已在转人工状态，重新触发转人工流程: session_key={session_key}")
+                    await self._retrigger_handoff(context, metadata)
+                    return True  # 跳过 AI 回复
+
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)
 
@@ -90,6 +102,31 @@ class AIReplyHandler(BaseHandler):
         except Exception as e:
             self.logger.error(f"AI回复处理失败: {e}")
             return await self._handle_fallback(context, metadata)
+
+    async def _retrigger_handoff(self, context: Context, metadata: Dict[str, Any]) -> None:
+        """会话处于转人工有效期内：再次触发转人工并通知人工客服"""
+        try:
+            shop_id = metadata.get('shop_id')
+            user_id = metadata.get('user_id')
+            from_uid = metadata.get('from_uid')
+            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', '') or ""
+
+            params = TransferConversationParams(
+                shop_id=str(shop_id),
+                user_id=str(user_id),
+                recipient_uid=str(from_uid),
+                shop_name=str(shop_name),
+            )
+            result = await asyncio.to_thread(
+                transfer_conversation,
+                params,
+                "有效期内再次发消息",
+                True,
+                context.content or "",
+            )
+            self.logger.info(f"重新触发转人工结果: {result}")
+        except Exception as e:
+            self.logger.error(f"重新触发转人工失败: {e}")
 
     async def _get_ai_reply(self, query: str, context: Context) -> Optional[str]:
         """获取AI回复"""

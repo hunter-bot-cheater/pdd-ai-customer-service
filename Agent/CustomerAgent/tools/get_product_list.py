@@ -21,7 +21,7 @@ class GetShopProductsParams(BaseModel):
 
 @agent_tool(
     name="get_shop_products",
-    description="获取店铺商品列表，用于客服主动推荐。",
+    description="获取店铺商品列表（含价格、库存），用于客服主动推荐及库存查询。",
     param_model=GetShopProductsParams,
 )
 def get_shop_products(params: GetShopProductsParams) -> str:
@@ -76,10 +76,13 @@ def _format_products_output(products, total, page):
         goods_id = product.get("goods_id", "未知ID")
         goods_name = product.get("goods_name", "未命名商品")
         price = product.get("price", "")
+        quantity = product.get("quantity")
 
         output += f"商品名称: {goods_name}\n商品ID: {goods_id}\n"
         if price:
             output += f"价格: {price} 元\n"
+        if quantity is not None:
+            output += f"库存: {quantity} 件\n"
         output += "\n"
 
     return output

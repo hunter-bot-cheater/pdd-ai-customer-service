@@ -8,9 +8,17 @@ from .base import BaseHandler
 from database.db_manager import db_manager
 from utils.logger_loguru import get_logger
 from bridge.sender import get_sender
+from Agent.CustomerAgent.tools.move_conversation import transfer_conversation, TransferConversationParams
 
 class KeywordDetectionHandler(BaseHandler):
     """关键词检测处理器 - 检测转人工关键词并触发转人工流程"""
+
+    # 售后关键词：命中后强制转人工，避免 AI 回复敏感问题
+    AFTER_SALE_KEYWORDS = [
+        "退货", "退款", "售后", "质量问题", "破损", "漏发", "少发",
+        "不满意", "投诉", "赔偿", "换货", "维修", "差评", "给差评",
+        "假货", "质量差",
+    ]
 
     def __init__(self):
         super().__init__("KeywordDetectionHandler")
@@ -18,7 +26,7 @@ class KeywordDetectionHandler(BaseHandler):
         self.keywords = self._load_keywords()
 
         # 记录加载的关键词数量
-        self.logger.info(f"关键词检测处理器初始化完成，加载了 {len(self.keywords)} 个关键词")
+        self.logger.info(f"关键词检测处理器初始化完成，加载了 {len(self.keywords)} 个关键词，{len(self.AFTER_SALE_KEYWORDS)} 个售后关键词")
 
     def _load_keywords(self):
         """从数据库加载关键词"""
@@ -52,10 +60,16 @@ class KeywordDetectionHandler(BaseHandler):
         # 将消息内容转换为小写进行检测
         content_lower = context.content.lower()
 
-        # 检查是否包含任何关键词
+        # 检查是否包含任何转人工关键词
         for keyword in self.keywords:
             if keyword in content_lower:
-                self.logger.debug(f"检测到关键词: '{keyword}' 在消息: '{context.content}'")
+                self.logger.debug(f"检测到转人工关键词: '{keyword}' 在消息: '{context.content}'")
+                return True
+
+        # 检查是否包含任何售后关键词
+        for keyword in self.AFTER_SALE_KEYWORDS:
+            if keyword in content_lower:
+                self.logger.debug(f"检测到售后关键词: '{keyword}' 在消息: '{context.content}'")
                 return True
 
         return False
@@ -63,48 +77,50 @@ class KeywordDetectionHandler(BaseHandler):
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """转接到人工客服"""
         try:
-            kwargs = context.kwargs
-            shop_id = getattr(kwargs, 'shop_id', None) or (kwargs.get('shop_id') if isinstance(kwargs, dict) else None)
-            user_id = getattr(kwargs, 'user_id', None) or (kwargs.get('user_id') if isinstance(kwargs, dict) else None)
-            from_uid = getattr(kwargs, 'from_uid', None) or (kwargs.get('from_uid') if isinstance(kwargs, dict) else None)
-            
+            shop_id = metadata.get('shop_id')
+            user_id = metadata.get('user_id')
+            from_uid = metadata.get('from_uid')
+            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', None) or ""
+
             if not all([shop_id, user_id, from_uid]):
                 return False
-            
-            sender = get_sender(context.channel_type)
-            if not sender:
-                self.logger.warning(f"无可用发送器: channel_type={context.channel_type}")
-                return False
 
-            # 获取可用的客服列表（同步 HTTP，放工作线程）
-            cs_list = await asyncio.to_thread(sender.get_cs_list, shop_id, user_id)
-            my_cs_uid = f"cs_{shop_id}_{user_id}"
+            content = context.content or ""
+            # 售后关键词：强制转人工，即使失败也拦截，避免 AI 回复敏感问题
+            is_after_sale = any(kw in content for kw in self.AFTER_SALE_KEYWORDS)
+            reason = "售后关键词触发转人工" if is_after_sale else "用户主动转人工"
 
-            if cs_list and isinstance(cs_list, dict):
-                # 过滤掉自己，不转接给自己
-                available_cs_uids = [uid for uid in cs_list.keys() if uid != my_cs_uid]
+            params = TransferConversationParams(
+                shop_id=str(shop_id),
+                user_id=str(user_id),
+                recipient_uid=str(from_uid),
+                shop_name=str(shop_name),
+            )
 
-                if available_cs_uids:
-                    # 选择第一个可用的客服
-                    cs_uid = available_cs_uids[0]
-                    target_cs = cs_list[cs_uid]
-                    cs_name = target_cs.get('username', '客服')
+            try:
+                result = await asyncio.to_thread(transfer_conversation, params, reason, True, content)
+            except Exception as e:
+                self.logger.error(f"调用转人工工具异常: {e}")
+                return True if is_after_sale else False
 
-                    # 转移会话（同步 HTTP，放工作线程）
-                    transfer_result = await asyncio.to_thread(sender.transfer_to_cs, shop_id, user_id, from_uid, cs_uid)
+            if "会话转接成功" in result:
+                self.logger.info(f"会话已成功转接人工: {result}")
+                return True
 
-                    if transfer_result and transfer_result.get('success'):
+            self.logger.error(f"会话转接失败: {result}")
+            # 无可用客服时，友好告知用户（保持原有体验）
+            if "无可用" in result or "无法获取客服列表" in result:
+                try:
+                    sender = get_sender(context.channel_type)
+                    if sender:
+                        await asyncio.to_thread(
+                            sender.send_text, shop_id, user_id, from_uid,
+                            "抱歉，当前没有其他客服在线，请您稍后再试。",
+                        )
+                except Exception as e:
+                    self.logger.error(f"发送无客服提示失败: {e}")
+            return True if is_after_sale else False
 
-                        self.logger.info(f"会话已成功转接给 {cs_name} ({cs_uid})")
-                        return True
-                    else:
-                        self.logger.error("会话转接失败")
-                else:
-                    self.logger.warning("没有其他可用的客服进行转接")
-                    await asyncio.to_thread(sender.send_text, shop_id, user_id, from_uid, "抱歉，当前没有其他客服在线，请您稍后再试。")
-            
-            return False
-            
         except Exception as e:
             self.logger.error(f"客服转接处理失败: {e}")
             return False
