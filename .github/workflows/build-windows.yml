@@ -17,15 +17,20 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # GitHub Windows runners may default Python stdout/stderr to cp1252.
+      # Keep CI output compatible with the repository's UTF-8 messages.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0  # 拉全量历史与 tag，git describe 读版本号需要
 
       - name: 安装 uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
 
@@ -47,7 +52,7 @@ jobs:
           APP_VERSION: ${{ github.ref_name }}
 
       - name: 上传安装程序 Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Agent-Customer-Setup
           path: dist\installer\*.exe
@@ -55,7 +60,7 @@ jobs:
 
       - name: 打标签时发布 Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist\installer\*.exe
           generate_release_notes: true
