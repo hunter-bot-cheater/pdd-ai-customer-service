@@ -1,14 +1,15 @@
-"""
-简化的消息消费者实现
-移除复杂的用户隔离机制，保持核心功能
-"""
+"""Bounded asynchronous message consumers."""
+
+from __future__ import annotations
 
 import asyncio
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
+
+from bridge.context import Context, context_scope
 from utils.logger_loguru import get_logger
-from bridge.context import Context
-from .queue import queue_manager
+
 from .handlers import MessageHandler
+from .queue import queue_manager
 from ..models.queue_models import MessageWrapper
 
 
@@ -16,88 +17,112 @@ logger = get_logger(__name__)
 
 
 class MessageConsumer:
-    """消息消费者 - 简化版"""
+    """Consume a queue with a fixed number of workers.
 
-    def __init__(self, queue_name: str, max_concurrent: int = 10):
+    The previous implementation spawned one task per dequeued message.  A
+    fixed worker pool makes the queue's max size a real back-pressure limit and
+    keeps shutdown deterministic.
+    """
+
+    def __init__(
+        self,
+        queue_name: str,
+        max_concurrent: int = 10,
+        queue_manager_instance=None,
+    ):
         self.queue_name = queue_name
-        self.max_concurrent = max_concurrent
+        self.max_concurrent = max(1, int(max_concurrent))
         self.handlers: List[MessageHandler] = []
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
         self.running = False
-        self.consumer_task = None
-        self._tasks: set = set()
+        self.consumer_task: Optional[asyncio.Task] = None
+        self.consumer_tasks: List[asyncio.Task] = []
+        self._tasks: set[asyncio.Task] = set()
+        self.queue_manager = queue_manager_instance or queue_manager
         self.logger = get_logger(f"Consumer.{queue_name}")
 
-    def add_handler(self, handler: MessageHandler):
-        """添加处理器"""
+    def add_handler(self, handler: MessageHandler) -> None:
         self.handlers.append(handler)
         self.logger.debug(f"Added handler: {handler.__class__.__name__}")
 
     def is_running(self) -> bool:
-        """检查消费者是否正在运行"""
         return self.running
 
-    async def start(self):
-        """启动消费者"""
+    async def start(self) -> None:
         if self.running:
             self.logger.warning(f"Consumer {self.queue_name} is already running")
             return
 
         self.running = True
-        self.consumer_task = asyncio.create_task(self._consume_loop())
+        self.consumer_tasks = [
+            asyncio.create_task(self._consume_loop(worker_id))
+            for worker_id in range(self.max_concurrent)
+        ]
+        self.consumer_task = self.consumer_tasks[0]
         self.logger.info(f"Consumer {self.queue_name} started")
 
-    async def _consume_loop(self):
-        """消费循环"""
-        queue = queue_manager.get_or_create_queue(self.queue_name)
-
+    async def _consume_loop(self, worker_id: int = 0) -> None:
+        queue = self.queue_manager.get_or_create_queue(self.queue_name)
         try:
             while self.running:
                 try:
                     wrapper = await queue.get(timeout=1.0)
                     if wrapper:
-                        # 使用信号量控制并发数，跟踪任务以便优雅停止
-                        task = asyncio.create_task(self._process_message(wrapper))
-                        self._tasks.add(task)
-                        task.add_done_callback(self._tasks.discard)
-                except Exception as e:
-                    self.logger.error(f"Consumer error: {e}")
+                        await self._process_message(wrapper)
+                    elif queue.is_closed():
+                        self.running = False
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.error(
+                        f"Consumer worker {worker_id} error: "
+                        f"error_type={type(exc).__name__}"
+                    )
                     await asyncio.sleep(0.1)
         finally:
-            self.logger.info(f"Consumer {self.queue_name} stopped")
+            self.logger.debug(
+                f"Consumer worker {worker_id} stopped: {self.queue_name}"
+            )
 
-    async def stop(self):
-        """停止消费者"""
+    async def stop(self, drain_timeout: float = 5.0) -> None:
+        """Stop workers cooperatively, with a bounded drain deadline."""
         self.running = False
-
-        # 取消消费任务
-        if hasattr(self, 'consumer_task'):
-            self.consumer_task.cancel()
+        tasks = [task for task in self.consumer_tasks if task and not task.done()]
+        if tasks:
             try:
-                await self.consumer_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=max(0.0, float(drain_timeout)),
+                )
+            except asyncio.TimeoutError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        self.consumer_tasks.clear()
+        self.consumer_task = None
 
-        # 等待所有正在处理的任务完成
-        if self._tasks:
-            pending = [t for t in self._tasks if not t.done()]
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            self._tasks.clear()
+        pending = [task for task in self._tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._tasks.clear()
 
-    async def _process_message(self, wrapper: MessageWrapper):
-        """处理单个消息"""
+    async def _process_message(self, wrapper: MessageWrapper) -> None:
         async with self.semaphore:
             try:
                 processed = False
                 metadata = wrapper.to_metadata()
-                # 追加渠道上下文到metadata，供发送使用
+                scope = context_scope(wrapper.context)
+                metadata.update(scope)
+                # Preserve the legacy sender field from the trusted scope.
+                metadata["from_uid"] = scope["recipient_uid"]
+                # context_scope 不含 shop_name，补充写入供发送/通知使用
                 try:
                     kwargs = getattr(wrapper.context, 'kwargs', None)
                     if kwargs:
-                        metadata['shop_id'] = getattr(kwargs, 'shop_id', None)
-                        metadata['user_id'] = getattr(kwargs, 'user_id', None)
-                        metadata['from_uid'] = getattr(kwargs, 'from_uid', None)
                         metadata['shop_name'] = getattr(kwargs, 'shop_name', None)
                 except Exception:
                     pass
@@ -110,91 +135,92 @@ class MessageConsumer:
                             success = await handler.handle(wrapper.context, metadata)
                             if success:
                                 processed = True
-                                self.logger.debug(f"Message {wrapper.message_id} handled by {handler.__class__.__name__}")
+                                self.logger.debug(
+                                    f"Message {wrapper.message_id} handled by "
+                                    f"{handler.__class__.__name__}"
+                                )
                                 break
-                    except Exception as e:
-                        self.logger.error(f"Handler {handler.__class__.__name__} error: {e}")
-                        # 尝试下一个处理器
+                    except Exception as exc:
+                        self.logger.error(
+                            f"Handler {handler.__class__.__name__} error: "
+                            f"error_type={type(exc).__name__}"
+                        )
                         continue
 
                 if not processed:
-                    self.logger.warning(f"Message {wrapper.message_id} not processed by any handler")
-
-            except Exception as e:
-                self.logger.error(f"Failed to process message {wrapper.message_id}: {e}")
+                    self.logger.warning(
+                        f"Message {wrapper.message_id} not processed by any handler"
+                    )
+            except Exception as exc:
+                self.logger.error(
+                    f"Failed to process message {wrapper.message_id}: "
+                    f"error_type={type(exc).__name__}"
+                )
 
     def _extract_user_id(self, context: Context) -> str:
-        """提取用户ID"""
-        try:
-            from_uid = context.kwargs.from_uid if hasattr(context, 'kwargs') else None
-            channel = context.channel_type
-
-            # 处理可能的None值
-            if from_uid is None:
-                from_uid = "unknown"
-            if channel is None:
-                channel = "unknown"
-
-            # 处理channel可能是字符串或枚举对象的情况
-            if hasattr(channel, 'value'):
-                channel_str = str(channel.value)
-            else:
-                channel_str = str(channel)
-
-            return f"{channel_str}_{from_uid}"
-        except Exception as e:
-            self.logger.error(f"Failed to extract user ID: {e}")
-            return "unknown_unknown"
+        scope = context_scope(context)
+        return f"{scope['account_key']}|{scope['recipient_uid'] or 'unknown'}"
 
 
 class MessageConsumerManager:
-    """消息消费者管理器"""
+    """Registry for consumers belonging to one queue manager/loop."""
 
-    def __init__(self):
+    def __init__(self, queue_manager_instance=None):
         self._consumers: Dict[str, MessageConsumer] = {}
         self.logger = get_logger("ConsumerManager")
+        self.queue_manager = queue_manager_instance or queue_manager
 
-    def create_consumer(self, queue_name: str, max_concurrent: int = 10) -> MessageConsumer:
-        """创建消费者"""
-        if queue_name in self._consumers:
-            self.logger.warning(f"Consumer {queue_name} already exists")
-            return self._consumers[queue_name]
+    def create_consumer(
+        self,
+        queue_name: str,
+        max_concurrent: int = 10,
+    ) -> MessageConsumer:
+        existing = self._consumers.get(queue_name)
+        if existing is not None:
+            if existing.is_running():
+                self.logger.warning(f"Consumer {queue_name} already exists")
+                return existing
+            self._consumers.pop(queue_name, None)
 
-        consumer = MessageConsumer(queue_name, max_concurrent)
+        consumer = MessageConsumer(
+            queue_name,
+            max_concurrent,
+            queue_manager_instance=self.queue_manager,
+        )
         self._consumers[queue_name] = consumer
         self.logger.info(f"Created consumer: {queue_name}")
         return consumer
 
-    def get_consumer(self, queue_name: str) -> MessageConsumer:
-        """获取消费者"""
+    def remove_consumer(self, queue_name: str) -> Optional[MessageConsumer]:
+        return self._consumers.pop(queue_name, None)
+
+    def get_consumer(self, queue_name: str) -> Optional[MessageConsumer]:
         return self._consumers.get(queue_name)
 
-    async def start_consumer(self, queue_name: str):
-        """启动消费者"""
+    async def start_consumer(self, queue_name: str) -> None:
         consumer = self.get_consumer(queue_name)
         if consumer:
             await consumer.start()
         else:
             self.logger.error(f"Consumer {queue_name} not found")
 
-    async def stop_consumer(self, queue_name: str):
-        """停止消费者"""
+    async def stop_consumer(self, queue_name: str, remove: bool = False) -> None:
         consumer = self.get_consumer(queue_name)
         if consumer:
             await consumer.stop()
+            if remove:
+                self.remove_consumer(queue_name)
         else:
-            self.logger.error(f"Consumer {queue_name} not found")
+            self.logger.debug(f"Consumer {queue_name} not found")
 
     def list_consumers(self) -> List[str]:
-        """列出所有消费者"""
         return list(self._consumers.keys())
 
-    async def stop_all(self):
-        """停止所有消费者"""
-        for consumer in self._consumers.values():
+    async def stop_all(self) -> None:
+        for consumer in list(self._consumers.values()):
             await consumer.stop()
+        self._consumers.clear()
         self.logger.info("All consumers stopped")
 
 
-# 全局消费者管理器实例
 message_consumer_manager = MessageConsumerManager()

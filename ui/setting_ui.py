@@ -370,7 +370,7 @@ class SettingUI(QFrame):
             self.logger.info("配置加载成功")
 
         except Exception as e:
-            self.logger.error(f"加载配置失败: {e}")
+            self.logger.error(f"加载配置失败: error_type={type(e).__name__}")
             QMessageBox.warning(self, "加载失败", f"加载配置失败：{str(e)}")
             self._loadDefaultConfig()
 
@@ -437,7 +437,7 @@ class SettingUI(QFrame):
                 "prompt": prompt_config,
                 "business_hours": business_config.get("businessHours", {"start": "08:00", "end": "23:00"}),
                 # 保持与旧配置的兼容性
-                "db_path": config.get("db_path", "")
+                "db_path": config.get("db_path") or "./temp/channel_shop.db"
             }
 
             # 验证 LLM 必填项
@@ -452,8 +452,8 @@ class SettingUI(QFrame):
             start_time = self.business_hours_card.start_time_picker.getTime()
             end_time = self.business_hours_card.end_time_picker.getTime()
 
-            if start_time >= end_time:
-                QMessageBox.warning(self, "时间设置错误", "开始时间必须早于结束时间！")
+            if start_time == end_time:
+                QMessageBox.warning(self, "时间设置错误", "开始时间和结束时间不能相同！")
                 return
 
             # 使用config模块保存配置
@@ -473,7 +473,7 @@ class SettingUI(QFrame):
             )
 
         except Exception as e:
-            self.logger.error(f"保存配置失败: {e}")
+            self.logger.error(f"保存配置失败: error_type={type(e).__name__}")
             QMessageBox.critical(self, "保存失败", f"保存配置时发生错误：{str(e)}")
 
     def onResetConfig(self):
@@ -503,7 +503,7 @@ class SettingUI(QFrame):
                     parent=self
                 )
             except Exception as e:
-                self.logger.error(f"重置配置失败: {e}")
+                self.logger.error(f"重置配置失败: error_type={type(e).__name__}")
                 QMessageBox.critical(self, "重置失败", f"重置配置失败：{str(e)}")
 
 

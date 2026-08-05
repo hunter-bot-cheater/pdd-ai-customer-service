@@ -31,13 +31,22 @@ _VALIDATION_HEADERS = {
 }
 
 
+def _login_result_matches_account(result, shop_id: str, user_id: str) -> bool:
+    """Reject cookies resolved from a browser session belonging to another account."""
+    return (
+        isinstance(result, dict)
+        and str(result.get("shop_id")) == str(shop_id)
+        and str(result.get("user_id")) == str(user_id)
+    )
+
+
 def check_cookies_valid(
     channel_name: str,
     shop_id: str,
     user_id: str,
     cookies: dict,
     timeout: float = 15.0,
-) -> bool:
+) -> Optional[bool]:
     """
     通过轻量级 HTTP 请求验证 cookie 是否有效。
 
@@ -52,8 +61,9 @@ def check_cookies_valid(
         timeout: 请求超时（秒）
 
     Returns:
-        True: cookie 有效（或网络错误无法确定时保守返回 True）
-        False: cookie 已过期
+        True: 服务端明确确认 cookie 有效
+        False: 服务端明确确认 cookie 已过期
+        None: 网络或响应异常，状态未知（由调用方决定是否重试）
     """
     url = "https://mms.pinduoduo.com/chats/getToken"
     payload = {'version': '3'}
@@ -74,22 +84,26 @@ def check_cookies_valid(
                    '会话已过期' in str(data.get('error_msg', '')):
                     logger.warning(f"Cookie 验证失败: 会话已过期 ({channel_name}:{shop_id}:{user_id})")
                     return False
+                if isinstance(data, dict) and data.get('error_code') in (None, 0):
+                    return True
+                logger.debug("Cookie 验证: 服务端返回未知状态")
+                return None
             except json.JSONDecodeError:
-                logger.debug(f"Cookie 验证: 响应非 JSON，视为有效")
+                logger.debug("Cookie 验证: 响应非 JSON，状态未知")
+                return None
         else:
-            logger.debug(f"Cookie 验证: HTTP {response.status_code}，视为有效")
-
-        return True
+            logger.debug(f"Cookie 验证: HTTP {response.status_code}，状态未知")
+            return None
 
     except requests.ConnectionError:
-        logger.debug(f"Cookie 验证: 网络连接失败，保守视为有效")
-        return True
+        logger.debug("Cookie 验证: 网络连接失败，状态未知")
+        return None
     except requests.Timeout:
-        logger.debug(f"Cookie 验证: 请求超时，保守视为有效")
-        return True
+        logger.debug("Cookie 验证: 请求超时，状态未知")
+        return None
     except Exception as e:
-        logger.debug(f"Cookie 验证: 异常 {e}，保守视为有效")
-        return True
+        logger.debug(f"Cookie 验证: 异常 {type(e).__name__}，状态未知")
+        return None
 
 
 class ReloginGuard:
@@ -183,10 +197,17 @@ def perform_relogin(
         # 阶段 1: 刷新 cookie（headless，利用浏览器持久化会话）
         logger.info(f"尝试刷新 cookie（无需重新登录）: {username}")
         try:
+            profile_scope = f"{channel_name}:{shop_id}:{user_id}"
             refresh_result = run_async_in_thread(
-                pdd_login_module.refresh_pdd_cookies(username, password),
+                pdd_login_module.refresh_pdd_cookies(
+                    username, password, profile_scope=profile_scope
+                ),
                 timeout=60.0,
             )
+            if refresh_result and isinstance(refresh_result, dict):
+                if not _login_result_matches_account(refresh_result, shop_id, user_id):
+                    logger.error("Cookie 刷新返回的账号身份不匹配，已拒绝应用")
+                    refresh_result = None
             if refresh_result and isinstance(refresh_result, dict):
                 new_cookies = refresh_result.get('cookies')
                 if new_cookies:
@@ -197,7 +218,9 @@ def perform_relogin(
                     relogin_guard.release(channel_name, shop_id, user_id, success=True)
                     return True
         except Exception as e:
-            logger.warning(f"Cookie 刷新异常: {username}, {e}")
+            logger.warning(
+                f"Cookie 刷新异常: {username}, error_type={type(e).__name__}"
+            )
 
         # 阶段 2: 完整重新登录
         if not password:
@@ -208,9 +231,18 @@ def perform_relogin(
         logger.info(f"回退到完整重新登录 (headless={headless_fallback}): {username}")
         try:
             login_result = run_async_in_thread(
-                pdd_login_module.login_pdd(username, password, headless_fallback),
+                pdd_login_module.login_pdd(
+                    username,
+                    password,
+                    headless_fallback,
+                    profile_scope=f"{channel_name}:{shop_id}:{user_id}",
+                ),
                 timeout=60.0,
             )
+            if login_result and isinstance(login_result, dict):
+                if not _login_result_matches_account(login_result, shop_id, user_id):
+                    logger.error("完整登录返回的账号身份不匹配，已拒绝应用")
+                    login_result = None
             if login_result and isinstance(login_result, dict):
                 new_cookies = login_result.get('cookies')
                 if new_cookies:
@@ -221,14 +253,18 @@ def perform_relogin(
                     relogin_guard.release(channel_name, shop_id, user_id, success=True)
                     return True
         except Exception as e:
-            logger.error(f"完整重新登录异常: {username}, {e}")
+            logger.error(
+                f"完整重新登录异常: {username}, error_type={type(e).__name__}"
+            )
 
         logger.error(f"重新登录失败: {username}")
         relogin_guard.release(channel_name, shop_id, user_id, success=False)
         return False
 
     except Exception as e:
-        logger.error(f"重登流程异常: {username}, {e}")
+        logger.error(
+            f"重登流程异常: {username}, error_type={type(e).__name__}"
+        )
         relogin_guard.release(channel_name, shop_id, user_id, success=False)
         return False
 

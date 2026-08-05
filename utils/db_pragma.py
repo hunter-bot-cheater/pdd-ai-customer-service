@@ -22,5 +22,6 @@ def setup_sqlite_pragmas(engine: Engine) -> None:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()

@@ -55,9 +55,9 @@ class BaseService(ABC):
         error_msg = f"{self.__class__.__name__}"
         if context:
             error_msg += f" - {context}"
-        error_msg += f": {str(e)}"
+        error_msg += f": error_type={type(e).__name__}"
 
-        self.logger.error(error_msg, exc_info=True)
+        self.logger.error(error_msg)
         return False
 
     def validate_state(self, operation: str = "") -> bool:

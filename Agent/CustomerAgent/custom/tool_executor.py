@@ -1,28 +1,34 @@
-"""
-工具执行器模块
+"""Bounded tool execution with serialized side effects."""
 
-负责并行执行 Agent 工具调用。
-"""
 from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict, List
 
 from utils.logger_loguru import get_logger
-from Agent.CustomerAgent.custom.tool_decorator import execute_tool
+from Agent.CustomerAgent.custom.tool_decorator import (
+    execute_tool,
+    get_tool_entry,
+)
+
 
 logger = get_logger("ToolExecutor")
 
+# Only these audited tools are allowed to run concurrently.  New tools are
+# serialized by default until their side-effect behavior is reviewed.
+READ_ONLY_TOOL_NAMES = {
+    "get_shop_products",
+    "get_product_knowledge",
+    "search_customer_service_knowledge",
+}
+
 
 class ToolResult:
-    """工具执行结果"""
-
     def __init__(self, tool_call_id: str, content: str):
         self.tool_call_id = tool_call_id
         self.content = content
 
     def to_dict(self) -> Dict[str, Any]:
-        """转换为 LLM 消息格式的字典"""
         return {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
@@ -31,66 +37,59 @@ class ToolResult:
 
 
 class ToolExecutor:
-    """工具执行器"""
-    pass
-
     async def execute_parallel(
         self,
         tool_calls: List[Any],
         dependencies: Dict[str, Any],
     ) -> List[ToolResult]:
-        """
-        并行执行多个工具调用
-
-        Args:
-            tool_calls: 工具调用列表
-            dependencies: 依赖字典
-
-        Returns:
-            工具执行结果列表（按原始顺序）
-        """
         if not tool_calls:
             return []
 
-        logger.debug(f"开始并行执行 {len(tool_calls)} 个工具")
-
-        # 构建任务列表
-        tasks: List[Any] = []
-        for tc in tool_calls:
-            task = asyncio.get_event_loop().run_in_executor(
-                None,
-                execute_tool,
-                tc.function.name,
-                tc.function.arguments,
-                dependencies,
-            )
-            tasks.append((tc.id, task))
-
-        # 等待所有任务完成
         results: List[ToolResult] = []
-        for tool_call_id, task in tasks:
+
+        async def run(call: Any) -> ToolResult:
             try:
-                content = await task
-                results.append(ToolResult(tool_call_id, content))
-                logger.debug(f"工具执行完成: {tool_call_id}")
-            except Exception as e:
-                logger.error(f"工具执行失败: {tool_call_id}, error: {e}")
-                results.append(ToolResult(tool_call_id, f"[工具执行错误: {e}]"))
+                content = await asyncio.to_thread(
+                    execute_tool,
+                    call.function.name,
+                    call.function.arguments,
+                    dependencies,
+                )
+                return ToolResult(call.id, content)
+            except Exception as exc:
+                logger.error(
+                    f"tool execution failed: {call.function.name}: {type(exc).__name__}"
+                )
+                return ToolResult(call.id, "[工具执行失败，请稍后重试]")
 
-        # 按原始顺序排列
-        tool_ids = [tc.id for tc in tool_calls]
-        results.sort(key=lambda r: tool_ids.index(r.tool_call_id))
+        # Execute contiguous read-only calls concurrently, but keep side
+        # effects in the exact order emitted by the model.  This avoids a
+        # later transfer/send overtaking an earlier lookup or another send.
+        readonly_batch = []
 
+        async def flush_readonly_batch() -> None:
+            if readonly_batch:
+                results.extend(
+                    await asyncio.gather(*(run(call) for call in readonly_batch))
+                )
+                readonly_batch.clear()
+
+        for call in tool_calls:
+            entry = get_tool_entry(call.function.name)
+            if (
+                entry is None
+                or entry.side_effect
+                or call.function.name not in READ_ONLY_TOOL_NAMES
+            ):
+                await flush_readonly_batch()
+                results.append(await run(call))
+            else:
+                readonly_batch.append(call)
+        await flush_readonly_batch()
+
+        order = {call.id: index for index, call in enumerate(tool_calls)}
+        results.sort(key=lambda result: order.get(result.tool_call_id, 0))
         return results
 
     def results_to_messages(self, results: List[ToolResult]) -> List[Dict[str, str]]:
-        """
-        将工具执行结果转换为 LLM 消息格式
-
-        Args:
-            results: 工具执行结果列表
-
-        Returns:
-            LLM 消息格式的结果列表
-        """
         return [result.to_dict() for result in results]

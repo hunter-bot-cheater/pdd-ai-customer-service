@@ -5,7 +5,7 @@ Message模块重构版入口
 
 # 核心模块 - 新的简化实现
 from .core.queue import SimpleMessageQueue, queue_manager
-from .core.consumer import MessageConsumer, message_consumer_manager
+from .core.consumer import MessageConsumer, MessageConsumerManager, message_consumer_manager
 from .core.handlers import MessageHandler, TypeBasedHandler, ChannelBasedHandler, CatchAllHandler
 
 # 模型
@@ -110,30 +110,62 @@ def create_comprehensive_handlers(bot=None) -> list:
 MessageQueue = SimpleMessageQueue
 MessageQueueManager = QueueManager
 
-# 关键词检测处理器缓存（避免每次实例化都查 DB）
-_cached_keyword_handler = None
+# Keyword definitions are global configuration, but handler instances are
+# scoped by business-hours configuration so accounts cannot mutate each
+# other's runtime routing state.
+_cached_keyword_handlers = {}
 
 
-def _get_keyword_handler():
+def _get_keyword_handler(business_hours=None):
     """获取或创建缓存的关键词检测处理器"""
-    global _cached_keyword_handler
-    if _cached_keyword_handler is None:
+    global _cached_keyword_handlers
+    if isinstance(business_hours, dict):
+        cache_key = (
+            str(business_hours.get("start", "08:00")),
+            str(business_hours.get("end", "23:00")),
+        )
+    else:
+        cache_key = ("08:00", "23:00")
+    if cache_key not in _cached_keyword_handlers:
         try:
             from .handlers.keyword_handler import KeywordDetectionHandler
-            _cached_keyword_handler = KeywordDetectionHandler()
+            _cached_keyword_handlers[cache_key] = KeywordDetectionHandler(
+                business_hours=dict(business_hours) if isinstance(business_hours, dict) else None
+            )
         except ImportError as e:
             from utils.logger_loguru import get_logger
-            get_logger("handler_chain").warning(f"关键词检测处理器导入失败: {e}")
-    return _cached_keyword_handler
+            get_logger("handler_chain").warning(
+                f"关键词检测处理器导入失败: error_type={type(e).__name__}"
+            )
+            return None
+    return _cached_keyword_handlers.get(cache_key)
+
+
+def __getattr__(name):
+    """Lazily expose the keyword handler without eager DB imports."""
+    if name == "KeywordDetectionHandler":
+        from .handlers.keyword_handler import KeywordDetectionHandler
+        return KeywordDetectionHandler
+    raise AttributeError(name)
+
+
+def reload_keywords() -> None:
+    """Reload the cached keyword handler after keyword CRUD operations."""
+    for keyword_handler in list(_cached_keyword_handlers.values()):
+        keyword_handler.reload_keywords()
 
 
 # 提供兼容的handler_chain函数实现
-def handler_chain(use_ai=True, businessHours=None, bot=None):
+def handler_chain(use_ai=True, businessHours=None, bot=None, business_hours=None):
     """简化版处理器链创建函数 - 包含关键词检测"""
     handlers = []
+    if business_hours is None:
+        business_hours = businessHours
 
     # 1. 首先检查关键词（最高优先级，缓存实例避免重复 DB 查询）
-    keyword_handler = _get_keyword_handler()
+    keyword_handler = _get_keyword_handler(business_hours)
+    if keyword_handler is not None and business_hours is not None:
+        keyword_handler.business_hours = dict(business_hours)
     if keyword_handler is not None:
         handlers.append(keyword_handler)
 
@@ -192,5 +224,6 @@ __all__ = [
     'create_ai_handler',
     'create_simple_handlers',
     'create_comprehensive_handlers',
-    'handler_chain'  # 提供兼容的handler_chain函数
+    'handler_chain',
+    'reload_keywords',
 ]

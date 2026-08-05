@@ -5,6 +5,7 @@
 从拼多多API拉取商品列表，调用多模态LLM分析提取产品知识存入知识库。
 """
 import asyncio
+import inspect
 import threading
 from typing import Optional, Callable, List, Dict, Any
 from dataclasses import dataclass
@@ -97,9 +98,9 @@ class ProductSyncService:
         logger.info("=== 第一阶段：开始抓取商品列表 ===")
 
         # 第一页获取总数量
-        first_page = pm.get_product_list(page=1, size=20)
+        first_page = await asyncio.to_thread(pm.get_product_list, page=1, size=20)
         if not first_page["success"]:
-            logger.error(f"获取商品列表失败: {first_page.get('error_msg')}")
+            logger.error("获取商品列表失败: provider_error=true")
             progress = SyncProgress(
                 total=0, current=0, success=0, failed=0, current_goods_name="",
                 phase="fetching"
@@ -129,9 +130,13 @@ class ProductSyncService:
                 logger.info("同步已被用户取消")
                 break
 
-            page_result = pm.get_product_list(page=current_page, size=50)
+            page_result = await asyncio.to_thread(
+                pm.get_product_list, page=current_page, size=50
+            )
             if not page_result["success"]:
-                logger.error(f"获取第 {current_page} 页失败: {page_result.get('error_msg')}")
+                logger.error(
+                    f"获取第 {current_page} 页失败: provider_error=true"
+                )
                 break
 
             products = page_result["products"]
@@ -163,7 +168,11 @@ class ProductSyncService:
             filtered_products: List[Dict[str, Any]] = []
             for p in all_products:
                 goods_id = p.get("goods_id")
-                existing = self.knowledge_service.get_product_by_goods_id(shop_db_id, goods_id)
+                existing = await asyncio.to_thread(
+                    self.knowledge_service.get_product_by_goods_id,
+                    shop_db_id,
+                    goods_id,
+                )
                 if not existing:
                     filtered_products.append(p)
             logger.info(f"增量同步: 总商品 {original_count}，需要同步 {len(filtered_products)} 个（已存在跳过）")
@@ -191,7 +200,8 @@ class ProductSyncService:
 
             try:
                 # 先只保存基本信息，不调用LLM
-                self.knowledge_service.add_or_update_product(
+                await asyncio.to_thread(
+                    self.knowledge_service.add_or_update_product,
                     shop_id=shop_db_id,
                     goods_id=goods_id,
                     goods_name=goods_name,
@@ -206,7 +216,9 @@ class ProductSyncService:
                 progress.success += 1
                 logger.debug(f"商品基本信息已保存: {goods_name} (ID: {goods_id})")
             except Exception as e:
-                logger.error(f"保存商品基本信息失败 {goods_id}: {e}")
+                logger.error(
+                    f"保存商品基本信息失败: error_type={type(e).__name__}"
+                )
                 progress.failed += 1
                 continue
 
@@ -248,11 +260,13 @@ class ProductSyncService:
 
             try:
                 # 获取商品详情
-                detail = pm.get_product_detail(goods_id)
+                detail = await asyncio.to_thread(pm.get_product_detail, goods_id)
                 await asyncio.sleep(self.request_delay)
 
                 if not detail["success"]:
-                    logger.error(f"获取商品详情失败: {goods_id}, {detail.get('error_msg')}")
+                    logger.error(
+                        f"获取商品详情失败: error_type=provider_error"
+                    )
                     with counter_lock:
                         progress.failed += 1
                         progress.current += 1
@@ -266,7 +280,8 @@ class ProductSyncService:
                 extracted = await self._extract_product_knowledge(product, product_info)
 
                 # 立即更新到数据库（仅更新提取内容）
-                self.knowledge_service.update_product_extracted_content(
+                await asyncio.to_thread(
+                    self.knowledge_service.update_product_extracted_content,
                     shop_id=shop_db_id,
                     goods_id=goods_id,
                     specifications=json.dumps(product_info.get("specifications", [])),
@@ -281,7 +296,9 @@ class ProductSyncService:
                         progress_callback(progress)
 
             except Exception as e:
-                logger.error(f"提取商品知识失败 {goods_id}: {e}")
+                logger.error(
+                    f"提取商品知识失败: error_type={type(e).__name__}"
+                )
                 with counter_lock:
                     progress.failed += 1
                     progress.current += 1
@@ -390,14 +407,21 @@ class ProductSyncService:
         ]
 
         try:
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
+            try:
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+            finally:
+                close = getattr(client, "close", None) or getattr(client, "aclose", None)
+                if close is not None:
+                    close_result = close()
+                    if inspect.isawaitable(close_result):
+                        await close_result
             content = response.choices[0].message.content.strip()
-            logger.debug(f"LLM输出: {content}")
+            logger.debug(f"LLM输出长度={len(content)}")
 
             # 尝试解析JSON
             try:
@@ -451,11 +475,11 @@ class ProductSyncService:
 
             except json.JSONDecodeError:
                 # 如果解析失败，返回原始内容
-                logger.warning(f"LLM输出不是合法JSON，返回原始内容: {content[:100]}...")
+                logger.warning("LLM输出不是合法JSON，返回原始内容")
                 return content
 
         except Exception as e:
-            logger.error(f"LLM调用失败: {e}")
+            logger.error(f"LLM调用失败: error_type={type(e).__name__}")
             # 降级返回基本信息
             return self._format_basic_info(list_product, detail_product)
 

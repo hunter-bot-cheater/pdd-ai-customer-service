@@ -11,7 +11,7 @@ from qfluentwidgets import (CardWidget, SubtitleLabel, CaptionLabel, BodyLabel,
                            InfoBadge, ScrollArea, FluentIcon as FIF)
 from service.account_service import account_service
 from utils.logger_loguru import get_logger
-import requests
+from utils.safe_image_fetch import fetch_image
 
 logger = get_logger("UserUI")
 
@@ -25,11 +25,10 @@ class LogoLoaderThread(QThread):
 
     def run(self):
         try:
-            response = requests.get(self.url, timeout=10)
-            response.raise_for_status()
-            
+            image_data = fetch_image(self.url)
+
             pixmap = QPixmap()
-            pixmap.loadFromData(response.content)
+            pixmap.loadFromData(image_data)
 
             if pixmap.isNull():
                 raise ValueError("Loaded data is not a valid image.")
@@ -54,7 +53,9 @@ class LogoLoaderThread(QThread):
 
             self.logo_loaded.emit(circular_pixmap)
         except Exception as e:
-            logger.error(f"Failed to load logo from {self.url}: {e}")
+            logger.error(
+                f"Failed to load logo: error_type={type(e).__name__}"
+            )
             self.logo_loaded.emit(QPixmap()) # 失败时发射空pixmap
 
 class LoginThread(QThread):
@@ -84,7 +85,7 @@ class LoginThread(QThread):
             self.login_finished.emit(result)
             
         except Exception as e:
-            logger.error(f"登录线程异常: {e}")
+            logger.error(f"登录线程异常: error_type={type(e).__name__}")
             self.login_finished.emit(False)
 
 
@@ -489,7 +490,7 @@ class UserManagerWidget(QFrame):
             self.refreshAccountList()
             
         except Exception as e:
-            logger.error(f"加载账号数据失败: {e}")
+            logger.error(f"加载账号数据失败: error_type={type(e).__name__}")
 
     
 
@@ -676,7 +677,9 @@ class UserManagerWidget(QFrame):
 
         except Exception as e:
             QMessageBox.critical(self, "严重错误", f"添加账号过程中发生严重错误：{str(e)}")
-            logger.error(f"添加账号过程中发生错误: {e}")
+            logger.error(
+                f"添加账号过程中发生错误: error_type={type(e).__name__}"
+            )
     
     def onEditAccount(self, account_data: dict):
         """编辑账号回调"""

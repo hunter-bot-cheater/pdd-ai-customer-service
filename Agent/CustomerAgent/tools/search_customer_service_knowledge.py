@@ -12,7 +12,9 @@ from database.knowledge_service import KnowledgeService
 from core.di_container import container
 
 # 从DI容器获取服务实例
-knowledge_service = container.get(KnowledgeService)
+def _get_knowledge_service() -> KnowledgeService:
+    """Resolve lazily so tool imports do not depend on DI bootstrap order."""
+    return container.get(KnowledgeService)
 
 
 class SearchCustomerServiceKnowledgeParams(BaseModel):
@@ -44,6 +46,7 @@ def search_customer_service_knowledge(params: SearchCustomerServiceKnowledgePara
     if not params.query:
         return "[错误：缺少搜索关键词，无法搜索客服知识]"
 
+    knowledge_service = _get_knowledge_service()
     result = knowledge_service.search_knowledge(
         shop_id=params.shop_id,
         query=params.query,

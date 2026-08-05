@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
+from utils.runtime_path import get_log_path
 
 from loguru import logger
 
@@ -37,12 +38,12 @@ except ImportError:
 
 # 默认配置
 DEFAULT_LOG_LEVEL = "info"
-DEFAULT_LOG_FILE = "logs/app.log"
+DEFAULT_LOG_FILE = str(get_log_path())
 MAX_LOG_SIZE = "10 MB"
 BACKUP_COUNT = 5
 
 # 确保日志目录存在
-os.makedirs(os.path.dirname(DEFAULT_LOG_FILE), exist_ok=True)
+Path(DEFAULT_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 # 配置loguru
 log_level = os.environ.get("LOG_LEVEL", DEFAULT_LOG_LEVEL).lower()

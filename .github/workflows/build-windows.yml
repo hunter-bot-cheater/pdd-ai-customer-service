@@ -39,6 +39,11 @@ jobs:
           uv venv --python 3.11 .venv
           uv sync
 
+      - name: 运行语法与回归检查
+        run: |
+          .venv\Scripts\python.exe -m compileall -q Agent Channel Message bridge core database service ui utils
+          .venv\Scripts\python.exe -m unittest discover -v
+
       - name: 安装 Inno Setup 6
         shell: pwsh
         run: |

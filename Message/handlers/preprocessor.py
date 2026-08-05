@@ -95,7 +95,9 @@ class MessagePreprocessor:
             return cleaned
 
         except Exception as e:
-            logger.error(f"Message preprocessing failed: {e}")
+            logger.error(
+                f"Message preprocessing failed: error_type={type(e).__name__}"
+            )
             return "消息处理失败"
 
     def _extract_key_info(self, data: Dict[str, Any]) -> str:

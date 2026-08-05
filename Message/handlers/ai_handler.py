@@ -166,7 +166,9 @@ class AIReplyHandler(BaseHandler):
             return True
 
         except Exception as e:
-            self.logger.error(f"AI回复处理失败: {e}")
+            self.logger.error(
+                f"AI回复处理失败: error_type={type(e).__name__}"
+            )
             return await self._handle_fallback(context, metadata)
 
     async def _notify_handoff_new_message(self, context: Context, metadata: Dict[str, Any], session_key: str) -> None:
@@ -352,7 +354,9 @@ class AIReplyHandler(BaseHandler):
                 return None
 
         except Exception as e:
-            self.logger.error(f"AI Bot调用失败: {e}")
+            self.logger.error(
+                f"AI Bot调用失败: error_type={type(e).__name__}"
+            )
             return None
 
     def _clean_text(self, text: str) -> str:
@@ -395,7 +399,9 @@ class AIReplyHandler(BaseHandler):
             return ok
 
         except Exception as e:
-            self.logger.error(f"发送回复失败: {e}")
+            self.logger.error(
+                f"发送回复失败: error_type={type(e).__name__}"
+            )
             return False
 
     def _check_send_result(self, result) -> bool:
@@ -435,5 +441,7 @@ class AIReplyHandler(BaseHandler):
             return True
 
         except Exception as e:
-            self.logger.error(f"备用回复处理失败: {e}")
+            self.logger.error(
+                f"备用回复处理失败: error_type={type(e).__name__}"
+            )
             return True  # 即使失败也返回True，避免重复处理

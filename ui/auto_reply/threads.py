@@ -3,8 +3,8 @@ import asyncio
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath
 from PyQt6.QtCore import Qt
-import requests
 from utils.logger_loguru import get_logger
+from utils.safe_image_fetch import fetch_image
 
 
 class LogoLoaderThread(QThread):
@@ -17,11 +17,10 @@ class LogoLoaderThread(QThread):
 
     def run(self):
         try:
-            response = requests.get(self.url, timeout=10)
-            response.raise_for_status()
+            image_data = fetch_image(self.url)
 
             pixmap = QPixmap()
-            pixmap.loadFromData(response.content)
+            pixmap.loadFromData(image_data)
 
             if pixmap.isNull():
                 raise ValueError("Loaded data is not a valid image.")
@@ -46,7 +45,9 @@ class LogoLoaderThread(QThread):
 
             self.logo_loaded.emit(circular_pixmap)
         except Exception as e:
-            get_logger().error(f"Failed to load logo from {self.url}: {e}")
+            get_logger().error(
+                f"Failed to load logo: error_type={type(e).__name__}"
+            )
             self.logo_loaded.emit(QPixmap())
 
 
@@ -60,6 +61,9 @@ class AutoReplyThread(QThread):
         super().__init__()
         self.account_data = account_data
         self.channel = None
+        self.loop = None
+        self._shutdown_task = None
+        self._stop_requested = False
         self.logger = get_logger("AutoReplyThread")
 
     def run(self):
@@ -82,7 +86,7 @@ class AutoReplyThread(QThread):
                 self.connection_failed.emit(error_msg)
 
             # 启动引擎，并传递回调
-            task = self.loop.create_task(
+            self._start_task = self.loop.create_task(
                 self.channel.start_account(
                     shop_id=self.account_data['shop_id'],
                     user_id=self.account_data['user_id'],
@@ -95,29 +99,103 @@ class AutoReplyThread(QThread):
             self.loop.run_forever()
 
         except Exception as e:
-            self.logger.error(f"自动回复线程启动失败: {e}")
-            self.connection_failed.emit(str(e))
+            self.logger.error(f"自动回复线程启动失败: {type(e).__name__}")
+            self.connection_failed.emit("自动回复线程启动失败，请稍后重试")
         finally:
-            if self.loop.is_running():
-                self.loop.stop()
-            self.loop.close()
+            loop = self.loop
+            if loop is not None:
+                try:
+                    if loop.is_running():
+                        loop.stop()
+
+                    # 先在事件循环内取消并等待剩余任务，再关闭 loop，避免
+                    # cleanup 协程在 loop 关闭后继续访问 asyncio 资源。
+                    if not loop.is_closed():
+                        pending = [
+                            task for task in asyncio.all_tasks(loop)
+                            if not task.done()
+                        ]
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                        loop.close()
+                except Exception as cleanup_error:
+                    self.logger.error(
+                        "自动回复线程清理失败: "
+                        f"error_type={type(cleanup_error).__name__}"
+                    )
+                finally:
+                    try:
+                        if asyncio.get_event_loop() is loop:
+                            asyncio.set_event_loop(None)
+                    except RuntimeError:
+                        pass
+
+    async def _shutdown_async(self):
+        """在工作线程自己的事件循环中完成连接和任务清理。"""
+        try:
+            if self.channel:
+                shop_id = self.account_data.get("shop_id")
+                user_id = self.account_data.get("user_id")
+                if shop_id is not None and user_id is not None:
+                    await asyncio.wait_for(
+                        self.channel.stop_account(shop_id, user_id),
+                        timeout=4.0,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self.channel.stop_all_connections(),
+                        timeout=4.0,
+                    )
+        except asyncio.TimeoutError:
+            self.logger.warning("自动回复连接清理超时，将取消剩余任务")
+        except Exception as e:
+            self.logger.warning(
+                "自动回复连接清理失败，将取消剩余任务: "
+                f"error_type={type(e).__name__}"
+            )
+        finally:
+            current_task = asyncio.current_task()
+            pending = [
+                task for task in asyncio.all_tasks()
+                if task is not current_task and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            asyncio.get_running_loop().stop()
 
     def stop(self):
         """停止后端引擎"""
         try:
-            if self.channel:
-                self.channel.request_stop()
+            loop = self.loop
+            if loop is None or loop.is_closed() or not loop.is_running():
+                return
+            if self._stop_requested:
+                return
 
-            # 停止事件循环（如果存在）
-            if hasattr(self, 'loop') and self.loop:
-                if self.loop.is_running():
-                    for task in asyncio.all_tasks(self.loop):
-                        if not task.done():
-                            task.cancel()
-                    self.loop.call_soon_threadsafe(self.loop.stop)
+            self._stop_requested = True
+
+            # stop() 通常从 Qt 主线程调用；所有 asyncio 对象必须回到其
+            # 所属事件循环线程中操作，不能直接跨线程 cancel/set。
+            def schedule_shutdown():
+                if loop.is_closed():
+                    return
+                if self._shutdown_task is None or self._shutdown_task.done():
+                    self._shutdown_task = loop.create_task(self._shutdown_async())
+
+            loop.call_soon_threadsafe(schedule_shutdown)
 
         except Exception as e:
-            self.logger.error(f"停止自动回复线程失败: {e}")
+            self.logger.error(
+                f"停止自动回复线程失败: error_type={type(e).__name__}"
+            )
 
     def is_running(self) -> bool:
         """检查线程是否在运行"""

@@ -4,7 +4,7 @@
 import json
 from typing import Dict, Any, Optional
 from utils.logger_loguru import get_logger
-from bridge.context import Context
+from bridge.context import Context, _context_value
 from ..core.handlers import MessageHandler
 
 
@@ -18,20 +18,21 @@ class BaseHandler(MessageHandler):
 
     async def log_message(self, context: Context, action: str, extra_info: str = ""):
         """统一的日志记录（不记录完整内容以保护隐私）"""
-        user_info = self._get_user_info(context)
-        content_preview = str(context.content)[:50] + "..." if context.content else ""
-        self.logger.info(f"{self.name} {action} - {user_info} - {content_preview} {extra_info}")
+        message_id = _context_value(context, "msg_id", "unknown")
+        content_length = len(str(context.content)) if context.content else 0
+        extra_length = len(str(extra_info)) if extra_info else 0
+        self.logger.info(
+            f"{self.name} {action} - message_id={message_id} "
+            f"content_length={content_length} extra_length={extra_length}"
+        )
 
     def _get_user_info(self, context: Context) -> str:
         """提取用户信息"""
         try:
             if hasattr(context, 'kwargs') and context.kwargs:
-                from_uid = getattr(context.kwargs, 'from_uid', None)
-                username = getattr(context.kwargs, 'username', None)
-                if username:
-                    return f"用户:{username}({from_uid})"
-                elif from_uid:
-                    return f"用户:{from_uid}"
+                message_id = _context_value(context, "msg_id")
+                if message_id:
+                    return f"message:{message_id}"
             return "用户:unknown"
         except Exception:
             return "用户:unknown"

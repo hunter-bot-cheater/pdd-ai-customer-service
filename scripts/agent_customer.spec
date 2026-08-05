@@ -7,6 +7,7 @@ PyInstaller spec for Agent-Customer
 import sys
 import os
 from pathlib import Path
+import tomllib
 
 block_cipher = None
 
@@ -20,6 +21,12 @@ elif len(sys.argv) > 0:
 else:
     # last fallback: 从 cwd 推导
     PROJECT_ROOT = Path.cwd()
+
+try:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as _version_file:
+        PROJECT_VERSION = tomllib.load(_version_file)["project"]["version"]
+except (OSError, KeyError, TypeError):
+    PROJECT_VERSION = "0.0.0-dev"
 
 # ================================
 # Playwright 驱动打包
@@ -46,7 +53,7 @@ a = Analysis(
     datas=[
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
-        # 配置文件（如果存在）
+        (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
     ] + _pw_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===
@@ -58,24 +65,10 @@ a = Analysis(
         "qfluentwidgets",
         "qfluentwidgets.common",
         "qfluentwidgets.components",
-        "qfluentwidgets.navigation",
         "qfluentwidgets.window",
         # === AI / Agent ===
-        "agno",
-        "agno.agent",
-        "agno.models",
-        "agno.models.openai",
-        "agno.knowledge",
-        "agno.knowledge.embedder",
-        "agno.db",
-        "agno.db.sqlite",
-        "agno.tools",
-        "agno.team",
-        "agno.run",
-        "agno.team.agent",
         # === 嵌入器 ===
         "openai",
-        "openai._base",
         "openai._models",
         "openai._client",
         "tiktoken",
@@ -86,11 +79,6 @@ a = Analysis(
         "sqlalchemy.orm",
         "sqlalchemy.sql",
         "sqlalchemy.dialects.sqlite",
-        "lancedb",
-        "lancedb.embeddings",
-        "lancedb.vector",
-        # === 搜索 ===
-        "tantivy",
         # === 日志 ===
         "loguru",
         "loguru._logger",
@@ -101,7 +89,6 @@ a = Analysis(
         "aiohttp",
         "aiohttp.client",
         "aiohttp.web",
-        "aiohttp.websocket",
         "requests",
         "urllib3",
         "charset_normalizer",
@@ -125,18 +112,14 @@ a = Analysis(
         # === 图像 ===
         "PIL",
         "PIL._imaging",
-        "cv2",
-        "cv2.cv2",
         # === 异步 ===
         "asyncio",
         "aiofiles",
         # === 工具类 ===
         "pydantic",
-        "pydantic.base",
         "pydantic.fields",
         "pydantic.dataclasses",
         "pydantic.v1",
-        "pydantic.v1.error_messages",
         "pydantic.v1.fields",
         "volcengine",
         "volcengine.base",
@@ -185,6 +168,7 @@ a = Analysis(
         "utils.resource_manager",
         "utils.path_utils",
         "utils.runtime_path",
+        "utils.secret_store",
         # === 避免 pydantic v1/v2 冲突 ===
         "pydantic.errors",
         "pydantic.fields",
@@ -200,16 +184,11 @@ a = Analysis(
         "pydantic.validators",
         # === rich (for volcengine) ===
         "rich",
-        "rich.console",
-        "rich.table",
-        "rich.progress",
         # === 避免 importlib 静默失败 ===
         "importlib",
         "importlib.util",
         "importlib.abc",
         # === jsonschema (for openapi) ===
-        "jsonschema",
-        "jsonschema_specifications",
         # === certifi / charset ===
         "certifi",
         "charset_normalizer",
@@ -261,15 +240,11 @@ exe = EXE(
     version="",
     description="电商AI客服助手",
     product_name="Agent-Customer",
-    product_version="0.1.0",
+    product_version=PROJECT_VERSION,
     company_name="",
     legal_copyright="",
     # 权限
-   RequestedExecutionLevel="asInvoker",
-    # 环境变量：解决 uv 管理 Python 在 frozen 模式下找不到 Python 运行时的问题
-    env=[
-        ("PYTHONHOME", str(Path(sys.exec_prefix))),
-    ],
+    RequestedExecutionLevel="asInvoker",
 )
 
 # ================================

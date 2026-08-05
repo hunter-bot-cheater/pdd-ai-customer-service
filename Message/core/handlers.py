@@ -50,7 +50,10 @@ class MessageHandler(ABC):
             context: 消息上下文
             error: 错误对象
         """
-        self.logger.error(f"Handler {self.__class__.__name__} error: {error}")
+        self.logger.error(
+            f"Handler {self.__class__.__name__} error: "
+            f"error_type={type(error).__name__}"
+        )
 
 
 class TypeBasedHandler(MessageHandler):
@@ -100,16 +103,13 @@ class CatchAllHandler(MessageHandler):
 
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """记录所有消息，用于调试和统计（不记录完整内容以保护隐私）"""
-        user_id = metadata.get('user_id', 'unknown')
-        message_id = metadata.get('message_id', 'unknown')
-        content_preview = str(context.content)[:50] + "..." if context.content else ""
+        content_length = len(str(context.content)) if context.content else 0
 
         self.logger.info(f"=== 消息处理记录 ===")
-        self.logger.info(f"用户ID: {user_id}")
-        self.logger.info(f"消息ID: {message_id}")
+        self.logger.info("用户与消息标识已省略以保护隐私")
         self.logger.info(f"消息类型: {context.type}")
         self.logger.info(f"渠道类型: {context.channel_type}")
-        self.logger.info(f"消息内容预览: {content_preview}")
+        self.logger.info(f"消息内容长度: {content_length}")
         self.logger.info(f"消息已被CatchAllHandler处理")
         self.logger.info(f"===================")
 

@@ -70,6 +70,18 @@ class LLMClient:
         )
         logger.debug(f"LLM 客户端初始化成功: model={self.model_name}")
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client and release its connection pool."""
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -104,7 +116,9 @@ class LLMClient:
             validated_request = ChatCompletionsRequest(**request_dict)
             logger.debug("请求参数验证通过")
         except Exception as e:
-            logger.error(f"请求参数验证失败: {e}")
+            logger.error(
+                f"请求参数验证失败: error_type={type(e).__name__}"
+            )
             raise
 
         # 3. 调试日志：输出发送给 LLM 的消息（限制内容长度，避免泄露敏感信息）
@@ -132,7 +146,8 @@ class LLMClient:
             tool_names = [tc.function.name for tc in message.tool_calls]
             logger.info(f"LLM 决定调用工具: {tool_names}")
         else:
-            logger.debug(f"LLM 直接回复: {str(message.content)[:200]}...")
+            content_length = len(str(message.content or ""))
+            logger.debug(f"LLM 直接回复已生成: length={content_length}")
 
         return LLMResponse(
             content=message.content,

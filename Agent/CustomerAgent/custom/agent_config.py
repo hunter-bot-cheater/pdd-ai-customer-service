@@ -12,7 +12,7 @@ from utils.logger_loguru import get_logger
 logger = get_logger("AgentConfig")
 
 # 默认参数
-DEFAULT_DB_PATH = "./temp/agent.db"
+DEFAULT_DB_PATH = "./temp/channel_shop.db"
 # Token 窗口大小：128k context，用于控制上下文长度
 DEFAULT_TOKEN_WINDOW = 131072
 # 压缩阈值比例：当历史消息超过 token_window * compress_ratio 时触发压缩
@@ -28,7 +28,9 @@ DEFAULT_TEMPERATURE = 0.3
 @dataclass
 class AgentConfig:
     """Agent 配置数据类"""
-    db_path: str = field(default_factory=lambda: get_config("db_path", DEFAULT_DB_PATH))
+    db_path: str = field(
+        default_factory=lambda: get_config("db_path", DEFAULT_DB_PATH) or DEFAULT_DB_PATH
+    )
     token_window: int = DEFAULT_TOKEN_WINDOW
     compress_ratio: float = DEFAULT_COMPRESS_RATIO
     retain_count: int = DEFAULT_RETAIN_COUNT

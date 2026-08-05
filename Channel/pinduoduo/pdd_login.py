@@ -5,10 +5,12 @@ import os
 # 必须在导入 playwright 之前设置浏览器路径
 from pathlib import Path
 from utils.path_utils import get_app_dir
+from utils.runtime_path import get_data_path
 from utils.logger_loguru import get_logger
 
 # 设置 Playwright 浏览器路径
 app_dir = get_app_dir()
+data_dir = get_data_path()
 browsers_path = app_dir / ".browsers"
 if browsers_path.exists():
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
@@ -44,12 +46,38 @@ import socket
 import subprocess
 import threading
 import urllib.request
+import re
+import shutil
+from urllib.parse import urlsplit
 from typing import Optional, Dict, Any, Tuple
 import sys
 from database import db_manager
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from Channel.pinduoduo.utils.API.get_shop_info import GetShopInfo
 from Channel.pinduoduo.utils.API.get_user_info import GetUserInfo
+
+
+def _profile_scope_identity(profile_scope: Optional[str]):
+    """Extract the expected channel/shop/user identity from a profile key."""
+    if profile_scope is None:
+        return None
+    parts = str(profile_scope).split(":", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def _profile_scope_matches(profile_scope: Optional[str], shop_id, user_id) -> bool:
+    """Fail closed when a scoped browser session resolves to another account."""
+    if profile_scope is None:
+        return True
+    expected = _profile_scope_identity(profile_scope)
+    return bool(
+        expected
+        and expected[0] == "pinduoduo"
+        and str(expected[1]) == str(shop_id)
+        and str(expected[2]) == str(user_id)
+    )
 
 
 class _CdpContextHandle:
@@ -90,12 +118,35 @@ class _CdpContextHandle:
                     pass
 
 class PDDLogin():
-    def __init__(self,name,password):
+    def __init__(self, name, password, profile_scope=None):
         self.logger = get_logger("Pdd_login")
         self.channel_name = "pinduoduo"  # 渠道名称固定为"pinduoduo"
         self.base_url = "https://mms.pinduoduo.com/login"
         self.name = name
         self.password = password
+        self.profile_scope = profile_scope
+
+    def _profile_dir(self, profile_scope: Optional[str] = None) -> Path:
+        """Return a filesystem-safe, stable profile path for this account."""
+        raw_name = str(profile_scope or self.profile_scope or self.name or "").strip()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:48]
+        safe_name = safe_name or "account"
+        digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:12]
+        return data_dir / "user_data" / f"{safe_name}-{digest}"
+
+    def migrate_profile(self, profile_scope: str) -> None:
+        """Copy a legacy username profile to its account-scoped location."""
+        source = self._profile_dir()
+        target = self._profile_dir(profile_scope)
+        if source.resolve() == target.resolve() or not source.exists() or target.exists():
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target)
+        except OSError as exc:
+            self.logger.warning(
+                f"browser profile migration skipped: error_type={type(exc).__name__}"
+            )
 
     # 本地浏览器启动参数（Chrome/Edge 通用）
     # 精简为对登录真正有用且兼容性好的参数；避免 --disable-web-security（登录用不到，
@@ -177,8 +228,8 @@ class PDDLogin():
                     args=self._LAUNCH_ARGS,
                 )
             except Exception as e:
-                attempts.append(f"{channel}({exe_path}): {str(e).splitlines()[0][:100]}")
-                self.logger.warning(f"启动本地浏览器 {channel} 失败: {e}")
+                attempts.append(f"{channel}({exe_path}): error_type={type(e).__name__}")
+                self.logger.warning(f"启动本地浏览器 {channel} 失败: {type(e).__name__}")
 
         # 2) 回退：channel 方式（路径探测未命中时的兜底）。
         # 级 1 已用 executable_path 试过同一浏览器（pipe 模式同样秒退），跳过。
@@ -194,8 +245,8 @@ class PDDLogin():
                     args=self._LAUNCH_ARGS,
                 )
             except Exception as e:
-                attempts.append(f"{ch}(channel): {str(e).splitlines()[0][:100]}")
-                self.logger.warning(f"启动本地浏览器 {ch} 失败: {e}")
+                attempts.append(f"{ch}(channel): error_type={type(e).__name__}")
+                self.logger.warning(f"启动本地浏览器 {ch} 失败: {type(e).__name__}")
 
         # 3) 回退：手动启动浏览器用 remote-debugging-port，再 connect_over_cdp。
         # 部分电脑 Edge 在 Playwright 的 --remote-debugging-pipe 下启动后秒退
@@ -214,8 +265,8 @@ class PDDLogin():
                 args=self._LAUNCH_ARGS,
             )
         except Exception as e:
-            attempts.append(f"chromium(bundled): {str(e).splitlines()[0][:100]}")
-            self.logger.warning(f"启动 Playwright Chromium 失败: {e}")
+            attempts.append(f"chromium(bundled): error_type={type(e).__name__}")
+            self.logger.warning(f"启动 Playwright Chromium 失败: {type(e).__name__}")
 
         raise RuntimeError(
             "未找到可用的浏览器。尝试过的方案：\n  - " +
@@ -255,7 +306,7 @@ class PDDLogin():
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
         except Exception as e:
-            self.logger.warning(f"手动启动浏览器失败: {e}")
+            self.logger.warning(f"手动启动浏览器失败: {type(e).__name__}")
             return None
 
         drain_thread = threading.Thread(
@@ -304,7 +355,7 @@ class PDDLogin():
                 proc.terminate()
             self._log_proc_stderr(
                 stderr_chunks, drain_thread,
-                f"CDP 回退连接失败: {e}",
+                f"CDP 回退连接失败: {type(e).__name__}",
             )
             return None
 
@@ -347,12 +398,14 @@ class PDDLogin():
             headless: 是否使用无头模式（自动回退时使用 True，避免弹出浏览器窗口）
 
         """
+        playwright = None
+        context = None
         try:
             # 启动Playwright
             playwright = await async_playwright().start()
 
             # 创建独立的用户数据目录，避免多实例冲突
-            user_data_dir = str(app_dir / "user_data" / self.name)
+            user_data_dir = str(self._profile_dir())
             self.logger.debug(f"使用用户数据目录: {user_data_dir}")
 
             # 使用本地浏览器（Chrome/Edge），无需下载 Playwright 自带 Chromium
@@ -386,15 +439,22 @@ class PDDLogin():
             # 将playwright格式的cookies列表转换为字典格式，使用安全的get方法
             cookies_dict = {cookie.get('name', ''): cookie.get('value', '') for cookie in cookies_list if cookie.get('name')}
             cookies_json = json.dumps(cookies_dict)
-            # 关闭浏览器上下文
-            await context.close()
-            await playwright.stop()
-                
             return cookies_json
             
         except Exception as e:
-            self.logger.error(f"登录失败: {str(e)}")
+            self.logger.error(f"登录失败: {type(e).__name__}")
             return False
+        finally:
+            if context:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if playwright:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
         
     async def refresh_cookies(self):
         """重新获取cookies，使用已保存的用户数据，无需再次登录
@@ -409,7 +469,7 @@ class PDDLogin():
             playwright = await async_playwright().start()
 
             # 使用相同的用户数据目录（与login保持一致）
-            user_data_dir = str(app_dir / "user_data" / self.name)
+            user_data_dir = str(self._profile_dir())
             self.logger.debug(f"使用用户数据目录刷新cookies: {user_data_dir}")
 
             # 检查用户数据目录是否存在
@@ -423,7 +483,22 @@ class PDDLogin():
             page = await context.new_page()
 
             # 访问拼多多商家后台首页，验证登录状态
-            await page.goto("https://mms.pinduoduo.com/home/")
+            response = await page.goto("https://mms.pinduoduo.com/home/")
+
+            # 只记录状态码和 URL 的路径，避免把 query 参数中的敏感信息写入日志。
+            current_url = page.url or ""
+            parsed_url = urlsplit(current_url)
+            safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+            response_status = response.status if response is not None else None
+            self.logger.debug(
+                f"刷新页面完成: status={response_status}, url={safe_url}"
+            )
+
+            # 有些情况下 goto 返回时已经落在登录页，直接判定登录态失效，
+            # 避免再额外等待一次导航。
+            if "login" in parsed_url.path.lower():
+                self.logger.warning("登录状态已失效，需要重新登录")
+                return False
 
             # 等待页面加载，检查是否需要重新登录
             try:
@@ -431,9 +506,14 @@ class PDDLogin():
                 await page.wait_for_url("**/login**", timeout=5000)
                 self.logger.warning("登录状态已失效，需要重新登录")
                 return False
-            except asyncio.TimeoutError:
+            except PlaywrightTimeoutError:
                 # 没有跳转到登录页面，说明登录状态有效
-                pass
+                # 再检查一次当前路径，覆盖“跳转发生但页面加载较慢”的情况。
+                final_path = urlsplit(page.url or "").path.lower()
+                if "login" in final_path:
+                    self.logger.warning("登录状态已失效，需要重新登录")
+                    return False
+                self.logger.debug("5 秒内未跳转到登录页，继续读取 cookies")
 
             # 获取最新的cookies
             cookies_list = await context.cookies()
@@ -444,11 +524,14 @@ class PDDLogin():
             return cookies_json
 
         except Exception as e:
-            self.logger.error(f"刷新cookies失败: {str(e)}")
+            self.logger.error(f"刷新cookies失败: {type(e).__name__}")
             return False
         finally:
             if context:
-                await context.close()
+                try:
+                    await context.close()
+                except Exception:
+                    pass
             if playwright:
                 try:
                     await playwright.stop()
@@ -473,7 +556,7 @@ class PDDLogin():
         shop_id, shop_name, mallLogo = result
         return shop_id, shop_name, mallLogo
     
-async def login_pdd(name, password, headless=False):
+async def login_pdd(name, password, headless=False, profile_scope=None):
     """
     使用账号密码登录并返回账号、店铺信息，不直接操作数据库。
     如果登录成功，返回包含详细信息的字典。
@@ -484,7 +567,9 @@ async def login_pdd(name, password, headless=False):
     :param headless: 是否使用无头模式（默认 False，自动回退时传 True）
     :return: dict or bool
     """
-    pdd_login = PDDLogin(name=name, password=password)
+    pdd_login = PDDLogin(
+        name=name, password=password, profile_scope=profile_scope
+    )
     cookies_json = await pdd_login.login(headless=headless)
     if not cookies_json:
         pdd_login.logger.error(f"账号 '{name}' 登录失败，未能获取cookies")
@@ -500,6 +585,17 @@ async def login_pdd(name, password, headless=False):
             pdd_login.logger.error(f"账号 '{name}' 登录成功，但获取用户信息或店铺信息失败")
             return False
 
+        if not _profile_scope_matches(profile_scope, shop_id, user_id):
+            pdd_login.logger.error("登录会话与指定账号不一致，已失败并不会应用 cookies")
+            return False
+
+        # Initial UI login historically used the username as the profile key.
+        # Preserve that data while creating the account-scoped profile used by
+        # subsequent refresh/relogin operations.
+        pdd_login.migrate_profile(
+            f"{pdd_login.channel_name}:{shop_id}:{user_id}"
+        )
+
         pdd_login.logger.info(f"账号 '{name}' 登录成功，获取到店铺: {shop_name}({shop_id})")
 
         # 登录成功，返回包含所有信息的字典
@@ -514,10 +610,12 @@ async def login_pdd(name, password, headless=False):
             "cookies": cookies_json,
         }
     except Exception as e:
-        pdd_login.logger.error(f"账号 '{name}' 登录成功，但在处理后续信息时出错: {e}")
+        pdd_login.logger.error(
+            f"账号 '{name}' 登录成功，但在处理后续信息时出错: {type(e).__name__}"
+        )
         return False
 
-async def refresh_pdd_cookies(name, password=None):
+async def refresh_pdd_cookies(name, password=None, profile_scope=None):
     """
     刷新拼多多账号的cookies，使用已保存的用户数据，无需再次输入账号密码。
     如果刷新成功，返回包含最新cookies的字典。
@@ -527,8 +625,18 @@ async def refresh_pdd_cookies(name, password=None):
     :param password: 密码（可选，仅用于创建PDDLogin实例）
     :return: dict or bool
     """
-    pdd_login = PDDLogin(name=name, password=password or "")
+    pdd_login = PDDLogin(
+        name=name, password=password or "", profile_scope=profile_scope
+    )
     cookies_json = await pdd_login.refresh_cookies()
+    if not cookies_json and profile_scope:
+        # Existing installs may still have only the legacy username profile.
+        # Read it once as a compatibility fallback; new logins migrate it to
+        # the scoped path above.
+        legacy_login = PDDLogin(name=name, password=password or "")
+        cookies_json = await legacy_login.refresh_cookies()
+        if cookies_json:
+            pdd_login = legacy_login
     
     if not cookies_json:
         pdd_login.logger.error(f"账号 '{name}' cookies刷新失败")
@@ -544,6 +652,15 @@ async def refresh_pdd_cookies(name, password=None):
             pdd_login.logger.error(f"账号 '{name}' cookies刷新成功，但获取用户信息或店铺信息失败")
             return False
 
+        if not _profile_scope_matches(profile_scope, shop_id, user_id):
+            pdd_login.logger.error("刷新会话与指定账号不一致，已失败并不会应用 cookies")
+            return False
+
+        if profile_scope and pdd_login.profile_scope is None:
+            # The identity check above makes this legacy-to-scoped migration
+            # safe even when several usernames share a shop installation.
+            pdd_login.migrate_profile(profile_scope)
+
         pdd_login.logger.info(f"账号 '{name}' cookies刷新成功，店铺: {shop_name}({shop_id})")
 
         # 刷新成功，返回包含最新信息的字典
@@ -558,6 +675,8 @@ async def refresh_pdd_cookies(name, password=None):
             "cookies": cookies_json,
         }
     except Exception as e:
-        pdd_login.logger.error(f"账号 '{name}' cookies刷新成功，但在处理后续信息时出错: {e}")
+        pdd_login.logger.error(
+            f"账号 '{name}' cookies刷新成功，但在处理后续信息时出错: {type(e).__name__}"
+        )
         return False
 

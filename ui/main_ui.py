@@ -7,6 +7,7 @@ from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import SubtitleLabel, TeachingTip, TeachingTipTailPosition
 from qfluentwidgets import Action
 from utils.logger_loguru import get_logger
+from utils.runtime_path import get_resource_path
 import time
 
 class Widget(QFrame):
@@ -29,7 +30,7 @@ class MainWindow(FluentWindow):
         super().__init__()
         t = time.perf_counter()
         self.setWindowTitle('拼多多AI客服助手')
-        self.setWindowIcon(QIcon("icon/icon.ico"))
+        self.setWindowIcon(QIcon(str(get_resource_path("icon/icon.ico"))))
         self.logger = get_logger("MainWindow")
         self.logger.info(f"  基础属性初始化: {time.perf_counter()-t:.2f}s")
 
@@ -133,7 +134,7 @@ class MainWindow(FluentWindow):
         try:
             tip = TeachingTip.create(
                 target=self.navigationInterface,
-                image="icon/Customer-Agent-qr.png",
+                image=str(get_resource_path("icon/Customer-Agent-qr.png")),
                 icon=FIF.PEOPLE,
                 title="联系我们",
                 content="扫码关注获取更多信息和支持",
