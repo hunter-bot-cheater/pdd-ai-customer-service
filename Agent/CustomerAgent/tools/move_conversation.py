@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from Agent.CustomerAgent.custom.tool_decorator import agent_tool
 from bridge.sender import get_sender
+from config import get_config
 from core.session_state import SessionState
 from utils.logger_loguru import get_logger
 
@@ -20,6 +21,46 @@ class TransferConversationParams(BaseModel):
     user_id: Optional[Union[str, int]] = Field(default=None, description="用户ID（账号ID）")
     recipient_uid: Optional[str] = Field(default=None, description="接收转接的用户UID")
     shop_name: Optional[str] = Field(default=None, description="店铺名称")
+
+
+def _is_main_account(shop_id, user_id) -> bool:
+    """判断当前账号是否为主账号
+
+    规则 7：子账号不调用转人工 API，仅静默标记会话并通知人工客服；
+    主账号则尝试真实转移会话（转移失败也保持静默，不回复用户预设话术）。
+
+    判定依据（运行时认证时自动写入 config.json）：
+    1. transfer.sub_account_uids：子账号完整 UID 列表
+       （cs_{shop_id}_{user_id}）——命中即子账号；
+    2. 兼容旧配置 transfer.main_account_user_ids：user_id 或完整子账号
+       UID 命中其中的子账号项，也判定为子账号；
+    3. 未配置任何列表时，默认全部账号按主账号处理。
+    """
+    try:
+        user_id_str = str(user_id)
+        sub_uid = f"cs_{shop_id}_{user_id}"
+
+        # 1. 子账号列表优先判定
+        sub_uids = get_config("transfer.sub_account_uids", []) or []
+        sub_set = {str(u) for u in sub_uids}
+        if sub_uid in sub_set or user_id_str in sub_set:
+            return False
+
+        # 2. 兼容旧配置：main_account_user_ids 中的完整子账号 UID
+        main_uids = get_config("transfer.main_account_user_ids", []) or []
+        if main_uids:
+            main_set = {str(u) for u in main_uids}
+            if user_id_str in main_set:
+                return True
+            if sub_uid in main_set:
+                return False
+            # 未知账号：保守地按主账号处理，保证转人工流程可用
+            return True
+        return True
+    except Exception as e:
+        # 判断失败时保守地按主账号处理，保证转人工流程可用
+        logger.error(f"判断主账号失败，默认按主账号处理: {e}")
+        return True
 
 
 def _mark_handoff(params: TransferConversationParams) -> None:
@@ -71,6 +112,17 @@ def transfer_conversation(
     try:
         if not all([params.shop_id, params.user_id, params.recipient_uid]):
             return f"转接失败：缺少必要的会话信息 (shop_id={params.shop_id}, user_id={params.user_id}, recipient_uid={params.recipient_uid})"
+
+        # 规则 7：子账号不调用转人工 API，仅静默标记会话 + 通知人工客服
+        if not _is_main_account(params.shop_id, params.user_id):
+            logger.info(
+                f"子账号会话转人工（静默标记，不调用API）: "
+                f"shop_id={params.shop_id}, user_id={params.user_id}, recipient_uid={params.recipient_uid}"
+            )
+            _mark_handoff(params)
+            if send_notification:
+                _notify_handoff(params, reason, last_message)
+            return "会话转接成功"
 
         sender = get_sender()
         cs_list = sender.get_cs_list(str(params.shop_id), str(params.user_id))

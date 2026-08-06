@@ -4,13 +4,15 @@ AI回复处理器
 """
 import random
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from bridge.context import Context, ContextType
 from .base import BaseHandler
 from .preprocessor import MessagePreprocessor
 from Agent.bot import Bot
+from config import get_config
 from core.session_state import SessionState
-from Agent.CustomerAgent.tools.move_conversation import transfer_conversation, TransferConversationParams
+from core.notify_tracker import notify_tracker
+from core.uid_send_tracker import UIDSendTracker
 
 
 class AIReplyHandler(BaseHandler):
@@ -35,23 +37,38 @@ class AIReplyHandler(BaseHandler):
             ContextType.EMOTION
         }
 
+        # ===== 真人模拟时序参数（规则 1/3/4/2）=====
+        # 规则 1: 已读 6~8 秒，打字 4~6 秒，合计 10~14 秒
+        self.read_seconds_min = float(get_config("ai_reply.read_seconds_min", 6))
+        self.read_seconds_max = float(get_config("ai_reply.read_seconds_max", 8))
+        self.typing_seconds_min = float(get_config("ai_reply.typing_seconds_min", 4))
+        self.typing_seconds_max = float(get_config("ai_reply.typing_seconds_max", 6))
+        # 规则 4: 拆分后的多条消息间隔 3~6 秒
+        self.split_interval_min = float(get_config("ai_reply.split_interval_min", 3))
+        self.split_interval_max = float(get_config("ai_reply.split_interval_max", 6))
+        # 规则 3: 单条消息最大字数
+        self.max_message_len = int(get_config("ai_reply.max_message_len", 25))
+        # 规则 2: 同一买家连续回复间隔跟踪器
+        self.uid_tracker = UIDSendTracker()
+
     def can_handle(self, context: Context) -> bool:
         """检查是否可以处理该消息"""
         # 支持多种消息类型
         return context.type in self.auto_reply_types
 
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
-        """处理AI回复（支持分句发送）"""
+        """处理AI回复（支持分条短消息发送 + 真人时序模拟）"""
         try:
-            # ===== 0. 转人工状态检测：有效期内禁止 AI 抢答 =====
+            # ===== 0. 转人工状态检测：规则 8，转人工后 AI 完全忽略该会话后续消息 =====
             shop_id = metadata.get('shop_id')
             from_uid = metadata.get('from_uid')
             if shop_id and from_uid:
                 session_key = f"{shop_id}:{from_uid}"
                 if SessionState().is_handoff(session_key):
-                    self.logger.info(f"会话已在转人工状态，重新触发转人工流程: session_key={session_key}")
-                    await self._retrigger_handoff(context, metadata)
-                    return True  # 跳过 AI 回复
+                    self.logger.info(f"会话已转人工，AI 忽略该会话后续消息: session_key={session_key}")
+                    # 规则 9: 转人工后新消息仍通知人工客服（带冷却防刷屏）
+                    await self._notify_handoff_new_message(context, metadata, session_key)
+                    return True  # 直接返回，不等待、不回复
 
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)
@@ -62,71 +79,125 @@ class AIReplyHandler(BaseHandler):
                 self.logger.warning("AI回复生成失败，使用备用回复")
                 return await self._handle_fallback(context, metadata)
 
-            # ========== 3. 分句发送 ==========
-            # 按句子分隔符拆分：句号、问号、感叹号、分号、换行等
-            import re
-            # 使用正则按标点拆分，保留分隔符
-            sentences = re.split(r'(?<=[。！？；\n])', reply)
-            # 过滤空字符串
-            sentences = [s.strip() for s in sentences if s.strip()]
+            # 3. 规则 3: 拆分为不超过 max_message_len 字的短消息
+            messages = self._split_reply(reply)
 
-            # 如果句子数量太少（1-2句），直接整条发送
-            if len(sentences) <= 2:
-                success = await self._send_reply(context, reply, metadata)
+            # 4. 规则 1+2: 模拟已读+打字延迟（合计 10~14 秒），并补齐同一买家回复间隔
+            await self._simulate_human_delay(from_uid)
+
+            # 5. 逐条发送，遵守分条间隔与业务码校验（规则 4、5）
+            self.logger.info(f"分条发送：共 {len(messages)} 条")
+            sent_count = 0
+            for i, msg in enumerate(messages):
+                # 需求二：清洗后为空的分条跳过，不发送（与业务码失败区分，避免误停后续分条）
+                if not self._clean_text(msg).strip():
+                    self.logger.warning(f"分条 {i + 1} 清洗后为空，跳过该条: {msg!r}")
+                    continue
+                success = await self._send_reply(context, msg, metadata)
                 if success:
-                    await self.log_message(context, "AI回复发送成功", f"回复: {reply[:50]}...")
+                    sent_count += 1
+                    self.logger.debug(f"分条 {i + 1}/{len(messages)} 发送成功: {msg[:30]}...")
                 else:
-                    self.logger.warning("AI回复发送失败")
-                    return await self._handle_fallback(context, metadata)
-                return True
+                    # 规则 5: 发送结果业务码非 0（或请求失败）→ 记录日志并停止后续发送
+                    self.logger.error(f"分条 {i + 1} 发送失败，停止后续发送: {msg[:30]}...")
+                    break
 
-            # 句子较多时，逐条发送
-            self.logger.info(f"分句发送：共 {len(sentences)} 句")
-            for i, sentence in enumerate(sentences):
-                # 如果句子太长，可以不再拆分，直接发送
-                success = await self._send_reply(context, sentence, metadata)
-                if success:
-                    self.logger.debug(f"分句 {i + 1}/{len(sentences)} 发送成功: {sentence[:30]}...")
-                else:
-                    self.logger.warning(f"分句 {i + 1} 发送失败: {sentence}")
-                    # 发送失败时，可以选择继续还是中断
-                    # 建议继续，避免丢失后续内容
-                    # break  # 如果希望中断，取消注释
+                # 规则 4: 拆分后的多条消息间隔 3~6 秒
+                if i < len(messages) - 1:
+                    await asyncio.sleep(random.uniform(self.split_interval_min, self.split_interval_max))
 
-                # 每条之间间隔 1.5~2.5 秒（模拟打字停顿）
-                if i < len(sentences) - 1:
-                    await asyncio.sleep(random.uniform(1.5, 2.5))
+            if sent_count == 0:
+                self.logger.warning("AI回复全部发送失败，使用备用回复")
+                return await self._handle_fallback(context, metadata)
 
+            await self.log_message(context, "AI回复发送成功", f"回复: {reply[:50]}...")
             return True
 
         except Exception as e:
             self.logger.error(f"AI回复处理失败: {e}")
             return await self._handle_fallback(context, metadata)
 
-    async def _retrigger_handoff(self, context: Context, metadata: Dict[str, Any]) -> None:
-        """会话处于转人工有效期内：再次触发转人工并通知人工客服"""
+    async def _notify_handoff_new_message(self, context: Context, metadata: Dict[str, Any], session_key: str) -> None:
+        """规则 9: 转人工后买家新消息仍通知人工客服（同会话 5 分钟冷却防刷屏）"""
         try:
-            shop_id = metadata.get('shop_id')
-            user_id = metadata.get('user_id')
-            from_uid = metadata.get('from_uid')
-            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', '') or ""
+            if not notify_tracker.should_notify(session_key):
+                self.logger.debug(f"会话通知处于冷却期内，跳过通知: session_key={session_key}")
+                return
 
-            params = TransferConversationParams(
-                shop_id=str(shop_id),
-                user_id=str(user_id),
-                recipient_uid=str(from_uid),
-                shop_name=str(shop_name),
+            # 延迟导入，避免与 Message 包产生循环依赖
+            from Message.handlers.notify import build_handoff_message, send_wechat_notification_sync
+            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', '') or ""
+            message = build_handoff_message(
+                shop_name=shop_name,
+                buyer_uid=metadata.get('from_uid') or "",
+                reason="转人工后买家新消息",
+                last_message=context.content or "",
             )
-            result = await asyncio.to_thread(
-                transfer_conversation,
-                params,
-                "有效期内再次发消息",
-                True,
-                context.content or "",
-            )
-            self.logger.info(f"重新触发转人工结果: {result}")
+            await asyncio.to_thread(send_wechat_notification_sync, message)
+            notify_tracker.update_notify(session_key)
+            self.logger.info(f"已通知人工客服买家新消息: session_key={session_key}")
         except Exception as e:
-            self.logger.error(f"重新触发转人工失败: {e}")
+            self.logger.error(f"发送转人工后新消息通知失败: {e}")
+
+    def _split_reply(self, reply: str) -> List[str]:
+        """规则 3: 将回复拆分为不超过 max_message_len 字的短消息
+
+        优先在句号/问号/感叹号等句末标点处断句，其次在逗号/顿号处细分，
+        单段仍超长时按字符硬切，保证每条消息字数不超限。
+        """
+        if not reply:
+            return []
+        if self.max_message_len <= 0:
+            return [reply]
+
+        import re
+        # 按句末标点拆分，保留分隔符
+        sentences = re.split(r'(?<=[。！？；\n])', reply)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        chunks: List[str] = []
+        for sent in sentences:
+            if len(sent) <= self.max_message_len:
+                chunks.append(sent)
+                continue
+
+            # 句子超长：按逗号/顿号再细分
+            parts = re.split(r'(?<=[，、])', sent)
+            parts = [p.strip() for p in parts if p.strip()]
+
+            current = ""
+            for part in parts:
+                if len(part) > self.max_message_len:
+                    # 仍超长：按字符硬切
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    for i in range(0, len(part), self.max_message_len):
+                        chunks.append(part[i:i + self.max_message_len])
+                elif len(current) + len(part) <= self.max_message_len:
+                    current += part
+                else:
+                    chunks.append(current)
+                    current = part
+            if current:
+                chunks.append(current)
+        return chunks
+
+    async def _simulate_human_delay(self, uid: Optional[str]) -> None:
+        """模拟真人已读+打字延迟（规则 1），并补齐同一买家回复间隔（规则 2）"""
+        # 规则 1: 已读 6~8 秒 + 打字 4~6 秒 = 总计 10~14 秒
+        read_sec = random.uniform(self.read_seconds_min, self.read_seconds_max)
+        typing_sec = random.uniform(self.typing_seconds_min, self.typing_seconds_max)
+        delay = read_sec + typing_sec
+
+        # 规则 2: 同一买家连续回复间隔不足 4 秒时补齐
+        pad = self.uid_tracker.wait_before_send(uid)
+        if pad > delay:
+            self.logger.debug(f"同一买家回复间隔不足，补齐等待: pad={pad:.1f}s")
+            delay = pad
+
+        self.logger.debug(f"模拟已读+打字延迟: {delay:.1f}s (读{read_sec:.1f}s + 打{typing_sec:.1f}s)")
+        await asyncio.sleep(delay)
 
     async def _get_ai_reply(self, query: str, context: Context) -> Optional[str]:
         """获取AI回复"""
@@ -149,8 +220,20 @@ class AIReplyHandler(BaseHandler):
             self.logger.error(f"AI Bot调用失败: {e}")
             return None
 
+    def _clean_text(self, text: str) -> str:
+        """需求二：移除所有中英文句号、逗号、问号，使回复更简洁自然"""
+        if not text:
+            return text
+        import re
+        return re.sub(r'[，,。.？?]', '', text)
+
     async def _send_reply(self, context: Context, reply: str, metadata: Dict[str, Any]) -> bool:
-        """发送回复"""
+        """发送回复，并校验发送结果业务码（规则 5）"""
+        # 需求二：发送前清洗标点（句号、逗号、问号），清洗后为空则取消发送
+        reply = self._clean_text(reply)
+        if not reply.strip():
+            self.logger.warning(f"清洗后回复为空，取消发送: reply={reply!r}")
+            return False
         try:
             # 从metadata中提取必要信息
             shop_id = metadata.get('shop_id')
@@ -168,13 +251,34 @@ class AIReplyHandler(BaseHandler):
                 self.logger.warning(f"无可用发送器: channel_type={context.channel_type}")
                 return False
             result = await asyncio.to_thread(sender.send_text, shop_id, user_id, from_uid, reply)
-            if isinstance(result, dict) and result.get("success"):
-                return True
-            return False
+
+            # 规则 5: 校验发送结果与业务码，失败记录日志并返回 False（停止后续发送）
+            ok = self._check_send_result(result)
+            if ok:
+                # 规则 2: 记录本次发送时间，用于同一买家回复间隔控制
+                self.uid_tracker.record_send(from_uid)
+            return ok
 
         except Exception as e:
             self.logger.error(f"发送回复失败: {e}")
             return False
+
+    def _check_send_result(self, result) -> bool:
+        """规则 5: 校验发送结果，业务码非 0 视为失败"""
+        if not result:
+            return False
+        if isinstance(result, str):
+            # send_text 在业务错误（如 error_code=10002）时返回错误文案字符串
+            self.logger.error(f"发送失败（业务错误）: {result}")
+            return False
+        if result.get("success"):
+            error_code = result.get("result", {}).get("error_code", 0)
+            if error_code:
+                self.logger.error(f"发送业务码非 0: error_code={error_code}, result={result}")
+                return False
+            return True
+        self.logger.error(f"发送请求失败: {result}")
+        return False
 
     async def _handle_fallback(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """备用回复处理"""

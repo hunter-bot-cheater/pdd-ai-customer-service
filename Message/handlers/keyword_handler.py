@@ -7,7 +7,6 @@ from bridge.context import Context, ContextType
 from .base import BaseHandler
 from database.db_manager import db_manager
 from utils.logger_loguru import get_logger
-from bridge.sender import get_sender
 from Agent.CustomerAgent.tools.move_conversation import transfer_conversation, TransferConversationParams
 
 class KeywordDetectionHandler(BaseHandler):
@@ -108,17 +107,7 @@ class KeywordDetectionHandler(BaseHandler):
                 return True
 
             self.logger.error(f"会话转接失败: {result}")
-            # 无可用客服时，友好告知用户（保持原有体验）
-            if "无可用" in result or "无法获取客服列表" in result:
-                try:
-                    sender = get_sender(context.channel_type)
-                    if sender:
-                        await asyncio.to_thread(
-                            sender.send_text, shop_id, user_id, from_uid,
-                            "抱歉，当前没有其他客服在线，请您稍后再试。",
-                        )
-                except Exception as e:
-                    self.logger.error(f"发送无客服提示失败: {e}")
+            # 规则 6: 转人工后静默处理，不向用户发送预设回复话术
             return True if is_after_sale else False
 
         except Exception as e:
