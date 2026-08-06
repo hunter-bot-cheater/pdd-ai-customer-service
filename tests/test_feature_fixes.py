@@ -1,11 +1,23 @@
 """
-四个核心功能修复的验证测试
+核心功能修复 + 真人模拟规则的验证测试
 
 覆盖：
-1. 转人工后 AI 继续抢答 → 会话状态管理（4小时有效期），有效期内再次触发转人工
+A. 四个核心功能修复
+1. 转人工后 AI 继续抢答 → 会话状态管理（4小时有效期）
 2. 售后关键词自动转人工 → 售后词库命中后强制转人工并拦截
 3. 库存查询调用工具 → 系统提示词强制调用 get_shop_products + 库存输出
 4. 转人工通知到企业微信群 → Webhook 通知格式与发送
+
+B. 九条真人模拟硬性规则
+1. 模拟已读+打字：总延迟 10~14 秒（已读 6~8 秒 + 打字 4~6 秒）
+2. 同一买家连续回复间隔 4~6 秒（不足补齐）
+3. 单条消息最多 25 字，超长拆分
+4. 拆分后的多条消息间隔 3~6 秒
+5. 发送结果业务码校验，非 0 停止后续发送
+6. 转人工后静默处理，不发送预设回复话术
+7. 子账号转人工：不调用转人工 API，仅标记 + 通知
+8. 转人工后 AI 完全忽略该会话后续消息（直接返回 True）
+9. 转人工后新消息仍通知人工客服（5 分钟冷却防刷屏）
 
 运行方式（在项目根目录）：
     .venv/Scripts/python.exe -m unittest tests.test_feature_fixes -v
@@ -17,6 +29,7 @@ import time
 import unittest
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from unittest import mock
 
 warnings.filterwarnings("ignore")
@@ -25,10 +38,13 @@ warnings.filterwarnings("ignore")
 # 初始化：按 app.py 顺序注册标准服务（工具模块导入依赖 DI 容器）
 # ============================================================================
 from config import config as _app_config
+from config import get_config
 from core.di_container import configure_standard_services
 configure_standard_services(_app_config)
 
 from core.session_state import SessionState, session_state
+from core.uid_send_tracker import UIDSendTracker
+from core.notify_tracker import NotifyTracker, notify_tracker
 from Agent.CustomerAgent.tools import move_conversation as mc_module
 from Agent.CustomerAgent.tools.move_conversation import (
     transfer_conversation,
@@ -42,6 +58,7 @@ from Message.handlers.notify import (
     build_handoff_message,
     async_send_wechat_notification,
 )
+from utils.config_updater import update_config_with_uid
 from Agent.CustomerAgent.custom.message_builder import MessageBuilder
 from Agent.CustomerAgent.tools.get_product_list import _format_products_output
 from Agent.CustomerAgent.custom.tool_decorator import TOOL_REGISTRY
@@ -77,15 +94,32 @@ class FakeSender:
         return {"success": True}
 
 
-class MockBot:
-    """记录是否被调用的模拟 Bot"""
+class BusinessErrorSender(FakeSender):
+    """发送若干次成功后，返回业务码非 0 的结果（用于规则 5 测试）"""
 
-    def __init__(self):
+    def __init__(self, fail_after=1):
+        super().__init__()
+        self.fail_after = fail_after
+        self.count = 0
+
+    def send_text(self, shop_id, user_id, recipient_uid, text):
+        self.calls["send_text"].append((shop_id, user_id, recipient_uid, text))
+        self.count += 1
+        if self.count > self.fail_after:
+            return {"success": True, "result": {"error_code": 10002}}
+        return {"success": True}
+
+
+class MockBot:
+    """记录是否被调用的模拟 Bot，可配置返回的回复文本"""
+
+    def __init__(self, reply_text="好的，亲"):
         self.calls = []
+        self.reply_text = reply_text
 
     async def async_reply(self, query, context=None):
         self.calls.append((query, context))
-        return Reply(ReplyType.TEXT, "好的，亲")
+        return Reply(ReplyType.TEXT, self.reply_text)
 
 
 class CaptureWebhook:
@@ -136,6 +170,32 @@ def make_metadata(shop_id="shop1", user_id="user1", from_uid="buyer1", shop_name
         "shop_name": shop_name,
         "user_key": "pinduoduo_buyer1",
     }
+
+
+# ============================================================================
+# 配置辅助：加速测试（关闭真人模拟时序等待），用完恢复默认
+# ============================================================================
+
+def _zero_ai_reply_delays():
+    """将 AI 回复时序参数置 0，加速测试"""
+    _app_config.set("ai_reply.read_seconds_min", 0, save=False)
+    _app_config.set("ai_reply.read_seconds_max", 0, save=False)
+    _app_config.set("ai_reply.typing_seconds_min", 0, save=False)
+    _app_config.set("ai_reply.typing_seconds_max", 0, save=False)
+    _app_config.set("ai_reply.split_interval_min", 0, save=False)
+    _app_config.set("ai_reply.split_interval_max", 0, save=False)
+    _app_config.set("ai_reply.uid_min_interval", 0, save=False)
+
+
+def _restore_ai_reply_delays():
+    """恢复 AI 回复时序参数为生产默认值"""
+    _app_config.set("ai_reply.read_seconds_min", 6, save=False)
+    _app_config.set("ai_reply.read_seconds_max", 8, save=False)
+    _app_config.set("ai_reply.typing_seconds_min", 4, save=False)
+    _app_config.set("ai_reply.typing_seconds_max", 6, save=False)
+    _app_config.set("ai_reply.split_interval_min", 3, save=False)
+    _app_config.set("ai_reply.split_interval_max", 6, save=False)
+    _app_config.set("ai_reply.uid_min_interval", 4, save=False)
 
 
 # ============================================================================
@@ -192,12 +252,15 @@ class TestSessionState(unittest.TestCase):
 
 
 # ============================================================================
-# 测试 2：转人工工具标记会话 + 发送通知
+# 测试 2：转人工工具标记会话 + 发送通知（规则 6/7）
 # ============================================================================
 
 class TestTransferConversation(unittest.TestCase):
     def setUp(self):
         SessionState().clear_handoff("shop1:buyer1")
+        # 测试期间统一按"全部主账号"处理，不受真实 config 主账号列表影响
+        self._orig_main = get_config("transfer.main_account_user_ids", [])
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
         self.capture = CaptureWebhook()
         self.sender = FakeSender()
         self._sender_patch = mock.patch.object(mc_module, "get_sender", return_value=self.sender)
@@ -206,6 +269,7 @@ class TestTransferConversation(unittest.TestCase):
         self._notify_patch.start()
 
     def tearDown(self):
+        _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
         self._sender_patch.stop()
         self._notify_patch.stop()
 
@@ -253,12 +317,187 @@ class TestTransferConversation(unittest.TestCase):
 
 
 # ============================================================================
-# 测试 3：AI 处理器 —— 转人工有效期内不抢答，并重新触发转人工
+# 测试 3：主/子账号转人工行为（规则 7）
+# ============================================================================
+
+class TestSubAccountTransfer(unittest.TestCase):
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        self.capture = CaptureWebhook()
+        self.sender = FakeSender()
+        self._sender_patch = mock.patch.object(mc_module, "get_sender", return_value=self.sender)
+        self._sender_patch.start()
+        self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
+        self._notify_patch.start()
+        # 配置：user2 为子账号（完整 UID cs_shop1_user2），其余默认按主账号处理
+        self._orig_main = get_config("transfer.main_account_user_ids", [])
+        self._orig_sub = get_config("transfer.sub_account_uids", [])
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        _app_config.set("transfer.sub_account_uids", ["cs_shop1_user2"], save=False)
+
+    def tearDown(self):
+        _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
+        _app_config.set("transfer.sub_account_uids", self._orig_sub, save=False)
+        self._sender_patch.stop()
+        self._notify_patch.stop()
+
+    def test_sub_account_marks_and_notifies_without_api(self):
+        """规则 7: 子账号不调用转人工 API，仅标记会话 + 通知人工客服"""
+        params = TransferConversationParams(
+            shop_id="shop1", user_id="user2", recipient_uid="buyer1", shop_name="峰哥编织",
+        )
+        result = transfer_conversation(params)
+        self.assertIn("会话转接成功", result)
+        # 会话被标记（后续 AI 不再抢答）
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        # 子账号不调用转人工 API
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        # 但仍通知人工客服
+        self.assertEqual(len(self.capture.messages), 1)
+
+    def test_main_account_calls_api(self):
+        """主账号尝试真实转接"""
+        params = TransferConversationParams(
+            shop_id="shop1", user_id="user1", recipient_uid="buyer1", shop_name="峰哥编织",
+        )
+        result = transfer_conversation(params)
+        self.assertIn("会话转接成功", result)
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertEqual(len(self.capture.messages), 1)
+
+    def test_unconfigured_all_treated_as_main(self):
+        """未配置 main_account_user_ids 时，全部按主账号处理"""
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        _app_config.set("transfer.sub_account_uids", [], save=False)
+        params = TransferConversationParams(
+            shop_id="shop1", user_id="any_user", recipient_uid="buyer1",
+        )
+        result = transfer_conversation(params)
+        self.assertIn("会话转接成功", result)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+
+
+# ============================================================================
+# 测试 3.1：主/子账号判定（需求一：完整 UID 捕获后正确分类）
+# ============================================================================
+
+class TestIsMainAccount(unittest.TestCase):
+    """写入完整 UID 后，_is_main_account 对主/子账号的判定"""
+
+    def setUp(self):
+        self._orig_main = get_config("transfer.main_account_user_ids", [])
+        self._orig_sub = get_config("transfer.sub_account_uids", [])
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        _app_config.set("transfer.sub_account_uids", [], save=False)
+
+    def tearDown(self):
+        _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
+        _app_config.set("transfer.sub_account_uids", self._orig_sub, save=False)
+
+    def test_sub_account_list_marks_sub(self):
+        """子账号 UID 命中 sub_account_uids → 判定为子账号"""
+        _app_config.set("transfer.sub_account_uids", ["cs_661962391_189109418"], save=False)
+        self.assertFalse(mc_module._is_main_account("661962391", "189109418"))
+
+    def test_other_user_still_main(self):
+        _app_config.set("transfer.sub_account_uids", ["cs_661962391_189109418"], save=False)
+        self.assertTrue(mc_module._is_main_account("661962391", "661962391"))
+
+    def test_full_uid_in_main_list_detects_sub(self):
+        """兼容旧配置：main_account_user_ids 存完整子账号 UID → 判定为子账号"""
+        _app_config.set(
+            "transfer.main_account_user_ids", ["cs_661962391_189109418", "661962391"], save=False
+        )
+        self.assertFalse(mc_module._is_main_account("661962391", "189109418"))
+        self.assertTrue(mc_module._is_main_account("661962391", "661962391"))
+
+    def test_bare_user_id_in_main_list_is_main(self):
+        """兼容旧配置：裸 user_id 命中 main_account_user_ids → 主账号"""
+        _app_config.set("transfer.main_account_user_ids", ["user1"], save=False)
+        self.assertTrue(mc_module._is_main_account("shop1", "user1"))
+
+    def test_empty_config_all_main(self):
+        self.assertTrue(mc_module._is_main_account("shop1", "any_user"))
+
+
+# ============================================================================
+# 测试 3.2：运行时 WebSocket 认证捕获完整 UID（需求一）
+# ============================================================================
+
+class TestAuthUidCapture(unittest.TestCase):
+    """认证成功后从 WebSocket 认证响应捕获完整 UID 并写入配置"""
+
+    def setUp(self):
+        from Channel.pinduoduo.core.pdd_message_handler import MessageHandlerMixin
+        from utils.logger_loguru import get_logger
+        self.handler = MessageHandlerMixin()
+        self.handler.logger = get_logger("TestAuthUidCapture")
+
+    def make_auth_context(self, content):
+        return Context.create_pinduoduo_context(
+            content=content,
+            from_uid="",
+            user_id="189109418",
+            shop_id="661962391",
+            username="cs_661962391_189109418",
+            user_msg_type=ContextType.AUTH,
+            channel_type=ChannelType.PINDUODUO,
+        )
+
+    def test_captures_full_sub_uid(self):
+        # _convert_to_context 已将认证 dict 序列化为 JSON 字符串
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            self.handler._capture_auth_uid(
+                self.make_auth_context(json.dumps({"uid": "cs_661962391_189109418", "result": "ok"}))
+            )
+        m.assert_called_once_with("cs_661962391_189109418")
+
+    def test_captures_main_uid(self):
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            self.handler._capture_auth_uid(
+                self.make_auth_context(json.dumps({"uid": "661962391", "result": "ok"}))
+            )
+        m.assert_called_once_with("661962391")
+
+    def test_auth_failure_does_not_capture(self):
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            self.handler._capture_auth_uid(
+                self.make_auth_context(json.dumps({"uid": "cs_661962391_189109418", "result": "fail"}))
+            )
+        m.assert_not_called()
+
+    def test_missing_uid_does_not_capture(self):
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            self.handler._capture_auth_uid(self.make_auth_context(json.dumps({"result": "ok"})))
+        m.assert_not_called()
+
+    def test_invalid_json_does_not_capture(self):
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            self.handler._capture_auth_uid(self.make_auth_context("not-a-json"))
+        m.assert_not_called()
+
+    def test_handle_immediate_auth_writes_uid(self):
+        """AUTH 消息走 _handle_immediate_message → 捕获 UID，无需 SendMessage"""
+        with mock.patch("Channel.pinduoduo.core.pdd_message_handler.update_config_with_uid") as m:
+            asyncio.run(self.handler._handle_immediate_message(
+                self.make_auth_context(json.dumps({"uid": "cs_661962391_189109418", "result": "ok"})),
+                "661962391",
+                "189109418",
+            ))
+        m.assert_called_once_with("cs_661962391_189109418")
+
+
+# ============================================================================
+# 测试 4：AI 处理器 —— 转人工有效期内忽略消息（规则 8/9）
 # ============================================================================
 
 class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         SessionState().clear_handoff("shop1:buyer1")
+        notify_tracker.clear("shop1:buyer1")
+        # 加速测试：关闭真人模拟时序等待（规则 1/2/4）
+        _zero_ai_reply_delays()
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -271,20 +510,34 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self._sender_patch.stop()
         self._notify_patch.stop()
+        _restore_ai_reply_delays()
 
-    async def test_handoff_active_skips_ai_and_retriggers(self):
+    async def test_handoff_active_skips_ai_and_notifies(self):
+        """规则 8: 转人工后 AI 完全忽略该会话后续消息（不等待、不回复、不重触发）"""
         SessionState().mark_handoff("shop1:buyer1")
         context = make_context("在吗，请问发货了吗")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
         # AI 未被调用（不抢答）
         self.assertEqual(self.bot.calls, [])
-        # 再次触发转人工
-        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
-        # 再次通知人工，原因标注"有效期内再次发消息"
+        # 不再重复触发转人工 API
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        # 规则 9: 新消息仍通知人工客服，原因标注"转人工后买家新消息"
         self.assertEqual(len(self.capture.messages), 1)
-        self.assertIn("有效期内再次发消息", self.capture.messages[0])
+        self.assertIn("转人工后买家新消息", self.capture.messages[0])
         self.assertIn("在吗，请问发货了吗", self.capture.messages[0])
+
+    async def test_handoff_new_message_notify_cooldown(self):
+        """规则 9: 同会话冷却期内再次来消息，不重复通知（防刷屏）"""
+        SessionState().mark_handoff("shop1:buyer1")
+        context = make_context("在吗")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(len(self.capture.messages), 1)
+        # 冷却期内（5 分钟内）第二条消息 → 不再通知
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(len(self.capture.messages), 1)
 
     async def test_handoff_expired_ai_replies_normally(self):
         # 已过期（标记 0.1 秒）
@@ -296,7 +549,7 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         # AI 正常回复
         self.assertEqual(len(self.bot.calls), 1)
-        # 未重复转人工
+        # 未触发转人工
         self.assertEqual(self.sender.calls["transfer_to_cs"], [])
 
     async def test_no_handoff_ai_replies_normally(self):
@@ -309,25 +562,29 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
 
 
 # ============================================================================
-# 测试 4：售后关键词触发转人工
+# 测试 5：售后关键词触发转人工（规则 6 静默处理）
 # ============================================================================
 
 class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         SessionState().clear_handoff("shop1:buyer1")
+        # 测试期间统一按"全部主账号"处理，避免受真实 config 主账号列表影响
+        self._orig_main = get_config("transfer.main_account_user_ids", [])
+        self._orig_sub = get_config("transfer.sub_account_uids", [])
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        _app_config.set("transfer.sub_account_uids", [], save=False)
         self.sender = FakeSender()
         self._mc_patch = mock.patch.object(mc_module, "get_sender", return_value=self.sender)
         self._mc_patch.start()
-        self._kh_patch = mock.patch.object(kh_module, "get_sender", return_value=self.sender)
-        self._kh_patch.start()
         self.capture = CaptureWebhook()
         self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
         self._notify_patch.start()
         self.handler = KeywordDetectionHandler()
 
     def tearDown(self):
+        _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
+        _app_config.set("transfer.sub_account_uids", self._orig_sub, save=False)
         self._mc_patch.stop()
-        self._kh_patch.stop()
         self._notify_patch.stop()
 
     def test_after_sale_keywords_defined(self):
@@ -341,8 +598,11 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.handler.can_handle(context))
 
     def test_can_handle_regular_keyword(self):
+        # 不依赖数据库中的关键词状态，注入受控关键词源验证"转人工"检测
+        with mock.patch.object(kh_module.db_manager, "get_all_keywords", return_value=[{"keyword": "转人工"}]):
+            handler = KeywordDetectionHandler()
         context = make_context("转人工")
-        self.assertTrue(self.handler.can_handle(context))
+        self.assertTrue(handler.can_handle(context))
 
     def test_cannot_handle_normal_message(self):
         context = make_context("这件衣服多大码")
@@ -361,21 +621,177 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.assertIn("售后关键词触发转人工", self.capture.messages[0])
         self.assertIn("我要退款，商品有质量问题", self.capture.messages[0])
 
-    async def test_after_sale_failure_still_blocks(self):
-        # 无可用客服 → 转人工失败，但售后场景仍返回 True（拦截，避免 AI 回复敏感问题）
+    async def test_after_sale_failure_still_blocks_silently(self):
+        """规则 6: 转人工失败（无可用客服）时，售后场景仍拦截，但不发预设回复话术"""
         sender = FakeSender(cs_list={"cs_shop1_user1": {"username": "客服1"}})
         mc_module.get_sender = lambda: sender  # noqa: E731
-        kh_module.get_sender = lambda channel_type: sender
         context = make_context("我要投诉")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
         self.assertFalse(SessionState().is_handoff("shop1:buyer1"))
-        # 无可用客服时向用户说明（保持原有体验）
-        self.assertIn("当前没有其他客服在线", sender.calls["send_text"][0][3])
+        # 不向用户发送任何预设回复话术（静默处理）
+        self.assertEqual(sender.calls["send_text"], [])
+
+    async def test_sub_account_keyword_silent_mark_and_notify(self):
+        """规则 7: 子账号触发转人工关键词 → 不调用转人工 API，仅静默标记 + 通知"""
+        _app_config.set("transfer.sub_account_uids", ["cs_shop1_user1"], save=False)
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        context = make_context("退款", user_id="user1")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        # 子账号不调用转人工 API
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        # 会话被静默标记
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        # 仍通知人工客服
+        self.assertEqual(len(self.capture.messages), 1)
 
 
 # ============================================================================
-# 测试 5：库存查询调用工具（系统提示词 + 库存输出）
+# 测试 6：真人模拟规则（规则 1/2/3/4/5）
+# ============================================================================
+
+class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        _zero_ai_reply_delays()
+        self.bot = MockBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        self.sender = FakeSender()
+
+    def tearDown(self):
+        _restore_ai_reply_delays()
+
+    def test_split_reply_respects_max_len(self):
+        """规则 3: 超长回复被拆分为不超过 25 字的短消息，且内容完整保留"""
+        handler = AIReplyHandler(bot=MockBot())
+        long_reply = "亲，这款商品我们一般下单后48小时内发货哦，遇到大促可能会稍微延迟，但会尽快给您发出的。请放心购买哈。"
+        chunks = handler._split_reply(long_reply)
+        self.assertTrue(chunks)
+        for c in chunks:
+            self.assertLessEqual(len(c), handler.max_message_len)
+        # 拆分后内容应与原文一致（无空格的中文串）
+        self.assertEqual("".join(chunks), long_reply)
+
+    def test_split_reply_keeps_short_reply_whole(self):
+        handler = AIReplyHandler(bot=MockBot())
+        short = "亲，在的哦。"
+        chunks = handler._split_reply(short)
+        self.assertEqual(chunks, ["亲，在的哦。"])
+
+    def test_split_reply_empty(self):
+        handler = AIReplyHandler(bot=MockBot())
+        self.assertEqual(handler._split_reply(""), [])
+
+    def test_check_send_result_business_code(self):
+        """规则 5: 业务码校验"""
+        handler = AIReplyHandler(bot=MockBot())
+        # 成功 + 业务码 0 → 通过
+        self.assertTrue(handler._check_send_result({"success": True, "result": {"error_code": 0}}))
+        # 无 result 字段，默认业务码 0 → 通过
+        self.assertTrue(handler._check_send_result({"success": True}))
+        # success=True 但业务码非 0 → 失败
+        self.assertFalse(handler._check_send_result({"success": True, "result": {"error_code": 10002}}))
+        # 返回错误文案字符串 → 失败
+        self.assertFalse(handler._check_send_result("该消息发送失败，请稍后重试"))
+        # 返回 None / success=False → 失败
+        self.assertFalse(handler._check_send_result(None))
+        self.assertFalse(handler._check_send_result({"success": False}))
+
+    async def test_human_delay_is_10_to_14_seconds(self):
+        """规则 1: 已读 6~8 秒 + 打字 4~6 秒 = 合计 10~14 秒"""
+        # 显式设置为生产默认值
+        _restore_ai_reply_delays()
+        handler = AIReplyHandler(bot=MockBot())
+        with mock.patch("Message.handlers.ai_handler.asyncio.sleep") as mock_sleep:
+            await handler._simulate_human_delay("buyer1")
+        mock_sleep.assert_called_once()
+        delay = mock_sleep.call_args[0][0]
+        self.assertGreaterEqual(delay, 10.0)
+        self.assertLessEqual(delay, 14.0)
+
+    async def test_business_code_stops_subsequent_sends(self):
+        """规则 5: 发送业务码非 0 时记录日志并停止后续发送"""
+        self.bot = MockBot(reply_text="这是一条很长的回复，用来拆分成多条消息。第二句的内容。第三句的内容。")
+        handler = AIReplyHandler(bot=self.bot)
+        sender = BusinessErrorSender(fail_after=1)
+        with mock.patch("bridge.sender.get_sender", return_value=sender):
+            context = make_context("你好")
+            ok = await handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        # 第一条成功，第二条业务码非 0 → 停止，不再发送第三条
+        self.assertEqual(len(sender.calls["send_text"]), 2)
+
+    async def test_split_messages_all_sent_successfully(self):
+        """规则 3/4: 多条拆分消息全部发送成功（发送时已清洗标点）"""
+        self.bot = MockBot(reply_text="第一条短句。第二条短句。第三条短句。")
+        handler = AIReplyHandler(bot=self.bot)
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            context = make_context("你好")
+            ok = await handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        texts = [call[3] for call in self.sender.calls["send_text"]]
+        self.assertEqual(len(texts), 3)
+        self.assertEqual(texts, ["第一条短句", "第二条短句", "第三条短句"])
+
+
+# ============================================================================
+# 测试 7：同一买家回复间隔跟踪器（规则 2）
+# ============================================================================
+
+class TestUIDSendTracker(unittest.TestCase):
+    def test_pads_short_interval(self):
+        tracker = UIDSendTracker(min_interval=4.0)
+        tracker.record_send("buyer1")
+        # 立即再发：需要补齐到至少 4 秒
+        pad = tracker.wait_before_send("buyer1")
+        self.assertGreater(pad, 3.5)
+        self.assertLessEqual(pad, 4.0)
+
+    def test_unknown_uid_no_wait(self):
+        tracker = UIDSendTracker(min_interval=4.0)
+        self.assertEqual(tracker.wait_before_send("buyer9"), 0.0)
+
+    def test_after_wait_no_padding(self):
+        tracker = UIDSendTracker(min_interval=4.0)
+        tracker.record_send("buyer1")
+        time.sleep(4.2)
+        self.assertEqual(tracker.wait_before_send("buyer1"), 0.0)
+
+    def test_clear(self):
+        tracker = UIDSendTracker(min_interval=4.0)
+        tracker.record_send("buyer1")
+        tracker.clear("buyer1")
+        self.assertEqual(tracker.wait_before_send("buyer1"), 0.0)
+
+
+# ============================================================================
+# 测试 8：转人工通知冷却跟踪器（规则 9）
+# ============================================================================
+
+class TestNotifyTracker(unittest.TestCase):
+    def test_cooldown_blocks_repeat_notify(self):
+        tracker = NotifyTracker(cooldown_seconds=300)
+        self.assertTrue(tracker.should_notify("shop1:buyer1"))
+        tracker.update_notify("shop1:buyer1")
+        # 冷却期内不允许再次通知
+        self.assertFalse(tracker.should_notify("shop1:buyer1"))
+
+    def test_clear_resets_cooldown(self):
+        tracker = NotifyTracker(cooldown_seconds=300)
+        tracker.update_notify("shop1:buyer1")
+        tracker.clear("shop1:buyer1")
+        self.assertTrue(tracker.should_notify("shop1:buyer1"))
+
+    def test_module_singleton_shared_between_modules(self):
+        """规则 9: notify_tracker 是模块级单例，move_conversation 与 ai_handler 共用"""
+        from Message.handlers.ai_handler import notify_tracker as ai_notify_tracker
+        self.assertIsInstance(notify_tracker, NotifyTracker)
+        self.assertIs(ai_notify_tracker, notify_tracker)
+
+
+# ============================================================================
+# 测试 9：库存查询调用工具（系统提示词 + 库存输出）
 # ============================================================================
 
 class TestInventory(unittest.TestCase):
@@ -411,7 +827,7 @@ class TestInventory(unittest.TestCase):
 
 
 # ============================================================================
-# 测试 6：企业微信群机器人通知
+# 测试 10：企业微信群机器人通知
 # ============================================================================
 
 class TestWechatNotify(unittest.TestCase):
@@ -472,6 +888,158 @@ class TestWechatNotify(unittest.TestCase):
             server.shutdown()
             server.server_close()
         self.assertFalse(result)
+
+
+# ============================================================================
+# 测试 11：自动写入 UID 到 config.json（需求一）
+# ============================================================================
+
+class TestConfigUpdater(unittest.TestCase):
+    """需求一：账号认证成功后自动写入完整 UID 到 config.json"""
+
+    def setUp(self):
+        # 备份 config.json 原内容，测试结束后恢复
+        config_path = Path("config.json")
+        self._orig_content = config_path.read_text(encoding="utf-8") if config_path.exists() else None
+        # 清空内存中的列表，构造"未配置"场景
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        _app_config.set("transfer.sub_account_uids", [], save=False)
+        self._orig_llm = get_config("llm.model_name", "")
+
+    def tearDown(self):
+        # 恢复 config.json 原内容并重载缓存，避免污染真实配置
+        if self._orig_content is not None:
+            Path("config.json").write_text(self._orig_content, encoding="utf-8")
+        _app_config.reload()
+
+    def test_adds_uid(self):
+        ok = update_config_with_uid("661962391")
+        self.assertTrue(ok)
+        self.assertIn("661962391", get_config("transfer.main_account_user_ids", []))
+
+    def test_dedup(self):
+        update_config_with_uid("661962391")
+        update_config_with_uid("661962391")
+        lst = get_config("transfer.main_account_user_ids", [])
+        self.assertEqual(lst.count("661962391"), 1)
+
+    def test_multiple_uids(self):
+        update_config_with_uid("111")
+        update_config_with_uid("222")
+        lst = get_config("transfer.main_account_user_ids", [])
+        self.assertEqual(sorted(lst), ["111", "222"])
+
+    def test_empty_uid_rejected(self):
+        self.assertFalse(update_config_with_uid(""))
+        self.assertFalse(update_config_with_uid(None))
+
+    def test_preserves_other_config(self):
+        update_config_with_uid("661962391")
+        # 其他配置字段未被覆盖或删除
+        self.assertEqual(get_config("llm.model_name", ""), self._orig_llm)
+        self.assertIsNotNone(get_config("notification.wechat_webhook", None))
+
+    def test_sub_account_uid_written_to_both_lists(self):
+        """完整子账号 UID（cs_ 开头）同时写入 main 与 sub 列表"""
+        ok = update_config_with_uid("cs_661962391_189109418")
+        self.assertTrue(ok)
+        self.assertIn("cs_661962391_189109418", get_config("transfer.main_account_user_ids", []))
+        self.assertIn("cs_661962391_189109418", get_config("transfer.sub_account_uids", []))
+
+    def test_main_uid_not_in_sub_list(self):
+        """主账号 UID（纯数字）只写 main 列表，不写 sub 列表"""
+        update_config_with_uid("661962391")
+        self.assertIn("661962391", get_config("transfer.main_account_user_ids", []))
+        self.assertNotIn("661962391", get_config("transfer.sub_account_uids", []))
+
+    def test_sub_list_dedup(self):
+        update_config_with_uid("cs_661962391_189109418")
+        update_config_with_uid("cs_661962391_189109418")
+        subs = get_config("transfer.sub_account_uids", [])
+        self.assertEqual(subs.count("cs_661962391_189109418"), 1)
+
+
+# ============================================================================
+# 测试 12：回复标点清洗（需求二）
+# ============================================================================
+
+class TestCleanText(unittest.TestCase):
+    """需求二：_clean_text 移除中英文句号、逗号、问号"""
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=MockBot())
+
+    def test_removes_chinese_punctuation(self):
+        self.assertEqual(
+            self.handler._clean_text("亲，在的哦。您有什么需要帮忙？"),
+            "亲在的哦您有什么需要帮忙",
+        )
+
+    def test_removes_english_punctuation(self):
+        self.assertEqual(
+            self.handler._clean_text("Hello, world. How are you?"),
+            "Hello world How are you",
+        )
+
+    def test_empty_and_punct_only(self):
+        self.assertEqual(self.handler._clean_text(""), "")
+        self.assertEqual(self.handler._clean_text("。，？,."), "")
+
+    def test_no_punctuation_unchanged(self):
+        self.assertEqual(self.handler._clean_text("亲在的哦"), "亲在的哦")
+
+
+class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
+    """需求二：发送前清洗；纯标点分条跳过；整条纯标点走备用回复（同样被清洗）"""
+
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        _zero_ai_reply_delays()
+        self.sender = FakeSender()
+        self.bot = MockBot()
+
+    def tearDown(self):
+        _restore_ai_reply_delays()
+
+    async def test_send_removes_punctuation(self):
+        self.bot = MockBot(reply_text="亲，这款商品48小时内发货哦。请您放心。")
+        handler = AIReplyHandler(bot=self.bot)
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            context = make_context("发货时间？")
+            ok = await handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        texts = [call[3] for call in self.sender.calls["send_text"]]
+        self.assertTrue(texts)
+        for t in texts:
+            for p in "，,。.？?":
+                self.assertNotIn(p, t)
+        self.assertIn("亲这款商品48小时内发货哦", texts[0])
+        self.assertIn("请您放心", texts[1])
+
+    async def test_punct_only_chunk_skipped(self):
+        # 回复含纯标点分条 → 该条跳过，其余正常发送
+        self.bot = MockBot(reply_text="你好。？？？.。")
+        handler = AIReplyHandler(bot=self.bot)
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            context = make_context("在吗")
+            ok = await handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        texts = [call[3] for call in self.sender.calls["send_text"]]
+        self.assertEqual(texts, ["你好"])
+
+    async def test_pure_punctuation_reply_falls_back_cleaned(self):
+        # 整条回复仅由标点组成 → 清洗后为空，走备用回复（备用回复同样被清洗）
+        self.bot = MockBot(reply_text="？？？")
+        handler = AIReplyHandler(bot=self.bot)
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            context = make_context("在吗")
+            ok = await handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        texts = [call[3] for call in self.sender.calls["send_text"]]
+        self.assertTrue(texts)
+        for t in texts:
+            for p in "，,。.？?":
+                self.assertNotIn(p, t)
 
 
 if __name__ == "__main__":

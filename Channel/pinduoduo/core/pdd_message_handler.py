@@ -5,6 +5,7 @@ from websockets import exceptions as ws_exceptions
 from bridge.context import Context, ContextType, ChannelType
 from Channel.pinduoduo.pdd_message import PDDChatMessage
 from database import db_manager
+from utils.config_updater import update_config_with_uid
 from utils.logger_loguru import get_logger
 
 
@@ -121,18 +122,14 @@ class MessageHandlerMixin:
         username = context.kwargs.username
         recipient_uid = context.kwargs.from_uid
         try:
+            # 认证消息：捕获完整 UID 写入配置，无需创建 SendMessage
+            if context.type == ContextType.AUTH:
+                self._capture_auth_uid(context)
+                return
+
             from Channel.pinduoduo.utils.API.send_message import SendMessage
             send_message = SendMessage(shop_id, user_id)
-            if context.type == ContextType.AUTH:
-                auth_info = context.content
-                if isinstance(auth_info, dict):
-                    result = auth_info.get('result')
-                    if result == 'ok':
-                        self.logger.info(f"{username}认证成功")
-                    else:
-                        self.logger.warning(f"{username}认证失败")
-
-            elif context.type == ContextType.WITHDRAW:
+            if context.type == ContextType.WITHDRAW:
                 self.logger.info(f"收到撤回消息: {context.content}")
                 send_message.send_text(recipient_uid, "[玫瑰]")
 
@@ -157,6 +154,36 @@ class MessageHandlerMixin:
 
         except Exception as e:
             self.logger.error(f"立即处理消息失败: {e}")
+
+    def _capture_auth_uid(self, context: Context) -> None:
+        """认证成功后捕获完整 UID 并写入 config.json
+
+        需求：运行时从 WebSocket 认证响应中获取完整 UID
+        （子账号如 'cs_661962391_189109418'，主账号为纯数字），
+        自动写入 transfer.main_account_user_ids 与 transfer.sub_account_uids，
+        供主/子账号判定与转人工流程使用。
+        """
+        # _convert_to_context 已将认证 dict 序列化为 JSON 字符串
+        try:
+            auth_info = json.loads(context.content or "")
+        except (json.JSONDecodeError, TypeError):
+            self.logger.warning("认证消息格式异常，跳过 UID 捕获")
+            return
+        if not isinstance(auth_info, dict):
+            self.logger.warning("认证消息格式异常，跳过 UID 捕获")
+            return
+
+        result = auth_info.get('result')
+        if result != 'ok':
+            self.logger.warning(f"{context.kwargs.username}认证失败")
+            return
+        self.logger.info(f"{context.kwargs.username}认证成功")
+
+        uid = auth_info.get('uid')
+        if not uid:
+            self.logger.warning("认证响应缺少 uid，跳过 UID 捕获")
+            return
+        update_config_with_uid(str(uid))
 
     def _convert_to_context(self, pdd_message: PDDChatMessage, shop_id: str, user_id: str, username: str) -> Context:
         """将拼多多消息转换为Context格式"""

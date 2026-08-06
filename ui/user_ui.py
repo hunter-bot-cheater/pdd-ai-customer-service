@@ -633,6 +633,12 @@ class UserManagerWidget(QFrame):
             shop_name = result["shop_name"]
             user_id = result["user_id"]
             username = result["username"]
+
+            # 完整 UID（子账号为 cs_{shop_id}_{user_id}，主账号为纯数字）在运行时
+            # WebSocket 认证成功后由 pdd_message_handler 捕获并写入 config.json，
+            # 登录阶段拿不到完整 UID，这里不再写入，避免写入不完整的 user_id
+            # 导致主/子账号判定错误。
+
             # 1. 检查账号是否已存在
             existing_account = account_service.get_account(channel_name, shop_id, user_id)
             if existing_account:
