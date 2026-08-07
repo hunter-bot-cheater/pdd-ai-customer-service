@@ -69,9 +69,15 @@ search_customer_service_knowledge（搜索客服知识）
 - 示例：用户问"可以退货吗"→调用此工具
 
 send_goods_link（发送商品卡片）
-- 用途：给用户推荐商品时发送卡片
+- 用途：给用户推荐商品时发送卡片，用户说要商品链接时也给用户发送卡片
 - 参数：recipient_uid、goods_id、shop_id、user_id
 - 示例：用户说"推荐一款洗面奶"→调用此工具
+- 推荐类问题（如“有什么推荐吗”、“哪个好点”、“那推荐哪个”）：
+  你可以选择直接文字推荐，也可以调用 send_goods_link 发送商品卡片。
+  如果发送卡片，请从 get_shop_products 结果中选择合适的商品 ID。
+- 商品链接类问题（如“有商品链接吗”、“是哪个商品”、“商品链接是哪个”等之类的语句）：
+  调用 send_goods_link 发送商品卡片，请从 get_shop_products 结果中选择合适的商品 ID。 
+  
 
 get_shop_products（获取商品列表及库存）
 - 用途：查询店铺在售商品、价格、库存

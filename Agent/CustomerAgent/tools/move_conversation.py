@@ -19,7 +19,7 @@ class TransferConversationParams(BaseModel):
     """会话转接参数"""
     shop_id: Optional[Union[str, int]] = Field(default=None, description="店铺ID")
     user_id: Optional[Union[str, int]] = Field(default=None, description="用户ID（账号ID）")
-    recipient_uid: Optional[str] = Field(default=None, description="接收转接的用户UID")
+    recipient_uid: Optional[Union[str, int]] = Field(default=None, description="接收转接的用户UID")
     shop_name: Optional[str] = Field(default=None, description="店铺名称")
 
 
@@ -66,7 +66,7 @@ def _is_main_account(shop_id, user_id) -> bool:
 def _mark_handoff(params: TransferConversationParams) -> None:
     """转接成功后标记会话为已转人工（失败仅记录日志，不影响主流程）"""
     try:
-        session_key = f"{params.shop_id}:{params.recipient_uid}"
+        session_key = f"{params.shop_id}:{str(params.recipient_uid)}"
         SessionState().mark_handoff(session_key)
         logger.info(f"已标记会话转人工状态: session_key={session_key}")
     except Exception as e:
@@ -80,7 +80,7 @@ def _notify_handoff(params: TransferConversationParams, reason: str, last_messag
         from Message.handlers.notify import build_handoff_message, send_wechat_notification_sync
         message = build_handoff_message(
             shop_name=params.shop_name or "",
-            buyer_uid=params.recipient_uid or "",
+            buyer_uid=str(params.recipient_uid) if params.recipient_uid else "",
             reason=reason,
             last_message=last_message,
         )
@@ -135,7 +135,7 @@ def transfer_conversation(
                 # 选择第一个可用的客服
                 cs_uid = available_cs_uids[0]
                 # 转移会话
-                transfer_result = sender.transfer_to_cs(str(params.shop_id), str(params.user_id), params.recipient_uid, cs_uid)
+                transfer_result = sender.transfer_to_cs(str(params.shop_id), str(params.user_id), str(params.recipient_uid), cs_uid)
 
                 if transfer_result and transfer_result.get('success'):
                     logger.info(f"会话转接成功: recipient_uid={params.recipient_uid}, to_cs_uid={cs_uid}")

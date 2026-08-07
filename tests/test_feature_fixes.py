@@ -23,6 +23,7 @@ B. 九条真人模拟硬性规则
     .venv/Scripts/python.exe -m unittest tests.test_feature_fixes -v
 """
 import asyncio
+import datetime as _real_dt
 import json
 import threading
 import time
@@ -51,6 +52,7 @@ from Agent.CustomerAgent.tools.move_conversation import (
     TransferConversationParams,
 )
 from Message.handlers.ai_handler import AIReplyHandler
+from Message.handlers import ai_handler as ai_module
 from Message.handlers import keyword_handler as kh_module
 from Message.handlers.keyword_handler import KeywordDetectionHandler
 from Message.handlers import notify as notify_module
@@ -61,7 +63,7 @@ from Message.handlers.notify import (
 from utils.config_updater import update_config_with_uid
 from Agent.CustomerAgent.custom.message_builder import MessageBuilder
 from Agent.CustomerAgent.tools.get_product_list import _format_products_output
-from Agent.CustomerAgent.custom.tool_decorator import TOOL_REGISTRY
+from Agent.CustomerAgent.custom.tool_decorator import TOOL_REGISTRY, execute_tool
 
 from bridge.context import Context, ContextType, ChannelType
 from bridge.reply import Reply, ReplyType
@@ -198,6 +200,14 @@ def _restore_ai_reply_delays():
     _app_config.set("ai_reply.uid_min_interval", 4, save=False)
 
 
+def _set_inside_business_hours():
+    """将营业时间设为包含当前时刻的 ±1 小时窗口，避免 handle 测试受运行时刻影响"""
+    now = _real_dt.datetime.now()
+    start = (now - _real_dt.timedelta(hours=1)).strftime("%H:%M")
+    end = (now + _real_dt.timedelta(hours=1)).strftime("%H:%M")
+    _app_config.set("business_hours", {"start": start, "end": end}, save=False)
+
+
 # ============================================================================
 # 测试 1：会话状态管理器
 # ============================================================================
@@ -314,6 +324,20 @@ class TestTransferConversation(unittest.TestCase):
         params = TransferConversationParams(shop_id="shop1")
         result = transfer_conversation(params)
         self.assertIn("缺少必要的会话信息", result)
+
+    def test_int_recipient_uid_coerced_to_str(self):
+        """AI 可能以整数形式提取 recipient_uid，参数模型应接受并转字符串使用"""
+        params = TransferConversationParams(
+            shop_id="shop1", user_id="user1", recipient_uid=5927195871573, shop_name="峰哥编织",
+        )
+        result = transfer_conversation(params)
+        self.assertIn("会话转接成功", result)
+        # 会话标记使用字符串形式的 UID
+        self.assertTrue(SessionState().is_handoff("shop1:5927195871573"))
+        # 转人工 API 收到字符串形式的 recipient_uid
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        shop_id, user_id, recipient_uid, cs_uid = self.sender.calls["transfer_to_cs"][0]
+        self.assertEqual(recipient_uid, "5927195871573")
 
 
 # ============================================================================
@@ -498,6 +522,7 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         notify_tracker.clear("shop1:buyer1")
         # 加速测试：关闭真人模拟时序等待（规则 1/2/4）
         _zero_ai_reply_delays()
+        _set_inside_business_hours()
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -655,6 +680,7 @@ class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         SessionState().clear_handoff("shop1:buyer1")
         _zero_ai_reply_delays()
+        _set_inside_business_hours()
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -733,6 +759,186 @@ class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
         texts = [call[3] for call in self.sender.calls["send_text"]]
         self.assertEqual(len(texts), 3)
         self.assertEqual(texts, ["第一条短句", "第二条短句", "第三条短句"])
+
+
+# ============================================================================
+# 测试 6.1：URL 保护 —— 拆分时 URL 完整无损、不被截断
+# ============================================================================
+
+class TestSplitUrlProtection(unittest.TestCase):
+    """_split_reply 对 URL 的保护：占位符替换 → 拆分 → 还原"""
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=MockBot())
+
+    def test_url_single_message_preserved(self):
+        """示例：含 URL 的整条消息不超过上限时，原样保留为一条"""
+        reply = "亲，链接是 https://www.pinduoduo.com/search?keyword=保温杯，您看下。"
+        chunks = self.handler._split_reply(reply)
+        self.assertEqual(chunks, [reply])
+
+    def test_url_intact_in_long_message(self):
+        """URL 位于长消息中：完整出现在同一条，不被截断"""
+        url = "https://mobile.yangkeduo.com/goods.html?goods_id=123456789012345"
+        reply = f"亲这是商品链接{url}，这款保温杯很受欢迎销量很好质量也不错您可以放心购买。"
+        chunks = self.handler._split_reply(reply)
+        joined = "".join(chunks)
+        self.assertIn(url, joined)
+        self.assertEqual(sum(1 for c in chunks if url in c), 1)
+
+    def test_multiple_urls_all_intact(self):
+        url1 = "https://mobile.yangkeduo.com/goods.html?goods_id=111"
+        url2 = "https://mobile.yangkeduo.com/goods.html?goods_id=222"
+        reply = f"第一个链接{url1}，第二个链接{url2}，都可以看看哦。"
+        chunks = self.handler._split_reply(reply)
+        joined = "".join(chunks)
+        self.assertIn(url1, joined)
+        self.assertIn(url2, joined)
+        self.assertEqual(sum(1 for c in chunks if url1 in c), 1)
+        self.assertEqual(sum(1 for c in chunks if url2 in c), 1)
+
+    def test_url_longer_than_max_stays_whole(self):
+        """URL 单独超过字数上限：允许该条略超，但 URL 完整"""
+        url = "https://www.pinduoduo.com/mobile/mall/goods_detail?goods_id=" + "9" * 40
+        reply = f"链接{url}。"
+        chunks = self.handler._split_reply(reply)
+        joined = "".join(chunks)
+        self.assertIn(url, joined)
+        self.assertEqual(sum(1 for c in chunks if url in c), 1)
+        # 含 URL 的消息允许超过 25 字
+        self.assertTrue(any(len(c) > self.handler.max_message_len for c in chunks))
+
+    def test_url_followed_by_long_text_not_glued(self):
+        """URL 后的标点/长文本不被并入 URL，仍可正常拆分"""
+        url = "https://x.com/abc"
+        reply = (f"链接：{url}，后面这一段是很长的描述文字超过二十五个字了请查看详情，"
+                 "另一句也超过二十五字了请仔细核对一下。")
+        chunks = self.handler._split_reply(reply)
+        joined = "".join(chunks)
+        self.assertIn(url, joined)
+        self.assertEqual(sum(1 for c in chunks if url in c), 1)
+        # 长文本未被 URL 吞并，存在独立于 URL 的更多分片
+        self.assertGreater(len(chunks), 1)
+
+    def test_url_does_not_break_reconstruction_without_spaces(self):
+        """无空格干扰时，拆分后拼接应与原文一致（URL 完整）"""
+        url = "https://mobile.yangkeduo.com/goods.html?goods_id=123456"
+        reply = f"亲这是链接{url}您看下这个商品。"
+        chunks = self.handler._split_reply(reply)
+        self.assertEqual("".join(chunks), reply)
+
+
+# ============================================================================
+# 测试：营业时间检查（非营业时间静默转人工 + 企业微信通知）
+# ============================================================================
+
+class _FixedDateTime(_real_dt.datetime):
+    """固定 now() 的 datetime 子类，供营业时间判断单测使用"""
+    fixed_now = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fixed_now
+
+
+class _FakeDatetimeModule:
+    """模拟 datetime 模块：datetime.now() 固定、strptime 继承自真实 datetime"""
+    datetime = _FixedDateTime
+
+
+class TestBusinessHours(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        notify_tracker.clear("shop1:buyer1")
+        _zero_ai_reply_delays()
+        self._orig_bh = get_config("business_hours", {})
+        self.bot = MockBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        self.sender = FakeSender()
+        # _send_reply 内部从 bridge.sender 取发送器
+        self._bridge_sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
+        self._bridge_sender_patch.start()
+        self.capture = CaptureWebhook()
+        self._notify_patch = mock.patch.object(
+            notify_module, "_post_wechat_sync",
+            side_effect=lambda msg: (self.capture.messages.append(msg), True)[1],
+        )
+        self._notify_patch.start()
+
+    def tearDown(self):
+        _app_config.set("business_hours", self._orig_bh, save=False)
+        self._bridge_sender_patch.stop()
+        self._notify_patch.stop()
+        _restore_ai_reply_delays()
+
+    def _set_business_window(self, start, end):
+        _app_config.set("business_hours", {"start": start, "end": end}, save=False)
+
+    def _time_str(self, delta_minutes):
+        """返回 now + delta 分钟的 %H:%M 字符串（跨零点由 datetime 运算保证）"""
+        return (_real_dt.datetime.now() + _real_dt.timedelta(minutes=delta_minutes)).strftime("%H:%M")
+
+    async def test_outside_hours_marks_handoff_and_notifies_no_ai(self):
+        """非营业时间：静默转人工、通知企业微信、不执行 AI 回复"""
+        self._set_business_window(self._time_str(2), self._time_str(4))
+        context = make_context("在吗，发货了吗")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        # 不调用 AI
+        self.assertEqual(self.bot.calls, [])
+        # 不发送任何回复
+        self.assertEqual(self.sender.calls["send_text"], [])
+        # 静默标记转人工
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        # 通知企业微信，原因标注"非营业时间自动转人工"
+        self.assertEqual(len(self.capture.messages), 1)
+        self.assertIn("非营业时间自动转人工", self.capture.messages[0])
+        self.assertIn("峰哥编织", self.capture.messages[0])
+        self.assertIn("buyer1", self.capture.messages[0])
+        self.assertIn("在吗，发货了吗", self.capture.messages[0])
+
+    async def test_inside_hours_replies_normally(self):
+        """营业时间内：正常 AI 回复，不标记转人工、不通知"""
+        self._set_business_window(self._time_str(-2), self._time_str(2))
+        context = make_context("你好")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        # AI 正常回复
+        self.assertEqual(len(self.bot.calls), 1)
+        self.assertGreaterEqual(len(self.sender.calls["send_text"]), 1)
+        # 未标记转人工、未通知
+        self.assertFalse(SessionState().is_handoff("shop1:buyer1"))
+        self.assertEqual(self.capture.messages, [])
+
+    async def test_outside_hours_notify_failure_does_not_affect_flow(self):
+        """非营业时间通知发送失败：仅记录警告，仍静默转人工并拦截"""
+        self._notify_patch.stop()
+        self._notify_patch = mock.patch.object(notify_module, "_post_wechat_sync", return_value=False)
+        self._notify_patch.start()
+        self._set_business_window(self._time_str(2), self._time_str(4))
+        context = make_context("在吗")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(self.bot.calls, [])
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+
+    def test_is_outside_business_hours_config(self):
+        """_is_outside_business_hours 对配置区间与跨零点区间的判断"""
+        _FixedDateTime.fixed_now = _real_dt.datetime(2026, 8, 7, 12, 0, 0)
+        with mock.patch.object(ai_module, "datetime", _FakeDatetimeModule):
+            self._set_business_window("09:00", "18:00")
+            self.assertFalse(self.handler._is_outside_business_hours())
+            # 跨零点营业：18:00-09:00，12:00 在区间外
+            self._set_business_window("18:00", "09:00")
+            self.assertTrue(self.handler._is_outside_business_hours())
+            # 全天营业：00:00-23:59
+            self._set_business_window("00:00", "23:59")
+            self.assertFalse(self.handler._is_outside_business_hours())
+
+    def test_invalid_business_hours_defaults_to_inside(self):
+        """配置解析失败时保守地按营业时间内处理"""
+        with mock.patch.object(ai_module, "get_config", return_value={"start": "bad", "end": "23:00"}):
+            self.assertFalse(self.handler._is_outside_business_hours())
 
 
 # ============================================================================
@@ -995,6 +1201,7 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         SessionState().clear_handoff("shop1:buyer1")
         _zero_ai_reply_delays()
+        _set_inside_business_hours()
         self.sender = FakeSender()
         self.bot = MockBot()
 
@@ -1040,6 +1247,69 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
         for t in texts:
             for p in "，,。.？?":
                 self.assertNotIn(p, t)
+
+
+# ============================================================================
+# 测试 13：send_goods_link 兼容 AI 传入的整数 recipient_uid
+# ============================================================================
+
+class TestSendGoodsLinkIntUid(unittest.TestCase):
+    """AI 以整数形式提取 recipient_uid 时，工具应正常执行并转为字符串"""
+
+    def setUp(self):
+        from Agent.CustomerAgent.tools import send_goods_link as sg_module
+        self.sg_module = sg_module
+        self.calls = []
+
+        class _FakeSender:
+            def __init__(self, calls):
+                self.calls = calls
+
+            def send_product_card(self, shop_id, user_id, recipient_uid, goods_id, biz_type=2):
+                self.calls.append((shop_id, user_id, recipient_uid, goods_id, biz_type))
+                return {"success": True}
+
+        self.sender = _FakeSender(self.calls)
+        self._patch = mock.patch.object(sg_module, "get_sender", return_value=self.sender)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def test_params_model_accepts_int_uid(self):
+        p = self.sg_module.SendGoodsLinkParams(
+            recipient_uid=5927195871573, goods_id=100123, shop_id="1", user_id="2"
+        )
+        self.assertEqual(p.recipient_uid, 5927195871573)
+
+    def test_execute_tool_with_int_uid(self):
+        """execute_tool 不再因 recipient_uid 为 int 触发校验错误，且以字符串调用 API"""
+        result = execute_tool(
+            "send_goods_link",
+            json.dumps({
+                "recipient_uid": 5927195871573,
+                "goods_id": 100123,
+                "shop_id": 661962391,
+                "user_id": 189109418,
+            }),
+            {},
+        )
+        self.assertIn("商品卡片发送成功", result)
+        self.assertEqual(len(self.calls), 1)
+        shop_id, user_id, recipient_uid, goods_id, biz_type = self.calls[0]
+        self.assertEqual(recipient_uid, "5927195871573")
+        self.assertEqual(shop_id, "661962391")
+        self.assertEqual(user_id, "189109418")
+        self.assertEqual(goods_id, 100123)
+
+    def test_execute_tool_missing_params(self):
+        result = execute_tool(
+            "send_goods_link",
+            json.dumps({"recipient_uid": "buyer1", "goods_id": 100123}),
+            {},
+        )
+        self.assertIn("缺少必要", result)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
