@@ -15,7 +15,7 @@ logger = get_logger("SendGoodsLinkTool")
 
 class SendGoodsLinkParams(BaseModel):
     """发送商品卡片参数"""
-    recipient_uid: Optional[str] = Field(default=None, description="接收消息的用户UID")
+    recipient_uid: Optional[Union[str, int]] = Field(default=None, description="接收消息的用户UID")
     goods_id: Optional[int] = Field(default=None, description="商品ID。必须使用商品列表中给出的 商品ID（通常是很大的数字）。绝对不能使用列表序号(1, 2, 3...)，那是错误的！")
     shop_id: Optional[Union[str, int]] = Field(default=None, description="店铺ID")
     user_id: Optional[Union[str, int]] = Field(default=None, description="用户ID（账号ID）")
@@ -47,7 +47,7 @@ def send_goods_link(params: SendGoodsLinkParams) -> str:
             return f"发送失败：goods_id={params.goods_id} 无效。你错误地使用了列表序号作为商品ID，请回到商品列表中，使用'商品ID'标签后面给出的那个大数字作为goods_id，重新调用工具。"
 
         sender = get_sender()
-        result = sender.send_product_card(str(params.shop_id), str(params.user_id), params.recipient_uid, params.goods_id, biz_type=2)
+        result = sender.send_product_card(str(params.shop_id), str(params.user_id), str(params.recipient_uid), params.goods_id, biz_type=2)
 
         if result and result.get("success"):
             logger.info(f"商品卡片发送成功: goods_id={params.goods_id}, recipient_uid={params.recipient_uid}, shop_id={params.shop_id}")

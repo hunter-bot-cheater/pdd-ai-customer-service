@@ -4,6 +4,7 @@ AI回复处理器
 """
 import random
 import asyncio
+import datetime
 from typing import Dict, Any, Optional, List
 from bridge.context import Context, ContextType
 from .base import BaseHandler
@@ -56,9 +57,60 @@ class AIReplyHandler(BaseHandler):
         # 支持多种消息类型
         return context.type in self.auto_reply_types
 
+    def _is_outside_business_hours(self) -> bool:
+        """判断当前时间是否处于营业时间之外（非营业时间返回 True）
+
+        从 config.json 的 business_hours 读取 start/end（默认 08:00-23:00），
+        支持 start > end 的跨零点营业区间（如 23:00-08:00）。
+        配置解析失败时保守地按营业时间内处理。
+        """
+        try:
+            business_hours = get_config("business_hours", {}) or {}
+            start_str = str(business_hours.get("start", "08:00"))
+            end_str = str(business_hours.get("end", "23:00"))
+            start_time = datetime.datetime.strptime(start_str, "%H:%M").time()
+            end_time = datetime.datetime.strptime(end_str, "%H:%M").time()
+            now = datetime.datetime.now().time()
+
+            if start_time <= end_time:
+                return not (start_time <= now <= end_time)
+            # 跨零点营业（如 23:00-08:00）：营业区间为 [start, 24:00) ∪ [00:00, end]
+            return not (now >= start_time or now <= end_time)
+        except Exception as e:
+            self.logger.warning(f"营业时间解析失败，按营业时间内处理: {e}")
+            return False
+
+    async def _notify_after_hours(self, context: Context, metadata: Dict[str, Any], from_uid: Optional[str]) -> None:
+        """非营业时间通知人工客服（发送失败仅记录警告日志，不影响主流程）"""
+        try:
+            from Message.handlers.notify import async_send_wechat_notification, build_handoff_message
+            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', '') or ""
+            message = build_handoff_message(
+                shop_name=shop_name,
+                buyer_uid=from_uid or "",
+                reason="非营业时间自动转人工",
+                last_message=context.content or "",
+            )
+            ok = await async_send_wechat_notification(message)
+            if not ok:
+                self.logger.warning(f"非营业时间通知发送失败: session={from_uid}")
+        except Exception as e:
+            self.logger.warning(f"非营业时间通知发送异常: {e}")
+
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """处理AI回复（支持分条短消息发送 + 真人时序模拟）"""
         try:
+            # ===== 0. 营业时间检查：非营业时间静默转人工，不执行 AI 回复 =====
+            if self._is_outside_business_hours():
+                shop_id = metadata.get('shop_id')
+                from_uid = metadata.get('from_uid')
+                session_key = f"{shop_id}:{from_uid}"
+                if shop_id and from_uid:
+                    SessionState().mark_handoff(session_key)
+                self.logger.info(f"非营业时间，会话 {session_key} 静默标记为转人工，不进行 AI 回复")
+                await self._notify_after_hours(context, metadata, from_uid)
+                return True  # 拦截后续处理
+
             # ===== 0. 转人工状态检测：规则 8，转人工后 AI 完全忽略该会话后续消息 =====
             shop_id = metadata.get('shop_id')
             from_uid = metadata.get('from_uid')
@@ -144,6 +196,10 @@ class AIReplyHandler(BaseHandler):
 
         优先在句号/问号/感叹号等句末标点处断句，其次在逗号/顿号处细分，
         单段仍超长时按字符硬切，保证每条消息字数不超限。
+
+        URL 保护：先用占位符（__URL_n__）替换文本中的 URL，拆分完成后还原，
+        确保 URL 完整无损、不被截断。含 URL 的消息允许略超字数上限
+        （URL 无法拆分）。
         """
         if not reply:
             return []
@@ -151,8 +207,11 @@ class AIReplyHandler(BaseHandler):
             return [reply]
 
         import re
-        # 按句末标点拆分，保留分隔符
-        sentences = re.split(r'(?<=[。！？；\n])', reply)
+        # 1. URL → 占位符，避免拆分过程中截断 URL
+        masked, url_map = self._mask_urls(reply)
+
+        # 2. 按句末标点拆分，保留分隔符
+        sentences = re.split(r'(?<=[。！？；\n])', masked)
         sentences = [s.strip() for s in sentences if s.strip()]
 
         chunks: List[str] = []
@@ -168,12 +227,14 @@ class AIReplyHandler(BaseHandler):
             current = ""
             for part in parts:
                 if len(part) > self.max_message_len:
-                    # 仍超长：按字符硬切
-                    if current:
-                        chunks.append(current)
-                        current = ""
-                    for i in range(0, len(part), self.max_message_len):
-                        chunks.append(part[i:i + self.max_message_len])
+                    # 仍超长：按字符硬切（URL 占位符整体不可拆分）
+                    for sub in self._split_overlong(part, url_map):
+                        if current and len(current) + len(sub) <= self.max_message_len:
+                            current += sub
+                        else:
+                            if current:
+                                chunks.append(current)
+                            current = sub
                 elif len(current) + len(part) <= self.max_message_len:
                     current += part
                 else:
@@ -181,6 +242,80 @@ class AIReplyHandler(BaseHandler):
                     current = part
             if current:
                 chunks.append(current)
+
+        # 3. 还原占位符为原始 URL
+        return [self._restore_urls(c, url_map) for c in chunks]
+
+    def _mask_urls(self, text: str):
+        """将文本中的 URL 替换为占位符，返回 (掩码文本, {占位符: 原始URL})
+
+        URL 末尾的中英文句号、逗号、问号等标点不属于 URL，剥离出掩码范围，
+        避免 URL 被当作整块不可分割的内容而吞掉后续标点/文字。
+        """
+        if not text:
+            return text, {}
+        import re
+        url_map: Dict[str, str] = {}
+        parts = []
+        last = 0
+        i = 0
+        # URL 字符集：除空白外，也在中英文句末/逗号标点处终止，避免吞掉后续中文内容
+        for m in re.finditer(r'https?://[^\s，。！？；、]+', text):
+            raw = m.group(0)
+            url = raw.rstrip('，。！？；、,.!?;:()（）…')
+            if not url:
+                continue
+            start, end = m.start(), m.start() + len(url)
+            parts.append(text[last:start])
+            placeholder = f'__URL_{i}__'
+            url_map[placeholder] = url
+            parts.append(placeholder)
+            last = end
+            i += 1
+        parts.append(text[last:])
+        return ''.join(parts), url_map
+
+    def _restore_urls(self, text: str, url_map: Dict[str, str]) -> str:
+        """将占位符还原为原始 URL"""
+        if not text or not url_map:
+            return text
+        for placeholder, url in url_map.items():
+            text = text.replace(placeholder, url)
+        return text
+
+    def _split_overlong(self, text: str, url_map: Dict[str, str]) -> List[str]:
+        """将超长文本按字符硬切为不超过 max_message_len 的分片
+
+        URL 占位符视为原子 token，绝不截断；含 URL 的分片允许略超上限。
+        """
+        if not text:
+            return []
+        import re
+        tokens = [t for t in re.split(r'(__URL_\d+__)', text) if t]
+        chunks: List[str] = []
+        current = ""
+        for tok in tokens:
+            if tok in url_map:
+                # URL 占位符整体不可拆分；塞不下时单独成条（允许略超）
+                if current and len(current) + len(tok) <= self.max_message_len:
+                    current += tok
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = tok
+                continue
+            # 普通文本：逐字符填充
+            while tok:
+                room = self.max_message_len - len(current)
+                if room <= 0:
+                    chunks.append(current)
+                    current = ""
+                    continue
+                take = min(len(tok), room)
+                current += tok[:take]
+                tok = tok[take:]
+        if current:
+            chunks.append(current)
         return chunks
 
     async def _simulate_human_delay(self, uid: Optional[str]) -> None:
