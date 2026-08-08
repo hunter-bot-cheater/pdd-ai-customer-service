@@ -24,7 +24,10 @@ class GetToken(BaseRequest):
             elif 'result' in result and 'token' in result['result']:
                 return result['result']['token']
             else:
-                self.logger.error(f"账号 {self.account_name} 无法从响应中获取token: {result}")
+                self.logger.error(
+                    f"账号 {self.account_name} 无法从响应中获取token; "
+                    f"response_keys={sorted(result.keys())}"
+                )
         
         return None
 

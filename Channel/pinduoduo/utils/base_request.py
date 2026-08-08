@@ -2,6 +2,7 @@ import requests
 import json
 import time
 import random
+from urllib.parse import urlsplit
 from typing import Dict, Any, Optional, Union, Callable
 from utils.logger_loguru import get_logger
 from database import db_manager
@@ -109,7 +110,9 @@ class BaseRequest:
             else:
                 self.logger.error(f"无法在数据库中找到账户: shop_id={self.shop_id}, user_id={self.user_id}")
         except Exception as e:
-            self.logger.error(f"初始化账户信息失败: {str(e)}")
+            self.logger.error(
+                f"初始化账户信息失败: error_type={type(e).__name__}"
+            )
     
     def _is_session_expired(self, response_data: Dict[str, Any]) -> bool:
         """
@@ -132,7 +135,7 @@ class BaseRequest:
             
         return False
     
-    def _run_async_login_func(self, func: callable, *args) -> Any:
+    def _run_async_login_func(self, func: callable, *args, **kwargs) -> Any:
         """
         在线程中安全执行异步登录函数（避免事件循环冲突）
 
@@ -146,7 +149,7 @@ class BaseRequest:
         from utils.async_helper import run_async_in_thread
 
         async def _run_wrapper() -> Any:
-            return await func(*args)
+            return await func(*args, **kwargs)
 
         return run_async_in_thread(_run_wrapper(), timeout=60.0)
 
@@ -170,6 +173,16 @@ class BaseRequest:
             return None
 
         return username, password
+
+    def _login_result_matches_account(self, result: Any) -> bool:
+        """Ensure a browser session cannot replace another account's cookies."""
+        if not isinstance(result, dict):
+            return False
+        return (
+            str(result.get("channel_name") or self.channel_name) == str(self.channel_name)
+            and str(result.get("shop_id")) == str(self.shop_id)
+            and str(result.get("user_id")) == str(self.user_id)
+        )
 
     def _relogin_and_update_cookies(self) -> bool:
         """
@@ -204,9 +217,16 @@ class BaseRequest:
 
             try:
                 refresh_result = self._run_async_login_func(
-                    pdd_login_module.refresh_pdd_cookies, username, password
+                    pdd_login_module.refresh_pdd_cookies,
+                    username,
+                    password,
+                    profile_scope=f"{self.channel_name}:{self.shop_id}:{self.user_id}",
                 )
 
+                if refresh_result and isinstance(refresh_result, dict):
+                    if not self._login_result_matches_account(refresh_result):
+                        self.logger.error("cookies刷新返回的账号身份不匹配，已拒绝应用")
+                        refresh_result = None
                 if refresh_result and isinstance(refresh_result, dict):
                     new_cookies = refresh_result.get('cookies')
                     if new_cookies:
@@ -220,7 +240,10 @@ class BaseRequest:
                     self.logger.warning(f"账号 {self.account_name} cookies刷新失败，可能登录状态已失效")
 
             except Exception as refresh_error:
-                self.logger.warning(f"账号 {self.account_name} cookies刷新异常: {str(refresh_error)}")
+                self.logger.warning(
+                    f"账号 {self.account_name} cookies刷新异常: "
+                    f"error_type={type(refresh_error).__name__}"
+                )
 
             # 回退到完整重新登录（headless 模式，避免弹出浏览器窗口）
             if not password:
@@ -232,9 +255,17 @@ class BaseRequest:
 
             try:
                 login_result = self._run_async_login_func(
-                    pdd_login_module.login_pdd, username, password, True
+                    pdd_login_module.login_pdd,
+                    username,
+                    password,
+                    True,
+                    profile_scope=f"{self.channel_name}:{self.shop_id}:{self.user_id}",
                 )
 
+                if login_result and isinstance(login_result, dict):
+                    if not self._login_result_matches_account(login_result):
+                        self.logger.error("完整登录返回的账号身份不匹配，已拒绝应用")
+                        login_result = None
                 if login_result and isinstance(login_result, dict):
                     new_cookies = login_result.get('cookies')
                     if new_cookies:
@@ -252,12 +283,18 @@ class BaseRequest:
                     return False
 
             except Exception as login_error:
-                self.logger.error(f"账号 {self.account_name} 完整重新登录异常: {str(login_error)}")
+                self.logger.error(
+                    f"账号 {self.account_name} 完整重新登录异常: "
+                    f"error_type={type(login_error).__name__}"
+                )
                 relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
                 return False
 
         except Exception as e:
-            self.logger.error(f"账号 {self.account_name} 重新获取cookies过程中发生错误: {str(e)}")
+            self.logger.error(
+                f"账号 {self.account_name} 重新获取cookies过程中发生错误: "
+                f"error_type={type(e).__name__}"
+            )
             relogin_guard.release(self.channel_name, self.shop_id, self.user_id, success=False)
             return False
     
@@ -365,13 +402,15 @@ class BaseRequest:
                 # 判断是否应该重试
                 if attempt < self.max_retries and self._should_retry(exception=e):
                     delay = self._calculate_retry_delay(attempt)
-                    self.logger.warning(f"请求异常: {str(e)}，"
+                    self.logger.warning(f"请求异常: error_type={type(e).__name__}，"
                                       f"第 {attempt + 1} 次重试，延迟 {delay:.2f} 秒")
                     time.sleep(delay)
                     continue
                 else:
                     # 不需要重试或已达最大重试次数
-                    self.logger.error(f"请求最终失败: {str(e)}")
+                    self.logger.error(
+                        f"请求最终失败: error_type={type(e).__name__}"
+                    )
                     return None
         
         # 如果所有重试都失败了
@@ -411,20 +450,28 @@ class BaseRequest:
         try:
             # 检查HTTP状态码
             if response.status_code != 200:
-                self.logger.error(f"请求失败，状态码: {response.status_code}, 响应: {response.text}")
+                self.logger.error(
+                    "请求失败，状态码: %s, 响应长度: %s",
+                    response.status_code,
+                    len(response.content or b""),
+                )
                 return None
             
             if expect_json:
                 try:
                     return response.json()
                 except json.JSONDecodeError:
-                    self.logger.error(f"解析JSON响应失败: {response.text}")
+                    self.logger.error(
+                        "解析JSON响应失败，状态码: %s, 响应长度: %s",
+                        response.status_code,
+                        len(response.content or b""),
+                    )
                     return None
             else:
                 return {"text": response.text, "status_code": response.status_code}
                 
         except Exception as e:
-            self.logger.error(f"处理响应时发生错误: {str(e)}")
+            self.logger.error(f"处理响应时发生错误: {type(e).__name__}")
             return None
     
     _SENSITIVE_KEYS = {'password', 'cookies', 'token', 'api_key', 'access_token', 'anti-content', 'anti_content'}
@@ -447,7 +494,9 @@ class BaseRequest:
 
     def _log_request(self, method: str, url: str, **kwargs):
         """记录请求日志（自动脱敏敏感字段）"""
-        self.logger.debug(f"发起{method}请求: {url}")
+        parsed = urlsplit(url)
+        safe_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        self.logger.debug(f"发起{method}请求: {safe_url}")
         if 'data' in kwargs or 'json' in kwargs:
             params = kwargs.get('data') or kwargs.get('json')
             self.logger.debug(f"请求参数: {self._sanitize_for_log(params)}")
@@ -656,9 +705,16 @@ class BaseRequest:
 
             pdd_login_module = importlib.import_module('Channel.pinduoduo.pdd_login')
             refresh_result = self._run_async_login_func(
-                pdd_login_module.refresh_pdd_cookies, username, password
+                pdd_login_module.refresh_pdd_cookies,
+                username,
+                password,
+                profile_scope=f"{self.channel_name}:{self.shop_id}:{self.user_id}",
             )
 
+            if refresh_result and isinstance(refresh_result, dict):
+                if not self._login_result_matches_account(refresh_result):
+                    self.logger.error("cookies刷新返回的账号身份不匹配，已拒绝应用")
+                    refresh_result = None
             if refresh_result and isinstance(refresh_result, dict):
                 new_cookies = refresh_result.get('cookies')
                 if new_cookies:
@@ -673,5 +729,8 @@ class BaseRequest:
                 return False
 
         except Exception as e:
-            self.logger.error(f"账号 {self.account_name} cookies刷新过程中发生错误: {str(e)}")
+            self.logger.error(
+                f"账号 {self.account_name} cookies刷新过程中发生错误: "
+                f"error_type={type(e).__name__}"
+            )
             return False

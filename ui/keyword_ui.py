@@ -198,7 +198,8 @@ class KeywordManagerWidget(QFrame):
         for keyword in sample_keywords:
             if keyword_service.add_keyword(keyword):
                 self.keywords_data.append({"keyword": keyword})
-        
+
+        self._reload_runtime_keywords()
         self.refreshKeywordList()
     
     def refreshKeywordList(self):
@@ -217,6 +218,16 @@ class KeywordManagerWidget(QFrame):
         """更新统计信息"""
         total_count = len(self.keywords_data)
         self.stats_label.setText(f"共 {total_count} 个关键词")
+
+    @staticmethod
+    def _reload_runtime_keywords():
+        """Refresh the cached message handler after keyword CRUD."""
+        try:
+            from Message import reload_keywords
+            reload_keywords()
+        except Exception:
+            # The message system may not be initialized while this UI loads.
+            pass
     
     def onEditKeyword(self, keyword: str):
         """编辑关键词回调"""
@@ -256,6 +267,7 @@ class KeywordManagerWidget(QFrame):
                     print(f"成功删除关键词: {keyword}")
                     # 从本地数据中移除
                     self.keywords_data = [k for k in self.keywords_data if k["keyword"] != keyword]
+                    self._reload_runtime_keywords()
                     self.refreshKeywordList()
                     QMessageBox.information(self, '成功', f'关键词 "{keyword}" 删除成功!')
                 else:
@@ -278,6 +290,7 @@ class KeywordManagerWidget(QFrame):
                 print(f"成功添加关键词: {keyword}")
                 # 添加到本地数据
                 self.keywords_data.append({"keyword": keyword.strip()})
+                self._reload_runtime_keywords()
                 self.refreshKeywordList()
                 return True
             else:
@@ -294,6 +307,7 @@ class KeywordManagerWidget(QFrame):
             if keyword_service.delete_keyword(keyword):
                 # 从本地数据中移除
                 self.keywords_data = [k for k in self.keywords_data if k["keyword"] != keyword]
+                self._reload_runtime_keywords()
                 self.refreshKeywordList()
                 return True
             else:
@@ -323,6 +337,8 @@ class KeywordManagerWidget(QFrame):
                     if kw_data["keyword"] == old_keyword:
                         self.keywords_data[i]["keyword"] = new_keyword.strip()
                         break
+
+                self._reload_runtime_keywords()
                 
                 # 刷新界面
                 self.refreshKeywordList()

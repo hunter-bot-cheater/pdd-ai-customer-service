@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional, List, Dict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QStackedWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QPushButton, QMessageBox, QDialog, QDialogButtonBox,
+    QPushButton, QMessageBox, QDialog, QDialogButtonBox, QInputDialog,
     QLineEdit, QTextEdit, QCheckBox, QProgressBar, QFrame, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
@@ -572,6 +572,7 @@ class KnowledgeUI(QWidget):
         for row, cs in enumerate(cs_list):
             # 标题
             item = QTableWidgetItem(cs.title)
+            item.setData(Qt.ItemDataRole.UserRole, cs.id)
             self.cs_table.setItem(row, 0, item)
 
             # 内容（截断避免过长）
@@ -734,12 +735,27 @@ class KnowledgeUI(QWidget):
         """开始同步"""
         # 获取pdd shop_id和user_id
         pdd_shop_id = shop.shop_id
-        # 从shop.accounts[0]获取user_id，假设一个店铺只有一个账号
+        # A shop may have multiple isolated accounts. Never silently select
+        # the first one because that can sync with the wrong credentials.
         if not shop.accounts:
             self._show_message("error", "店铺没有账号信息")
             return
 
-        user_id = shop.accounts[0].user_id
+        if len(shop.accounts) == 1:
+            user_id = shop.accounts[0].user_id
+        else:
+            labels = [f"{account.username} ({account.user_id})" for account in shop.accounts]
+            selected, ok = QInputDialog.getItem(
+                self,
+                "选择同步账号",
+                "当前店铺有多个账号，请选择本次同步使用的账号：",
+                labels,
+                0,
+                False,
+            )
+            if not ok or selected not in labels:
+                return
+            user_id = shop.accounts[labels.index(selected)].user_id
 
         # 显示进度条
         self.progress_bar.setVisible(True)
@@ -925,16 +941,23 @@ class KnowledgeUI(QWidget):
                 self._show_message("error", "删除失败")
 
     def _get_cs_id_from_row(self, row: int) -> int:
-        """从表格行获取客服知识ID，这里需要查询，因为表格没有保存id"""
-        # 标题在第0列
-        title = self.cs_table.item(row, 0).text()
+        """从表格行读取稳定的客服知识ID。"""
+        title_item = self.cs_table.item(row, 0)
+        if title_item is None:
+            return 0
+        stored_id = title_item.data(Qt.ItemDataRole.UserRole)
+        if stored_id is not None:
+            return int(stored_id)
+
+        # 兼容旧表格实例：标题查询只作为最后兜底，并取最新记录。
+        title = title_item.text()
         # 直接查询当前店铺下的客服知识
         with self.knowledge_service.get_session() as session:
             from sqlalchemy import select
             stmt = select(CustomerServiceKnowledge).where(
                 CustomerServiceKnowledge.shop_id == self.current_shop_id,
                 CustomerServiceKnowledge.title == title,
-            )
+            ).order_by(CustomerServiceKnowledge.id.desc())
             cs = session.scalar(stmt)
             if cs:
                 return cs.id

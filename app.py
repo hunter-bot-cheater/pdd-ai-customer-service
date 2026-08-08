@@ -42,7 +42,6 @@ configure_standard_services(_app_config)
 
 # ============================================================================
 
-from ui.main_ui import MainWindow
 import time
 
 # 设置 Playwright 浏览器路径（支持打包后的 exe）

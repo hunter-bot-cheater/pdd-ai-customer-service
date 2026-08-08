@@ -56,26 +56,42 @@ def get_shop_products(params: GetShopProductsParams) -> str:
             return _format_products_output(products, total, page=1)
 
         else:
-            error_msg = result.get("error_msg", "未知错误")
-            logger.error(f"获取商品列表失败: {error_msg}, shop_id={params.shop_id}")
-            return f"获取商品列表失败: {error_msg}"
+            logger.error(
+                f"获取商品列表失败: shop_id={params.shop_id}, "
+                f"error_type={type(result.get('error_msg')).__name__}"
+            )
+            return "获取商品列表失败，请稍后重试"
 
     except Exception as e:
-        logger.error(f"获取商品列表工具执行异常: {str(e)}, shop_id={params.shop_id}")
-        return f"获取商品列表时发生异常: {str(e)}"
+        logger.error(
+            f"获取商品列表工具执行异常: {type(e).__name__}, shop_id={params.shop_id}"
+        )
+        return "获取商品列表失败，请稍后重试"
 
 
 def _format_products_output(products, total, page):
     """格式化商品列表输出"""
+
+    def _safe_text(value, limit=240):
+        text = str(value or "")
+        text = "".join(ch if ord(ch) >= 32 else " " for ch in text)
+        return (
+            text.replace("<", "＜")
+            .replace(">", "＞")
+            .replace("[", "［")
+            .replace("]", "］")[:limit]
+        )
+
+    # API fields are external content; mark them as data-only for the model.
     if not products:
         return "未找到商品"
 
-    output = f"商品列表 (共{total}个商品):\n\n"
+    output = f"[untrusted_product_catalog]\n商品列表 (共{int(total or 0)}个商品):\n\n"
 
     for product in products:
-        goods_id = product.get("goods_id", "未知ID")
-        goods_name = product.get("goods_name", "未命名商品")
-        price = product.get("price", "")
+        goods_id = _safe_text(product.get("goods_id", "未知ID"), 64)
+        goods_name = _safe_text(product.get("goods_name", "未命名商品"))
+        price = _safe_text(product.get("price", ""), 64)
         quantity = product.get("quantity")
 
         output += f"商品名称: {goods_name}\n商品ID: {goods_id}\n"
@@ -85,4 +101,4 @@ def _format_products_output(products, total, page):
             output += f"库存: {quantity} 件\n"
         output += "\n"
 
-    return output
+    return output + "[/untrusted_product_catalog]"

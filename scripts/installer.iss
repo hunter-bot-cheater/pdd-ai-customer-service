@@ -6,9 +6,8 @@
 ;
 ; 安装位置：%LocalAppData%\Programs\Agent-Customer（用户目录）
 ;   - 免管理员（PrivilegesRequired=lowest）
-;   - 应用把 数据库/日志/config.json/user_data 写在 exe 所在目录
-;     （见 utils/runtime_path.py、utils/path_utils.py），必须可写，
-;     因此不能装到 Program Files。
+;   - 应用把数据库/日志/config.json/user_data 写在用户数据目录
+;     （见 utils/runtime_path.py），安装目录只存程序文件。
 ;
 ; 编译命令（ISCC.exe 路径按实际安装位置调整）：
 ;   ISCC.exe scripts\installer.iss                 （用默认版本号）
@@ -90,9 +89,5 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; 安装完成后可选直接运行
 Filename: "{app}\{#AppExe}"; Description: "启动 {#AppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; 卸载时清掉运行时生成的数据（数据库/日志/temp/浏览器登录态）
-Type: filesandordirs; Name: "{app}\temp"
-Type: filesandordirs; Name: "{app}\logs"
-Type: filesandordirs; Name: "{app}\user_data"
-Type: files; Name: "{app}\config.json"
+; 不配置 [UninstallDelete]：数据库、日志、配置和浏览器登录态位于用户数据目录，
+; 卸载程序必须保留这些用户数据，避免误删历史会话和凭据。

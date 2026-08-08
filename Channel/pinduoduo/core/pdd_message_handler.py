@@ -1,8 +1,11 @@
-# 消息处理模块
-import json
+"""Pinduoduo message conversion and account-scoped dispatch."""
+
+from __future__ import annotations
+
 import asyncio
-from websockets import exceptions as ws_exceptions
-from bridge.context import Context, ContextType, ChannelType
+import json
+
+from bridge.context import ChannelType, Context, ContextType
 from Channel.pinduoduo.pdd_message import PDDChatMessage
 from database import db_manager
 from utils.config_updater import update_config_with_uid
@@ -10,102 +13,101 @@ from utils.logger_loguru import get_logger
 
 
 class MessageHandlerMixin:
-    """消息处理 Mixin"""
-
-    async def _setup_message_consumer(self, queue_name: str):
-        """设置消息消费者和处理器链"""
-        from Message import message_consumer_manager, queue_manager, handler_chain
+    async def _setup_message_consumer(
+        self,
+        queue_name: str,
+        shop_id: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Create one consumer and one Agent for this PDDChannel/account."""
+        from Message import handler_chain
         from Agent.CustomerAgent.custom.customer_agent import CustomerAgent
+        from core.di_container import container, configure_standard_services
 
         try:
-            existing_consumer = message_consumer_manager.get_consumer(queue_name)
-            if existing_consumer:
-                self.logger.info(f"消费者 {queue_name} 已存在，先停止并重新创建")
-                try:
-                    await message_consumer_manager.stop_consumer(queue_name)
-                except Exception as e:
-                    self.logger.warning(f"停止旧消费者失败: {queue_name}, {e}")
-                try:
-                    queue_manager.recreate_queue(queue_name)
-                except Exception as e:
-                    self.logger.warning(f"重新创建队列失败: {queue_name}, {e}")
+            existing_consumer = self.consumer_manager.get_consumer(queue_name)
+            if existing_consumer is not None:
+                await self.consumer_manager.stop_consumer(queue_name, remove=True)
+                self.queue_manager.remove_queue(queue_name)
 
-            consumer = message_consumer_manager.create_consumer(queue_name, max_concurrent=10)
+            consumer = self.consumer_manager.create_consumer(
+                queue_name,
+                max_concurrent=10,
+            )
+            if self._account_agent is None:
+                if not container.is_registered(CustomerAgent):
+                    configure_standard_services()
+                self._account_agent = container.get(CustomerAgent)
 
-            from core.di_container import container
-            bot = container.get(CustomerAgent)
-            handlers = handler_chain(use_ai=True, businessHours=self.businessHours, bot=bot)
+            handlers = handler_chain(
+                use_ai=True,
+                business_hours=self.business_hours,
+                bot=self._account_agent,
+            )
             for handler in handlers:
                 consumer.add_handler(handler)
 
-            await message_consumer_manager.start_consumer(queue_name)
-            self.logger.debug(f"消息消费者已启动: {queue_name}")
-
-        except Exception as e:
-            self.logger.error(f"设置消息消费者失败: {e}")
+            await self.consumer_manager.start_consumer(queue_name)
+            self.logger.debug(f"message consumer started: {queue_name}")
+        except Exception as exc:
+            self.logger.error(
+                f"message consumer setup failed: error_type={type(exc).__name__}"
+            )
             raise
 
-    async def _process_websocket_message(self, message: str, shop_id: str, user_id: str, username: str, queue_name: str):
-        """处理单条WebSocket消息"""
-        from Message import put_message
-
+    async def _process_websocket_message(
+        self,
+        message: str,
+        shop_id: str,
+        user_id: str,
+        username: str,
+        queue_name: str,
+    ) -> None:
         try:
             if not message or not message.strip():
-                self.logger.debug(f"收到空消息，跳过处理: {shop_id}-{username}")
                 return
 
             message_data = json.loads(message)
             msg_type = message_data.get("message", {}).get("type", "unknown")
-            from_uid_log = message_data.get("message", {}).get("from_uid", "unknown")
-            self.logger.debug(f"收到消息: type={msg_type}, from_uid={from_uid_log}, shop_id={shop_id}")
+            self.logger.debug(
+                f"received message: type={msg_type}, shop_id={shop_id}"
+            )
 
-            try:
-                pdd_message = PDDChatMessage(message_data)
-            except Exception as pdd_error:
-                self.logger.error(f"创建PDD消息对象失败: {shop_id}-{username}, 错误: {pdd_error}")
+            pdd_message = PDDChatMessage(message_data)
+            context = await asyncio.to_thread(
+                self._convert_to_context, pdd_message, shop_id, user_id, username
+            )
+            if not context:
                 return
 
-            try:
-                context = self._convert_to_context(pdd_message, shop_id, user_id, username)
-                if not context:
-                    self.logger.debug(f"消息转换失败，跳过处理: {shop_id}-{username}")
-                    return
-            except Exception as ctx_error:
-                self.logger.error(f"转换Context失败: {shop_id}-{username}, 错误: {ctx_error}")
-                return
-
-            if context:
-                if self._should_process_immediately(context):
-                    await self._handle_immediate_message(context, shop_id, user_id)
-                    self.logger.debug(f"立即处理消息: {context.type}, ID: {pdd_message.msg_id}")
-                elif self._should_queue_message(context):
-                    msg_id = await put_message(queue_name, context)
-                    self.logger.debug(f"消息已入队: {queue_name}, ID: {msg_id}, 类型: {context.type}")
-                else:
-                    self.logger.debug(f"忽略消息: {context.type}, ID: {pdd_message.msg_id}")
-            else:
-                self.logger.warning("消息转换失败，跳过处理")
-
+            if self._should_process_immediately(context):
+                await self._handle_immediate_message(context, shop_id, user_id)
+            elif self._should_queue_message(context):
+                msg_id = await self.queue_manager.get_or_create_queue(queue_name).put(
+                    context
+                )
+                self.logger.debug(
+                    f"message queued: {queue_name}, ID: {msg_id}, type: {context.type}"
+                )
         except json.JSONDecodeError:
-            self.logger.error(f"JSON解析失败: {message}")
-        except Exception as e:
-            self.logger.error(f"处理WebSocket消息失败: {e}")
+            self.logger.error("invalid websocket JSON message")
+        except Exception as exc:
+            self.logger.error(
+                f"websocket message handling failed: error_type={type(exc).__name__}"
+            )
 
     def _should_process_immediately(self, context: Context) -> bool:
-        """判断消息是否需要立即处理"""
-        immediate_types = {
+        return context.type in {
             ContextType.SYSTEM_STATUS,
             ContextType.AUTH,
             ContextType.WITHDRAW,
             ContextType.SYSTEM_HINT,
             ContextType.MALL_CS,
-            ContextType.TRANSFER
+            ContextType.TRANSFER,
         }
-        return context.type in immediate_types
 
     def _should_queue_message(self, context: Context) -> bool:
-        """判断消息是否需要放入队列处理"""
-        queue_types = {
+        return context.type in {
             ContextType.TEXT,
             ContextType.IMAGE,
             ContextType.VIDEO,
@@ -115,12 +117,22 @@ class MessageHandlerMixin:
             ContextType.GOODS_CARD,
             ContextType.GOODS_SPEC,
         }
-        return context.type in queue_types
 
-    async def _handle_immediate_message(self, context: Context, shop_id: str, user_id: str):
-        """立即处理消息"""
-        username = context.kwargs.username
-        recipient_uid = context.kwargs.from_uid
+    async def _handle_immediate_message(
+        self,
+        context: Context,
+        shop_id: str,
+        user_id: str,
+    ) -> None:
+        """立即处理系统消息（认证/撤回/转接等，不进入 AI 队列）"""
+        kwargs = context.kwargs
+        username = getattr(kwargs, "username", None)
+        recipient_uid = getattr(kwargs, "from_uid", None)
+        if isinstance(kwargs, dict):
+            username = username or kwargs.get("username")
+            recipient_uid = recipient_uid or kwargs.get("from_uid")
+        username = username or ""
+        recipient_uid = recipient_uid or ""
         try:
             # 认证消息：捕获完整 UID 写入配置，无需创建 SendMessage
             if context.type == ContextType.AUTH:
@@ -187,11 +199,8 @@ class MessageHandlerMixin:
 
     def _convert_to_context(self, pdd_message: PDDChatMessage, shop_id: str, user_id: str, username: str) -> Context:
         """将拼多多消息转换为Context格式"""
-        shop_info = db_manager.get_shop(self.channel_name, shop_id)
+        shop_info = db_manager.get_shop(self.channel_name, shop_id) or {}
         shop_name = shop_info.get("shop_name", "")
-
-        context_type = pdd_message.user_msg_type
-
         content = pdd_message.content
         if isinstance(content, dict):
             content = json.dumps(content, ensure_ascii=False)
@@ -200,14 +209,14 @@ class MessageHandlerMixin:
         else:
             content = str(content)
 
-        context = Context.create_pinduoduo_context(
+        return Context.create_pinduoduo_context(
             content=content,
             msg_id=str(pdd_message.msg_id) if pdd_message.msg_id is not None else "",
-            from_user=str(pdd_message.from_user) if pdd_message.from_user is not None else "",
-            from_uid=str(pdd_message.from_uid) if pdd_message.from_uid is not None else "",
-            to_user=str(pdd_message.to_user) if pdd_message.to_user is not None else "",
-            to_uid=str(pdd_message.to_uid) if pdd_message.to_uid is not None else "",
-            nickname=str(pdd_message.nickname) if pdd_message.nickname is not None else "",
+            from_user=str(pdd_message.from_user or ""),
+            from_uid=str(pdd_message.from_uid or ""),
+            to_user=str(pdd_message.to_user or ""),
+            to_uid=str(pdd_message.to_uid or ""),
+            nickname=str(pdd_message.nickname or ""),
             timestamp=pdd_message.timestamp,
             user_msg_type=pdd_message.user_msg_type,
             shop_id=str(shop_id),
@@ -215,9 +224,8 @@ class MessageHandlerMixin:
             username=str(username),
             shop_name=str(shop_name),
             raw_data=pdd_message.raw_data,
-            channel_type=ChannelType.PINDUODUO
+            channel_type=ChannelType.PINDUODUO,
         )
-        return context
 
 
-__all__ = ['MessageHandlerMixin']
+__all__ = ["MessageHandlerMixin"]

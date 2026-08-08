@@ -5,6 +5,9 @@
 支持配置验证
 """
 import json
+import copy
+import logging
+import os
 import threading
 from datetime import datetime
 from enum import Enum
@@ -12,6 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from contextlib import contextmanager
 from pydantic import BaseModel, Field, field_validator, ConfigDict
+from utils.runtime_path import get_config_path
+from utils.secret_store import protect_secret, unprotect_secret
+
+logger = logging.getLogger(__name__)
 
 
 class ModelType(str, Enum):
@@ -47,7 +54,7 @@ class BusinessHoursConfig(BaseModel):
 
 class PromptConfig(BaseModel):
     """提示词配置模型"""
-    instructions: list[str] = Field(default=[], description="指令")
+    instructions: list[str] = Field(default_factory=list, description="指令")
 
 
 class ConfigModel(BaseModel):
@@ -65,7 +72,7 @@ class ConfigModel(BaseModel):
         default_factory=PromptConfig,
         description="提示词配置"
     )
-    db_path: str = Field(default="", description="数据库路径")
+    db_path: str = Field(default="./temp/channel_shop.db", description="数据库路径")
 
 
 
@@ -75,6 +82,7 @@ config_base = {
         "start": "08:00",
         "end": "23:00"
     },
+    "db_path": "./temp/channel_shop.db",
     "llm": {
         "model_name": "",
         "api_key": "",
@@ -126,7 +134,7 @@ class Config:
 
     def __init__(
         self,
-        config_path: Union[str, Path] = 'config.json',
+        config_path: Union[str, Path, None] = None,
         auto_create: bool = True
     ):
         """
@@ -136,7 +144,9 @@ class Config:
             config_path: 配置文件路径
             auto_create: 是否自动创建默认配置文件
         """
-        self.config_path = Path(config_path)
+        self.config_path = Path(config_path) if config_path else get_config_path()
+        self.last_error: Optional[str] = None
+        self._needs_secret_migration = False
         self.auto_create = auto_create
 
         # 线程安全锁
@@ -156,7 +166,10 @@ class Config:
 
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
+                raw_config_data = json.load(f)
+
+            self._needs_secret_migration = self._has_plaintext_secrets(raw_config_data)
+            config_data = self._restore_secrets(raw_config_data)
 
             # 验证配置格式
             validated_config = ConfigModel(**config_data)
@@ -175,7 +188,7 @@ class Config:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(config_base, f, ensure_ascii=False, indent=4)
+                json.dump(self._protect_secrets(config_base), f, ensure_ascii=False, indent=4)
 
             print(f"已创建默认配置文件：{self.config_path}")
         except Exception as e:
@@ -186,19 +199,29 @@ class Config:
         with self._lock:
             try:
                 self._config = self._load_config()
+                self.last_error = None
+                if os.name == "nt" and self._needs_secret_migration:
+                    # Migrate legacy plaintext API keys on the next successful
+                    # load; this is an atomic rewrite and preserves all fields.
+                    self.save()
+                    self._needs_secret_migration = False
                 return self._config
             except ConfigFileNotFoundError:
                 if self.auto_create:
                     self._create_default_config_file()
-                    self._config = config_base.copy()
+                    self._config = copy.deepcopy(config_base)
                     self._validated_config = ConfigModel(**config_base)
                     return self._config
                 else:
                     raise
             except Exception as e:
-                print(f"加载配置文件失败: {e}")
+                self.last_error = str(e)
+                logger.error(
+                    f"configuration load failed; using safe defaults: "
+                    f"error_type={type(e).__name__}"
+                )
                 # 使用默认配置
-                self._config = config_base.copy()
+                self._config = copy.deepcopy(config_base)
                 self._validated_config = ConfigModel(**config_base)
                 return self._config
 
@@ -267,7 +290,7 @@ class Config:
         """
         with self._lock:
             if self._config is None:
-                self._config = config_base.copy()
+                self._config = copy.deepcopy(config_base)
 
             # 解析嵌套键
             keys = key.split('.')
@@ -305,7 +328,7 @@ class Config:
         """
         with self._lock:
             if self._config is None:
-                self._config = config_base.copy()
+                self._config = copy.deepcopy(config_base)
 
             # 深度合并配置
             merged_config = self._deep_merge(self._config, config_dict)
@@ -332,13 +355,20 @@ class Config:
                 # 使用临时文件 + 原子重命名，避免写入过程中崩溃导致配置文件损坏
                 temp_path = self.config_path.with_suffix('.tmp')
                 with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(self._config, f, ensure_ascii=False, indent=4)
+                    json.dump(
+                        self._protect_secrets(self._config),
+                        f,
+                        ensure_ascii=False,
+                        indent=4,
+                    )
 
                 # 原子重命名替换原文件
                 temp_path.replace(self.config_path)
                 return True
             except Exception as e:
-                print(f"保存配置文件失败: {e}")
+                logger.error(
+                    f"configuration save failed: error_type={type(e).__name__}"
+                )
                 # 清理临时文件（如果存在）
                 try:
                     temp_path = self.config_path.with_suffix('.tmp')
@@ -359,6 +389,30 @@ class Config:
                 result[key] = value
 
         return result
+
+    @staticmethod
+    def _protect_secrets(config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy config and protect persisted API keys without changing memory."""
+        result = copy.deepcopy(config_data)
+        llm = result.get("llm")
+        if isinstance(llm, dict) and "api_key" in llm:
+            llm["api_key"] = protect_secret(llm.get("api_key"))
+        return result
+
+    @staticmethod
+    def _restore_secrets(config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy config and decrypt values loaded from disk."""
+        result = copy.deepcopy(config_data)
+        llm = result.get("llm")
+        if isinstance(llm, dict) and "api_key" in llm:
+            llm["api_key"] = unprotect_secret(llm.get("api_key"))
+        return result
+
+    @staticmethod
+    def _has_plaintext_secrets(config_data: Dict[str, Any]) -> bool:
+        llm = config_data.get("llm") if isinstance(config_data, dict) else None
+        api_key = llm.get("api_key") if isinstance(llm, dict) else None
+        return bool(api_key) and not str(api_key).startswith("dpapi:v1:")
 
     @contextmanager
     def atomic_update(self):

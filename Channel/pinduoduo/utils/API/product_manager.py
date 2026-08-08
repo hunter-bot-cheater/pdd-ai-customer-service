@@ -220,7 +220,9 @@ class ProductManager(BaseRequest):
             }
 
         except Exception as e:
-            self.logger.error(f"解析商品列表失败: {str(e)}")
+            self.logger.error(
+                f"解析商品列表失败: error_type={type(e).__name__}"
+            )
             return {
                 "products": [],
                 "total": 0
@@ -269,15 +271,19 @@ class ProductManager(BaseRequest):
                     specifications.append(f"商品分类: {' > '.join(valid_cats)}")
 
             product_info = {
-                "goods_id": result_data.get('goods_id'),
-                "goods_name": result_data.get('goods_name', ''),
+                "goods_id": (
+                    result_data.get('goods_id') or result_data.get('goodsId')
+                ),
+                "goods_name": result_data.get('goods_name', result_data.get('goodsName', '')),
                 "specifications": specifications[:20]  # 最多显示20个规格信息
             }
 
             return product_info
 
         except Exception as e:
-            self.logger.error(f"解析商品详情失败: {str(e)}")
+            self.logger.error(
+                f"解析商品详情失败: error_type={type(e).__name__}"
+            )
             return {
                 "goods_id": None,
                 "goods_name": "解析失败",

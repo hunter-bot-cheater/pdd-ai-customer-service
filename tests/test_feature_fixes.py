@@ -202,10 +202,15 @@ def _restore_ai_reply_delays():
 
 def _set_inside_business_hours():
     """将营业时间设为包含当前时刻的 ±1 小时窗口，避免 handle 测试受运行时刻影响"""
+    _app_config.set("business_hours", _inside_business_hours_dict(), save=False)
+
+
+def _inside_business_hours_dict():
+    """返回包含当前时刻的 ±1 小时营业时间字典（供直接构造 handler 使用）"""
     now = _real_dt.datetime.now()
     start = (now - _real_dt.timedelta(hours=1)).strftime("%H:%M")
     end = (now + _real_dt.timedelta(hours=1)).strftime("%H:%M")
-    _app_config.set("business_hours", {"start": start, "end": end}, save=False)
+    return {"start": start, "end": end}
 
 
 # ============================================================================
@@ -604,7 +609,8 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.capture = CaptureWebhook()
         self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
         self._notify_patch.start()
-        self.handler = KeywordDetectionHandler()
+        # 营业时间窗口设为包含当前时刻，避免 can_handle 的营业时间门控受运行时刻影响
+        self.handler = KeywordDetectionHandler(business_hours=_inside_business_hours_dict())
 
     def tearDown(self):
         _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
@@ -625,7 +631,7 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
     def test_can_handle_regular_keyword(self):
         # 不依赖数据库中的关键词状态，注入受控关键词源验证"转人工"检测
         with mock.patch.object(kh_module.db_manager, "get_all_keywords", return_value=[{"keyword": "转人工"}]):
-            handler = KeywordDetectionHandler()
+            handler = KeywordDetectionHandler(business_hours=_inside_business_hours_dict())
         context = make_context("转人工")
         self.assertTrue(handler.can_handle(context))
 
@@ -1269,12 +1275,26 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
                 self.calls.append((shop_id, user_id, recipient_uid, goods_id, biz_type))
                 return {"success": True}
 
+        class _FakeProductManager:
+            """隔离校验通过：返回与请求 goods_id 一致的商品详情"""
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_product_detail(self, goods_id):
+                return {"success": True, "product_info": {"goods_id": goods_id}}
+
         self.sender = _FakeSender(self.calls)
         self._patch = mock.patch.object(sg_module, "get_sender", return_value=self.sender)
         self._patch.start()
+        self._pm_patch = mock.patch.object(
+            sg_module, "ProductManager", _FakeProductManager
+        )
+        self._pm_patch.start()
 
     def tearDown(self):
         self._patch.stop()
+        self._pm_patch.stop()
 
     def test_params_model_accepts_int_uid(self):
         p = self.sg_module.SendGoodsLinkParams(
@@ -1283,16 +1303,16 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
         self.assertEqual(p.recipient_uid, 5927195871573)
 
     def test_execute_tool_with_int_uid(self):
-        """execute_tool 不再因 recipient_uid 为 int 触发校验错误，且以字符串调用 API"""
+        """身份字段来自受信任 dependencies（int 值），goods_id 为 LLM 业务参数"""
         result = execute_tool(
             "send_goods_link",
-            json.dumps({
+            json.dumps({"goods_id": 100123}),
+            {
                 "recipient_uid": 5927195871573,
-                "goods_id": 100123,
                 "shop_id": 661962391,
                 "user_id": 189109418,
-            }),
-            {},
+                "channel_type": "pinduoduo",
+            },
         )
         self.assertIn("商品卡片发送成功", result)
         self.assertEqual(len(self.calls), 1)
@@ -1303,10 +1323,16 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
         self.assertEqual(goods_id, 100123)
 
     def test_execute_tool_missing_params(self):
+        """身份字段齐全但缺少业务参数 goods_id → 工具自身校验拦截"""
         result = execute_tool(
             "send_goods_link",
-            json.dumps({"recipient_uid": "buyer1", "goods_id": 100123}),
-            {},
+            json.dumps({}),
+            {
+                "recipient_uid": "buyer1",
+                "shop_id": 661962391,
+                "user_id": 189109418,
+                "channel_type": "pinduoduo",
+            },
         )
         self.assertIn("缺少必要", result)
         self.assertEqual(self.calls, [])

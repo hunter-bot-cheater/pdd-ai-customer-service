@@ -263,7 +263,10 @@ class DIContainer:
 
             return implementation_type(**kwargs)
         except Exception as e:
-            self.logger.error(f"创建实例失败 {implementation_type.__name__}: {e}")
+            self.logger.error(
+                f"创建实例失败 {implementation_type.__name__}: "
+                f"error_type={type(e).__name__}"
+            )
             raise RuntimeError(f"Failed to create instance of {implementation_type.__name__}") from e
 
     async def _create_instance_async(self, implementation_type: Type) -> Any:
@@ -288,7 +291,10 @@ class DIContainer:
 
             return implementation_type(**kwargs)
         except Exception as e:
-            self.logger.error(f"异步创建实例失败 {implementation_type.__name__}: {e}")
+            self.logger.error(
+                f"异步创建实例失败 {implementation_type.__name__}: "
+                f"error_type={type(e).__name__}"
+            )
             raise
 
     def clear_scoped(self):
@@ -319,7 +325,9 @@ class DIContainer:
                     try:
                         instance.dispose()
                     except Exception as e:
-                        self.logger.error(f"释放实例失败: {e}")
+                        self.logger.error(
+                            f"释放实例失败: error_type={type(e).__name__}"
+                        )
 
             # 清除所有实例
             self._singletons.clear()
@@ -360,7 +368,7 @@ def configure_standard_services(config_instance: Any = None) -> 'DIContainer':
     if not container.is_registered(DatabaseManager):
         db_path = "./temp/channel_shop.db"
         if config_instance is not None:
-            db_path = config_instance.get("db_path", db_path)
+            db_path = config_instance.get("db_path", db_path) or db_path
         container.register_singleton(
             DatabaseManager,
             factory=lambda: DatabaseManager(db_path=db_path)
@@ -374,10 +382,11 @@ def configure_standard_services(config_instance: Any = None) -> 'DIContainer':
             factory=lambda: KnowledgeService()
         )
 
-    # 4. CustomerAgent（AI 客服代理，全局单例；initialize_async 仍懒加载）
+    # 4. CustomerAgent is transient.  A running account owns its own Agent,
+    # LLM client and SessionManager so no async state crosses account loops.
     from Agent.CustomerAgent.custom.customer_agent import CustomerAgent
     if not container.is_registered(CustomerAgent):
-        container.register_singleton(
+        container.register_transient(
             CustomerAgent,
             factory=lambda: CustomerAgent()
         )

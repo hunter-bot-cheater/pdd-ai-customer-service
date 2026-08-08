@@ -39,7 +39,7 @@ class AutoReplyUI(QFrame):
                 self.sync_timer.stop()
             event.accept()
         except Exception as e:
-            self.logger.error(f"清理定时器失败: {e}")
+            self.logger.error(f"清理定时器失败: error_type={type(e).__name__}")
             event.accept()
 
     def showEvent(self, event):
@@ -166,7 +166,7 @@ class AutoReplyUI(QFrame):
             self.refreshAccountList()
 
         except Exception as e:
-            self.logger.error(f"加载账号数据失败: {e}")
+            self.logger.error(f"加载账号数据失败: error_type={type(e).__name__}")
 
     def refreshAccountList(self):
         """刷新账号列表"""
@@ -216,7 +216,10 @@ class AutoReplyUI(QFrame):
 
                     if is_running != current_status:
                         if current_status and not is_running:
-                            account_key = f"{widget.account_data['channel_name']}_{widget.account_data['shop_id']}_{widget.account_data['username']}"
+                            account_key = "_".join(
+                                str(widget.account_data.get(key, ""))
+                                for key in ("channel_name", "shop_id", "user_id")
+                            )
                             if account_key in auto_reply_manager.running_accounts:
                                 thread = auto_reply_manager.running_accounts[account_key]
                                 if hasattr(thread, 'isRunning') and thread.isRunning():
@@ -231,7 +234,7 @@ class AutoReplyUI(QFrame):
                 self.updateStats()
 
         except Exception as e:
-            self.logger.error(f"同步自动回复状态失败: {str(e)}")
+            self.logger.error(f"同步自动回复状态失败: error_type={type(e).__name__}")
 
     def reloadAccounts(self):
         """重新加载账号"""
@@ -273,8 +276,8 @@ class AutoReplyUI(QFrame):
             QMessageBox.information(self, "操作完成", f"已成功为 {started_count} / {len(eligible_accounts)} 个账号启动自动回复。")
 
         except Exception as e:
-            self.logger.error(f"开始所有自动回复失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"开始所有自动回复失败：{str(e)}")
+            self.logger.error(f"开始所有自动回复失败: error_type={type(e).__name__}")
+            QMessageBox.critical(self, "错误", "开始所有自动回复失败，请稍后重试")
 
     def stopAllAutoReply(self):
         """停止所有自动回复"""
@@ -300,8 +303,8 @@ class AutoReplyUI(QFrame):
                 QMessageBox.information(self, "成功", "已停止所有自动回复")
 
         except Exception as e:
-            self.logger.error(f"停止所有自动回复失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"停止所有自动回复失败：{str(e)}")
+            self.logger.error(f"停止所有自动回复失败: error_type={type(e).__name__}")
+            QMessageBox.critical(self, "错误", "停止所有自动回复失败，请稍后重试")
 
     def _update_all_cards_auto_reply_status(self):
         """更新所有卡片的自动回复状态"""
@@ -313,7 +316,7 @@ class AutoReplyUI(QFrame):
                     widget.setAutoReplyStatus(is_running)
 
         except Exception as e:
-            self.logger.error(f"更新卡片状态失败: {str(e)}")
+            self.logger.error(f"更新卡片状态失败: error_type={type(e).__name__}")
 
     def onAccountOnline(self, account_data: dict):
         """账号上线回调"""
@@ -328,8 +331,8 @@ class AutoReplyUI(QFrame):
             self.status_thread.start()
 
         except Exception as e:
-            self.logger.error(f"启动上线操作失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"启动上线操作失败：{str(e)}")
+            self.logger.error(f"启动上线操作失败: error_type={type(e).__name__}")
+            QMessageBox.critical(self, "错误", "启动上线操作失败，请稍后重试")
 
     def onAccountOffline(self, account_data: dict):
         """账号离线回调"""
@@ -344,8 +347,8 @@ class AutoReplyUI(QFrame):
             self.status_thread.start()
 
         except Exception as e:
-            self.logger.error(f"启动离线操作失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"启动离线操作失败：{str(e)}")
+            self.logger.error(f"启动离线操作失败: error_type={type(e).__name__}")
+            QMessageBox.critical(self, "错误", "启动离线操作失败，请稍后重试")
 
     def findAccountCard(self, account_data: dict):
         """查找对应的账号卡片"""
@@ -369,7 +372,7 @@ class AutoReplyUI(QFrame):
             self.logger.info(f"账号 '{account_data['username']}' 已成功设置为{status_text}状态")
 
         except Exception as e:
-            self.logger.error(f"处理状态设置成功回调失败: {str(e)}")
+            self.logger.error(f"处理状态设置成功回调失败: error_type={type(e).__name__}")
 
     def onStatusSetFailed(self, account_data: dict, error_message: str):
         """状态设置失败回调"""
@@ -383,7 +386,7 @@ class AutoReplyUI(QFrame):
             QMessageBox.warning(self, "失败", f"设置账号 '{account_data['username']}' 状态失败：{error_message}")
 
         except Exception as e:
-            self.logger.error(f"处理状态设置失败回调失败: {str(e)}")
+            self.logger.error(f"处理状态设置失败回调失败: error_type={type(e).__name__}")
 
     def onAutoReplyToggle(self, account_data: dict):
         """自动回复开关回调"""
@@ -401,8 +404,8 @@ class AutoReplyUI(QFrame):
                 self._start_auto_reply(account_data, account_card)
 
         except Exception as e:
-            self.logger.error(f"自动回复开关操作失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"自动回复操作失败：{str(e)}")
+            self.logger.error(f"自动回复开关操作失败: error_type={type(e).__name__}")
+            QMessageBox.critical(self, "错误", "自动回复操作失败，请稍后重试")
 
     def _start_auto_reply(self, account_data: dict, account_card):
         """启动自动回复"""
@@ -426,10 +429,10 @@ class AutoReplyUI(QFrame):
                 QMessageBox.warning(self, "失败", f"启动账号 '{account_data['username']}' 自动回复失败！")
 
         except Exception as e:
-            self.logger.error(f"启动自动回复失败: {str(e)}")
+            self.logger.error(f"启动自动回复失败: error_type={type(e).__name__}")
             account_card.auto_reply_btn.setText("开始回复")
             account_card.auto_reply_btn.setEnabled(True)
-            QMessageBox.critical(self, "错误", f"启动自动回复失败：{str(e)}")
+            QMessageBox.critical(self, "错误", "启动自动回复失败，请稍后重试")
 
     def _stop_auto_reply(self, account_data: dict, account_card):
         """停止自动回复"""
@@ -438,7 +441,7 @@ class AutoReplyUI(QFrame):
             account_card.auto_reply_btn.setEnabled(False)
 
             success = auto_reply_manager.stop_auto_reply(account_data)
-            account_card.setAutoReplyStatus(False)
+            account_card.setAutoReplyStatus(auto_reply_manager.is_running(account_data))
 
             if success:
                 self.logger.info(f"账号 '{account_data['username']}' 自动回复停止成功")
@@ -448,15 +451,18 @@ class AutoReplyUI(QFrame):
             self.updateStats()
 
         except Exception as e:
-            self.logger.error(f"停止自动回复失败: {str(e)}")
+            self.logger.error(f"停止自动回复失败: error_type={type(e).__name__}")
             account_card.setAutoReplyStatus(False)
-            QMessageBox.critical(self, "错误", f"停止自动回复失败：{str(e)}")
+            QMessageBox.critical(self, "错误", "停止自动回复失败，请稍后重试")
             self.updateStats()
 
     def _connect_auto_reply_signals(self, account_data: dict):
         """连接自动回复相关信号"""
         try:
-            account_key = f"{account_data['channel_name']}_{account_data['shop_id']}_{account_data['username']}"
+            account_key = "_".join(
+                str(account_data.get(key, ""))
+                for key in ("channel_name", "shop_id", "user_id")
+            )
 
             if account_key in auto_reply_manager.running_accounts:
                 thread = auto_reply_manager.running_accounts[account_key]
@@ -469,7 +475,7 @@ class AutoReplyUI(QFrame):
                 )
 
         except Exception as e:
-            self.logger.error(f"连接自动回复信号失败: {str(e)}")
+            self.logger.error(f"连接自动回复信号失败: error_type={type(e).__name__}")
 
     def _on_auto_reply_success(self, account_data: dict):
         """自动回复连接成功回调"""
@@ -483,7 +489,7 @@ class AutoReplyUI(QFrame):
             self.updateStats()
 
         except Exception as e:
-            self.logger.error(f"处理自动回复成功回调失败: {str(e)}")
+            self.logger.error(f"处理自动回复成功回调失败: error_type={type(e).__name__}")
 
     def _on_auto_reply_failed(self, account_data: dict, error: str):
         """自动回复连接失败回调"""
@@ -499,7 +505,7 @@ class AutoReplyUI(QFrame):
             self.updateStats()
 
         except Exception as e:
-            self.logger.error(f"处理自动回复失败回调失败: {str(e)}")
+            self.logger.error(f"处理自动回复失败回调失败: error_type={type(e).__name__}")
 
     def updateCardStatus(self, account_data: dict, new_status: int):
         """更新卡片状态"""

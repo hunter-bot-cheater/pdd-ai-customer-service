@@ -120,8 +120,8 @@ def create_distribution_files(dist_path):
 
 运行说明：
 1. 双击 AgentCustomer.exe 启动程序
-2. 首次运行会自动创建 temp 目录用于存储数据库
-3. 配置文件 config.json 可根据需要修改
+2. 首次运行会在用户数据目录创建数据库、日志和 config.json
+3. 请勿把包含 API 密钥的 config.json 放入发布目录
 
 注意事项：
 - 程序需要网络连接才能正常工作
@@ -131,8 +131,8 @@ def create_distribution_files(dist_path):
   用户无需额外安装 Playwright 或 Chromium 浏览器
 
 配置说明：
-- config.json 包含 API 密钥等配置信息
-- 请根据实际情况修改相关配置
+- 首次运行时会在用户数据目录生成 config.json
+- 请勿把包含 API 密钥的 config.json 提交到代码仓库
 
 技术支持：
 - 项目地址: https://github.com/your-repo/Agent-Customer
@@ -156,12 +156,7 @@ pause
 """
         (dist_path / "run.bat").write_text(bat_content, encoding="gbk")
 
-    # 复制必要的配置文件（如果不存在）
-    config_src = Path("config.json")
-    config_dst = dist_path / "config.json"
-    if config_src.exists() and not config_dst.exists():
-        shutil.copy2(config_src, config_dst)
-        print(f"复制配置文件: {config_dst}")
+    # 不复制 config.json：它可能包含 API 密钥，应用会在用户数据目录首次启动时生成。
 
 def create_installer_script(dist_path):
     """创建 NSIS 安装包脚本"""
@@ -170,7 +165,7 @@ def create_installer_script(dist_path):
 ; 需要 NSIS (https://nsis.sourceforge.io/)
 
 !define APP_NAME "Agent-Customer"
-!define APP_VERSION "0.1.0"
+!define APP_VERSION "1.1.0"
 !define APP_PUBLISHER "Agent-Customer Team"
 !define APP_URL "https://github.com/your-repo/Agent-Customer"
 !define APP_EXE "AgentCustomer.exe"
@@ -277,7 +272,6 @@ def check_dependencies():
     """检查必要的文件是否存在"""
     required_files = [
         "app.py",
-        "config.json",
         "icon/icon.ico",
         "scripts/agent_customer.spec",
         "pyproject.toml",

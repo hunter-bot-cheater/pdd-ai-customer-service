@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
 from typing import Any, Dict, List, Optional
 
 from Agent.bot import Bot
@@ -24,7 +26,7 @@ from Agent.CustomerAgent.tools import (
     get_product_knowledge,             # noqa: F401  — 注册 get_product_knowledge 工具
     search_customer_service_knowledge,  # noqa: F401  — 注册 search_customer_service_knowledge 工具
 )
-from bridge.context import Context
+from bridge.context import Context, make_conversation_key, context_scope
 from bridge.reply import Reply, ReplyType
 from Agent.CustomerAgent.custom.session_manager import SessionManager
 from Agent.CustomerAgent.custom.tool_decorator import get_tools_for_llm
@@ -96,10 +98,22 @@ class CustomerAgent(Bot):
         self._tool_executor: Optional[ToolExecutor] = None
         self._session_manager: Optional[SessionManager] = None
         self._tools: List[Dict[str, Any]] = []
+        self._initialize_lock = asyncio.Lock()
+        self._conversation_locks: Dict[str, asyncio.Lock] = {}
+        self._fallback_session_id = f"fallback_{uuid.uuid4().hex}"
 
         logger.info("CustomerAgent 实例创建成功")
 
     async def initialize_async(self) -> bool:
+        """Initialize once, even when the first messages arrive concurrently."""
+        if self._is_initialized:
+            return True
+        async with self._initialize_lock:
+            if self._is_initialized:
+                return True
+            return await self._initialize_async_unlocked()
+
+    async def _initialize_async_unlocked(self) -> bool:
         """异步初始化 Agent"""
         if self._is_initialized:
             return True
@@ -149,10 +163,52 @@ class CustomerAgent(Bot):
             return True
 
         except Exception as e:
-            logger.error(f"CustomerAgent 初始化失败: {e}")
+            logger.error(
+                f"CustomerAgent 初始化失败: error_type={type(e).__name__}"
+            )
             return False
 
     async def async_reply(self, query: str, context: Context = None) -> Reply:
+        """Reply serially per customer conversation."""
+        session_id = self._session_id(context, query)
+        lock = self._conversation_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            return await self._async_reply_unlocked(query, context, session_id)
+
+    async def close(self) -> None:
+        """Release per-account LLM, database, and in-memory resources."""
+        async with self._initialize_lock:
+            llm_client = self._llm_client
+            session_manager = self._session_manager
+            self._llm_client = None
+            self._session_manager = None
+            self._message_builder = None
+            self._tool_executor = None
+            self._tools = []
+            self._conversation_locks.clear()
+            self._is_initialized = False
+
+        if llm_client is not None:
+            try:
+                await llm_client.close()
+            except Exception as exc:
+                logger.warning(
+                    f"LLM client cleanup failed: error_type={type(exc).__name__}"
+                )
+        if session_manager is not None:
+            try:
+                await asyncio.to_thread(session_manager.dispose)
+            except Exception as exc:
+                logger.warning(
+                    f"session manager cleanup failed: error_type={type(exc).__name__}"
+                )
+
+    async def _async_reply_unlocked(
+        self,
+        query: str,
+        context: Context = None,
+        session_id: Optional[str] = None,
+    ) -> Reply:
         """异步回复接口"""
         # 延迟初始化
         if not self._is_initialized:
@@ -161,13 +217,11 @@ class CustomerAgent(Bot):
 
         try:
             # 构建 session_id 和 dependencies
-            if context and context.channel_type and hasattr(context.kwargs, "user_id"):
-                session_id = f"{context.channel_type.value}{context.kwargs.user_id}"
+            if context and context.channel_type and context_scope(context).get("user_id"):
                 dependencies = self._message_builder.build_dependencies(context)
             else:
-                # 降级：使用 query hash 作为 session_id
-                session_id = f"fallback_{abs(hash(query)) % 100000}"
                 dependencies = {}
+            session_id = session_id or self._session_id(context, query)
 
             # 加载历史并检查压缩（DB 操作放工作线程，避免阻塞事件循环）
             history = await asyncio.to_thread(self._session_manager.get_history, session_id)
@@ -179,6 +233,15 @@ class CustomerAgent(Bot):
 
             # 预取商品列表（拼多多 HTTP，放工作线程）并注入 dependencies，
             # 避免 build_messages 内同步阻塞
+            # Persist the user turn before invoking the model.  This keeps the
+            # durable transcript complete even when the model or a tool fails.
+            await asyncio.to_thread(
+                self._session_manager.add_message,
+                session_id=session_id,
+                role="user",
+                content=query,
+            )
+
             shop_id = dependencies.get("shop_id")
             user_id = dependencies.get("user_id")
             if shop_id and user_id:
@@ -192,7 +255,9 @@ class CustomerAgent(Bot):
             messages = self._message_builder.build_messages(query, history, dependencies)
 
             # 执行 Agent 循环
-            final_content = await self._run_agent_loop(messages, dependencies)
+            final_content = await self._run_agent_loop(
+                messages, dependencies, session_id=session_id
+            )
 
             # 保存最终回复到历史（DB 写入放工作线程，避免阻塞事件循环）
             await asyncio.to_thread(
@@ -205,13 +270,16 @@ class CustomerAgent(Bot):
             return Reply(ReplyType.TEXT, final_content or "抱歉，我暂时无法回复。")
 
         except Exception as e:
-            logger.error(f"CustomerAgent 回复失败: {e}")
+            logger.error(
+                f"CustomerAgent 回复失败: error_type={type(e).__name__}"
+            )
             return Reply(ReplyType.TEXT, "抱歉，我现在无法回复，请稍后再试。")
 
     async def _run_agent_loop(
         self,
         messages: List[Dict[str, Any]],
         dependencies: Dict[str, Any],
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Agent 循环核心
@@ -225,14 +293,16 @@ class CustomerAgent(Bot):
             try:
                 response = await self._llm_client.chat(messages, tool_choice="auto")
             except Exception as e:
-                logger.error(f"LLM 调用失败: {e}")
+                logger.error(
+                    f"LLM 调用失败: error_type={type(e).__name__}"
+                )
                 if loop_count == 0:
-                    return f"抱歉，AI 服务暂时不可用：{e}"
+                    return "抱歉，AI 服务暂时不可用，请稍后再试。"
                 # 已有中间结果，返回已生成的内容
                 for msg in reversed(messages):
                     if msg.get("role") == "assistant" and msg.get("content"):
                         return msg["content"]
-                return f"抱歉，AI 服务暂时不可用：{e}"
+                return "抱歉，AI 服务暂时不可用，请稍后再试。"
 
             # 2. 解析响应
             if not response.has_tool_calls:
@@ -258,6 +328,16 @@ class CustomerAgent(Bot):
                 ],
             }
             messages.append(assistant_msg)
+            if session_id and self._session_manager:
+                await asyncio.to_thread(
+                    self._session_manager.add_message,
+                    session_id=session_id,
+                    role="assistant",
+                    content=json.dumps(
+                        {"content": assistant_msg["content"], "tool_calls": assistant_msg["tool_calls"]},
+                        ensure_ascii=False,
+                    ),
+                )
 
             # 4. 检查循环上限
             if loop_count >= self._config.max_loops - 1:
@@ -280,11 +360,24 @@ class CustomerAgent(Bot):
             # 6. 将结果追加到消息列表
             for result in tool_results:
                 messages.append(result.to_dict())
+                if session_id and self._session_manager:
+                    await asyncio.to_thread(
+                        self._session_manager.add_message,
+                        session_id=session_id,
+                        role="tool",
+                        content=result.content,
+                        tool_call_id=result.tool_call_id,
+                    )
 
             loop_count += 1
 
         # 兜底
         return messages[-1].get("content", "")
+
+    def _session_id(self, context: Optional[Context], query: str) -> str:
+        if context is not None and context_scope(context).get("recipient_uid"):
+            return make_conversation_key(context)
+        return self._fallback_session_id
 
     async def _compress_with_llm(
         self,
@@ -319,7 +412,9 @@ class CustomerAgent(Bot):
                 )
                 return response.content or "[摘要生成失败]"
             except Exception as e:
-                logger.error(f"生成摘要失败: {e}")
+                logger.error(
+                    f"生成摘要失败: error_type={type(e).__name__}"
+                )
                 return "[摘要生成失败]"
 
         await self._session_manager.compress_history(session_id, summary_llm)

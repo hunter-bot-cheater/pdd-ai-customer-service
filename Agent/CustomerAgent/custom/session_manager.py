@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import os
 import json
+import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
 from sqlalchemy import (
@@ -25,6 +27,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from utils.logger_loguru import get_logger
 from utils.db_pragma import setup_sqlite_pragmas
+from utils.runtime_path import resolve_data_path
 
 logger = get_logger("SessionManager")
 
@@ -41,7 +44,7 @@ class AgentMessage(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(255), nullable=False, index=True)
-    role = Column(String(32), nullable=False)  # system | user | assistant | tool
+    role = Column(String(32), nullable=False)  # user | assistant | tool | summary
     content = Column(Text, nullable=True)
     tool_call_id = Column(String(128), nullable=True)  # 关联 LLM 请求中的 tool_call id
     timestamp = Column(DateTime, default=datetime.now, nullable=False)
@@ -90,7 +93,9 @@ class TokenEstimator:
                 self._available = True
                 logger.debug("tiktoken cl100k_base 编码器初始化成功")
             except Exception as e:
-                logger.warning(f"tiktoken 编码器初始化失败: {e}")
+                logger.warning(
+                    f"tiktoken 编码器初始化失败: error_type={type(e).__name__}"
+                )
                 self._available = False
 
     def estimate(self, text: str) -> int:
@@ -147,23 +152,57 @@ class SessionManager:
             retain_count: 压缩后保留的最近消息条数
             model_name: 用于 tiktoken 的模型名称
         """
-        self.db_path = db_path
+        configured_path = Path(db_path)
+        resolved_path = Path(resolve_data_path(configured_path))
+
+        # The default filename changed during account-isolation migration.
+        # Reuse an initialized legacy agent.db without deleting or overwriting
+        # either database.
+        if resolved_path.name == "channel_shop.db" and not self._has_messages_table(resolved_path):
+            legacy_path = (
+                Path(resolve_data_path(configured_path.with_name("agent.db")))
+                if not configured_path.is_absolute()
+                else configured_path.with_name("agent.db")
+            )
+            if self._has_messages_table(legacy_path):
+                resolved_path = legacy_path
+
+        self.db_path = str(resolved_path)
         self.token_window = token_window
         self.compress_ratio = compress_ratio
         self.retain_count = retain_count
         self.threshold = int(token_window * compress_ratio)
 
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        self.engine = create_engine(f"sqlite:///{self.db_path}")
         setup_sqlite_pragmas(self.engine)
         self._Session = sessionmaker(bind=self.engine)
         Base.metadata.create_all(self.engine)
 
         self._token_estimator = TokenEstimator(model_name=model_name)
         logger.info(
-            f"SessionManager 初始化完成: db={db_path}, "
+            f"SessionManager 初始化完成: db={self.db_path}, "
             f"threshold={self.threshold}, retain={retain_count}"
         )
+
+    @staticmethod
+    def _has_messages_table(path: Path) -> bool:
+        """Return whether *path* contains an initialized session table."""
+        if not path.is_file():
+            return False
+        connection = None
+        try:
+            connection = sqlite3.connect(str(path), timeout=1)
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='agent_messages' LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except (OSError, sqlite3.Error):
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _session(self):
         return self._Session()
@@ -176,6 +215,11 @@ class SessionManager:
         tool_call_id: Optional[str] = None,
     ) -> bool:
         """追加消息到会话历史"""
+        if role not in {"user", "assistant", "tool", "summary"}:
+            logger.warning(
+                f"unknown session role rejected: role_type={type(role).__name__}"
+            )
+            return False
         session = self._session()
         try:
             msg = AgentMessage(
@@ -190,10 +234,16 @@ class SessionManager:
             return True
         except SQLAlchemyError as e:
             session.rollback()
-            logger.error(f"添加消息失败: {e}")
+            logger.error(f"添加消息失败: error_type={type(e).__name__}")
             return False
         finally:
             session.close()
+
+    def dispose(self) -> None:
+        """Release the SQLAlchemy engine and its connection pool."""
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.dispose()
 
     def get_history(
         self,
@@ -205,7 +255,7 @@ class SessionManager:
         try:
             query = session.query(AgentMessage).filter(
                 AgentMessage.session_id == session_id
-            ).order_by(AgentMessage.timestamp.asc())
+            ).order_by(AgentMessage.timestamp.asc(), AgentMessage.id.asc())
 
             if limit is not None:
                 query = query.limit(limit)
@@ -213,7 +263,7 @@ class SessionManager:
             messages = query.all()
             return [msg.to_dict() for msg in messages]
         except SQLAlchemyError as e:
-            logger.error(f"获取历史消息失败: {e}")
+            logger.error(f"获取历史消息失败: error_type={type(e).__name__}")
             return []
         finally:
             session.close()
@@ -226,7 +276,7 @@ class SessionManager:
                 AgentMessage.session_id == session_id
             ).count()
         except SQLAlchemyError as e:
-            logger.error(f"获取消息数量失败: {e}")
+            logger.error(f"获取消息数量失败: error_type={type(e).__name__}")
             return 0
         finally:
             session.close()
@@ -263,7 +313,7 @@ class SessionManager:
             # 1. 获取全部历史
             messages = session.query(AgentMessage).filter(
                 AgentMessage.session_id == session_id
-            ).order_by(AgentMessage.timestamp.asc()).all()
+            ).order_by(AgentMessage.timestamp.asc(), AgentMessage.id.asc()).all()
 
             if len(messages) <= self.retain_count + 1:
                 logger.debug(f"消息数量 {len(messages)} 未达到压缩阈值，跳过")
@@ -285,21 +335,26 @@ class SessionManager:
             try:
                 summary = await llm_callable(summary_input)
             except Exception as e:
-                logger.error(f"生成摘要失败: {e}")
-                # 摘要生成失败时，保留最近的消息，删除更旧的
-                summary = "[历史消息已清理，无法生成摘要]"
+                logger.error(f"生成摘要失败: error_type={type(e).__name__}")
+                # Never delete history when the summary is unavailable.
+                session.rollback()
+                return False
 
             # 4. 删除旧消息
             for msg in old_messages:
                 session.delete(msg)
 
-            # 5. 在顶部插入摘要消息
+            # 5. 在顶部插入不可信摘要消息
+            summary_timestamp = retain_messages[0].timestamp - timedelta(microseconds=1)
             summary_msg = AgentMessage(
                 session_id=session_id,
-                role="system",
-                content=f"[以下是对之前对话的摘要]\n\n{summary}",
+                # A model-generated summary is conversation data, never a new
+                # system instruction. MessageBuilder renders this role with a
+                # user-level safety wrapper.
+                role="summary",
+                content=str(summary),
                 tool_call_id=None,
-                timestamp=datetime.now(),
+                timestamp=summary_timestamp,
             )
             session.add(summary_msg)
 
@@ -315,7 +370,7 @@ class SessionManager:
 
         except SQLAlchemyError as e:
             session.rollback()
-            logger.error(f"压缩历史失败: {e}")
+            logger.error(f"压缩历史失败: error_type={type(e).__name__}")
             return False
         finally:
             session.close()

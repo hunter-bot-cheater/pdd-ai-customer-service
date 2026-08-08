@@ -36,9 +36,13 @@ class ConnectionMixin:
                     return
 
                 if attempt == self.reconnect_config.max_attempts - 1:
-                    self.status_manager.update_status(shop_id, user_id, username, ConnectionState.ERROR, str(e))
-                    logger.error(f"连接失败，已达到最大重试次数: {shop_id}-{username}, 错误: {str(e)}")
-                    on_failure(f"连接失败，已达到最大重试次数: {e}")
+                    self.status_manager.update_status(
+                        shop_id, user_id, username, ConnectionState.ERROR, type(e).__name__
+                    )
+                    logger.error(
+                        f"连接失败，已达到最大重试次数: {shop_id}-{username}, 错误类型: {type(e).__name__}"
+                    )
+                    on_failure("连接失败，已达到最大重试次数，请检查网络和账号状态")
                     return
 
                 delay = min(
@@ -46,7 +50,9 @@ class ConnectionMixin:
                     self.reconnect_config.max_delay
                 )
 
-                logger.warning(f"连接失败，{delay:.1f}秒后重试: {shop_id}-{username}, 错误: {str(e)}")
+                logger.warning(
+                    f"连接失败，{delay:.1f}秒后重试: {shop_id}-{username}, 错误类型: {type(e).__name__}"
+                )
 
                 try:
                     for _ in range(int(delay * 10)):
@@ -83,7 +89,9 @@ class ConnectionMixin:
                 if asyncio.iscoroutine(result):
                     await result
         except Exception as e:
-            self.logger.debug(f"关闭WebSocket失败: {e}")
+            self.logger.debug(
+                f"关闭WebSocket失败: error_type={type(e).__name__}"
+            )
 
 
 # 延迟导入避免循环依赖

@@ -10,7 +10,7 @@ from typing import Optional, Dict, Set
 from utils.logger_loguru import get_logger
 
 from ..models.queue_models import MessageWrapper, QueueStats, QueueConfig
-from bridge.context import Context
+from bridge.context import Context, _context_value
 
 
 logger = get_logger(__name__)
@@ -88,6 +88,10 @@ class SimpleMessageQueue:
         """检查队列是否为空"""
         return self._queue.empty()
 
+    def is_closed(self) -> bool:
+        """Return whether no more messages may be enqueued."""
+        return self._closed
+
     def get_stats(self) -> QueueStats:
         """获取统计信息"""
         stats = QueueStats(
@@ -115,13 +119,12 @@ class SimpleMessageQueue:
         if self._deduplication_cache is None:
             return False
 
-        kwargs = getattr(wrapper.context, "kwargs", None)
-        msg_id = getattr(kwargs, "msg_id", None) if kwargs is not None else None
+        msg_id = _context_value(wrapper.context, "msg_id")
 
         if msg_id:
             dedup_key = f"mid:{msg_id}"
         else:
-            from_uid = getattr(kwargs, "from_uid", None) if kwargs is not None else None
+            from_uid = _context_value(wrapper.context, "from_uid")
             channel = ""
             ct = getattr(wrapper.context, "channel_type", None)
             if ct is not None:
@@ -187,6 +190,13 @@ class QueueManager:
         """获取队列"""
         return self._queues.get(name)
 
+    def remove_queue(self, name: str) -> Optional[SimpleMessageQueue]:
+        """Remove a closed queue from this loop/account registry."""
+        queue = self._queues.pop(name, None)
+        if queue is not None:
+            queue.close()
+        return queue
+
     def recreate_queue(self, name: str, config: Optional[QueueConfig] = None) -> SimpleMessageQueue:
         """重新创建队列以绑定当前事件循环"""
         try:
@@ -209,8 +219,9 @@ class QueueManager:
 
     async def close_all(self):
         """关闭所有队列"""
-        for queue in self._queues.values():
+        for queue in list(self._queues.values()):
             queue.close()
+        self._queues.clear()
         self.logger.info("All queues closed")
 
 

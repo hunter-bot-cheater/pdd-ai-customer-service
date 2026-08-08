@@ -41,13 +41,17 @@ class SendMessage(BaseRequest):
         result = self.post(url, json_data=data)
         if result and result.get("success") == True:
             if result.get("result", {}).get("error_code") == 10002:
-                error_msg = result.get('result', {}).get('error')
-                self.logger.error(f"发送文本消息失败: {error_msg}")
-                return error_msg
+                self.logger.error(
+                    "发送文本消息失败: platform_error_code=10002"
+                )
+                return None
             else:
                 return result
         else:
-            self.logger.error(f"发送文本消息失败: {result}")
+            self.logger.error(
+                "发送文本消息失败: "
+                f"response_keys={sorted(result.keys()) if isinstance(result, dict) else []}"
+            )
             return None
 
  
@@ -82,7 +86,7 @@ class SendMessage(BaseRequest):
 
         result = self.post(url, json_data=data)
         if result:
-            self.logger.debug(f"发送图片消息成功: {result}")
+            self.logger.debug("发送图片消息完成")
             return result
 
 
@@ -126,9 +130,14 @@ class SendMessage(BaseRequest):
         result = self.post(url, json_data=data, headers=headers)
         if result:
             if result.get("success"):
-                self.logger.info(f"商品卡片发送成功: goods_id={goods_id}, to={recipient_uid}, biz_type={biz_type}")
+                self.logger.info(
+                    f"商品卡片发送成功: goods_id={goods_id}, biz_type={biz_type}"
+                )
             else:
-                self.logger.error(f"商品卡片发送失败: {result.get('error_msg', '未知错误')}")
+                self.logger.error(
+                    "商品卡片发送失败: "
+                    f"response_keys={sorted(result.keys())}"
+                )
             return result
 
 
@@ -143,8 +152,10 @@ class SendMessage(BaseRequest):
         if result and result.get('success'):
             return result['result']['csList']
         else:
-            error_msg = result.get('result', {}).get('error') if result else "请求失败"
-            self.logger.error(f"获取分配的客服列表失败: {error_msg}")
+            self.logger.error(
+                "获取分配的客服列表失败: "
+                f"response_keys={sorted(result.keys()) if isinstance(result, dict) else []}"
+            )
             return None
 
 
@@ -169,5 +180,5 @@ class SendMessage(BaseRequest):
         
         result = self.post(url, json_data=data)
         if result:
-            self.logger.debug(f"转移会话成功: {result}")
+            self.logger.debug("转移会话请求完成")
             return result

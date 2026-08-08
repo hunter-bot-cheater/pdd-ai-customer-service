@@ -93,6 +93,7 @@ def _notify_handoff(params: TransferConversationParams, reason: str, last_messag
     name="transfer_conversation",
     description="将当前会话转接给人工客服。",
     param_model=TransferConversationParams,
+    side_effect=True,
 )
 def transfer_conversation(
     params: TransferConversationParams,
@@ -111,7 +112,7 @@ def transfer_conversation(
     """
     try:
         if not all([params.shop_id, params.user_id, params.recipient_uid]):
-            return f"转接失败：缺少必要的会话信息 (shop_id={params.shop_id}, user_id={params.user_id}, recipient_uid={params.recipient_uid})"
+            return "转接失败：缺少必要的会话信息"
 
         # 规则 7：子账号不调用转人工 API，仅静默标记会话 + 通知人工客服
         if not _is_main_account(params.shop_id, params.user_id):
@@ -148,11 +149,11 @@ def transfer_conversation(
                     logger.warning(f"会话转接失败: transfer_result={transfer_result}")
                     return "会话转接失败"
             else:
-                logger.warning(f"会话转接失败: 当前无可用的人工客服 (shop_id={params.shop_id})")
+                logger.warning("会话转接失败: 当前无可用的人工客服")
                 return "当前无可用的人工客服"
         logger.warning("会话转接失败：无法获取客服列表")
         return "会话转接失败：无法获取客服列表"
 
     except Exception as e:
-        logger.error(f"转接过程中发生错误: {str(e)}")
-        return f"转接过程中发生错误: {str(e)}"
+        logger.error(f"转接过程中发生错误: {type(e).__name__}")
+        return "转接失败，请稍后重试"

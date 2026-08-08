@@ -12,13 +12,15 @@
 - core/pdd_utils.py: 全局便捷函数
 """
 from utils.logger_loguru import get_logger
-from bridge.context import Context, ContextType, ChannelType
+from bridge.context import Context, ContextType, ChannelType, make_account_key
 from Channel.pinduoduo.pdd_message import PDDChatMessage
 from Channel.channel import Channel
 from Channel.pinduoduo.utils.API.get_token import GetToken
 from database import db_manager
 from utils.resource_manager import WebSocketResourceManager
 from core.connection_status import ConnectionStatusManager, ConnectionState, ConnectionStatus
+from Message.core.queue import QueueManager
+from Message.core.consumer import MessageConsumerManager
 import websockets
 import json
 from websockets import exceptions as ws_exceptions
@@ -76,7 +78,18 @@ class PDDChannel(ConnectionMixin, MessageHandlerMixin, LifecycleMixin, StatusMix
         self._stop_event: Optional[asyncio.Event] = None
         self.base_url = "wss://m-ws.pinduoduo.com/"
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.businessHours = config.get("businessHours")
+        self.business_hours = config.get(
+            "business_hours", {"start": "08:00", "end": "23:00"}
+        )
+        # Keep the legacy attribute for third-party callers.
+        self.businessHours = self.business_hours
+
+        # Each AutoReplyThread owns one PDDChannel.  Keep queue, consumers and
+        # Agent state on that channel instead of using process-global registries.
+        self.queue_manager = QueueManager()
+        self.consumer_manager = MessageConsumerManager(self.queue_manager)
+        self._account_agent = None
+        self._account_key = None
 
         # WebSocket优化功能
         self.reconnect_config = ReconnectConfig()

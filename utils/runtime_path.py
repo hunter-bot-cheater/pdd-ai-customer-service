@@ -5,6 +5,8 @@
 
 import os
 import sys
+import copy
+import shutil
 from pathlib import Path
 from typing import Union
 
@@ -32,6 +34,41 @@ def get_base_path() -> Path:
     else:
         # 开发环境下的路径
         return Path(__file__).resolve().parents[1]
+
+
+def get_data_path() -> Path:
+    """Return the writable per-user data directory."""
+    if not is_frozen():
+        return get_base_path()
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Agent-Customer"
+    return get_base_path()
+
+
+def resolve_data_path(path: Union[str, Path]) -> Path:
+    """Resolve a configured path inside the writable application data root."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        target = get_data_path() / candidate
+        if is_frozen() and not target.exists() and candidate.suffix.lower() in {
+            ".db", ".sqlite", ".sqlite3"
+        }:
+            legacy = get_base_path() / candidate
+            if legacy.exists() and legacy.is_file():
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(legacy, target)
+                    for suffix in ("-wal", "-shm"):
+                        sidecar = Path(str(legacy) + suffix)
+                        if sidecar.exists() and sidecar.is_file():
+                            shutil.copy2(sidecar, Path(str(target) + suffix))
+                except OSError:
+                    # Do not silently open a new empty database when migration
+                    # cannot be completed.
+                    return legacy
+        candidate = target
+    return candidate
 
 
 def get_resource_path(relative_path: Union[str, Path]) -> Path:
@@ -79,10 +116,10 @@ def get_temp_path(subpath: Union[str, Path] = "") -> Path:
     """
     if is_frozen():
         # 打包环境下，使用可执行文件目录下的 temp 文件夹
-        temp_dir = get_base_path() / "temp"
+        temp_dir = get_data_path() / "temp"
     else:
         # 开发环境下，使用项目根目录下的 temp 文件夹
-        temp_dir = get_base_path() / "temp"
+        temp_dir = get_data_path() / "temp"
 
     # 如果指定了子路径，追加到临时目录
     if subpath:
@@ -116,15 +153,17 @@ def get_config_path(config_name: str = "config.json") -> Path:
     Returns:
         Path: 配置文件的绝对路径
     """
-    # 优先查找可执行文件目录（打包后可能需要修改配置）
-    exe_dir = get_base_path()
-    config_path = exe_dir / config_name
-
-    # 如果可执行文件目录下没有配置文件，尝试查找原始位置
-    if not config_path.exists() and not is_frozen():
-        config_path = get_resource_path(config_name)
-
-    return config_path
+    # 配置属于用户数据，打包后放到 LOCALAPPDATA，避免安装目录不可写。
+    target = get_data_path() / config_name
+    if is_frozen() and not target.exists():
+        legacy = get_base_path() / config_name
+        if legacy.exists() and legacy.is_file() and legacy.resolve() != target.resolve():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, target)
+            except OSError:
+                return legacy
+    return target
 
 
 def get_log_path() -> Path:
@@ -183,8 +222,8 @@ def adjust_config_for_runtime(config: dict) -> dict:
     Returns:
         dict: 调整后的配置字典
     """
-    # 创建新的配置副本
-    adjusted_config = config.copy()
+    # 创建深拷贝，避免调整嵌套路径时修改调用方配置。
+    adjusted_config = copy.deepcopy(config)
 
     # 调整数据库路径
     if "db_path" in adjusted_config:
@@ -213,7 +252,7 @@ def adjust_config_for_runtime(config: dict) -> dict:
             # 如果是相对路径，转换为绝对路径
             path = Path(adjusted_config[key])
             if not path.is_absolute():
-                adjusted_config[key] = str(get_temp_dir() / path.name)
+                adjusted_config[key] = str(get_temp_path() / path.name)
 
     return adjusted_config
 

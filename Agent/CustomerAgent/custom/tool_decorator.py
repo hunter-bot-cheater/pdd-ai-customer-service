@@ -25,6 +25,7 @@ class ToolEntry:
     description: str
     param_model: type[BaseModel]  # Pydantic 模型，用于生成 schema 和实例化参数
     func: Callable
+    side_effect: bool = False
 
 
 # 全局工具注册表
@@ -89,16 +90,25 @@ def execute_tool(
         # 解析参数
         args_dict = json.loads(arguments) if isinstance(arguments, str) else arguments
 
-        # 构建参数：优先使用 LLM 提供的参数，dependencies 仅作为补充
-        # 工具参数从两部分获取：
-        # 1. LLM 通过 function call 提供的参数（args_dict）- 优先使用
-        # 2. dependencies 中的上下文 - 仅当 LLM 未提供时使用
+        # 构建参数：身份/权限字段必须来自受信任的 dependencies，
+        # 其他业务参数才允许使用 LLM 提供的值。
         # 使用 Pydantic 模型的字段名来构建参数字典
         params = {}
         model_fields = entry.param_model.model_fields
+        authority_fields = {
+            "channel_type",
+            "shop_id",
+            "user_id",
+            "recipient_uid",
+        }
 
         for field_name in model_fields:
-            if field_name in args_dict:
+            if field_name in authority_fields:
+                trusted_value = dependencies.get(field_name)
+                if trusted_value is None or str(trusted_value).strip() == "":
+                    return "[工具无法执行：缺少可信会话身份]"
+                params[field_name] = trusted_value
+            elif field_name in args_dict:
                 # 优先从 LLM 提供的参数中获取
                 params[field_name] = args_dict[field_name]
             elif field_name in dependencies:
@@ -117,11 +127,11 @@ def execute_tool(
         return str(result)
 
     except json.JSONDecodeError as e:
-        logger.error(f"工具 {name} 参数解析失败: {e}, raw={arguments}")
-        return f"[工具参数解析错误: {e}]"
+        logger.error(f"工具 {name} 参数解析失败: {type(e).__name__}")
+        return "[工具参数格式错误，请重试]"
     except Exception as e:
-        logger.error(f"工具 {name} 执行异常: {e}")
-        return f"[工具执行错误: {e}]"
+        logger.error(f"工具 {name} 执行异常: {type(e).__name__}")
+        return "[工具执行失败，请稍后重试]"
 
 
 # ==============================================================================
@@ -132,6 +142,7 @@ def agent_tool(
     name: str,
     description: str,
     param_model: Optional[type[BaseModel]] = None,
+    side_effect: bool = False,
 ) -> Callable:
     """
     工具装饰器
@@ -165,6 +176,7 @@ def agent_tool(
             description=description,
             param_model=param_model,
             func=func,
+            side_effect=side_effect,
         )
         logger.debug(f"工具已注册: {name}")
         return func
