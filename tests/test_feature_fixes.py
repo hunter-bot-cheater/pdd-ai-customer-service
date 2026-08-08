@@ -1303,16 +1303,16 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
         self.assertEqual(p.recipient_uid, 5927195871573)
 
     def test_execute_tool_with_int_uid(self):
-        """execute_tool 不再因 recipient_uid 为 int 触发校验错误，且以字符串调用 API"""
+        """身份字段来自受信任 dependencies（int 值），goods_id 为 LLM 业务参数"""
         result = execute_tool(
             "send_goods_link",
-            json.dumps({
+            json.dumps({"goods_id": 100123}),
+            {
                 "recipient_uid": 5927195871573,
-                "goods_id": 100123,
                 "shop_id": 661962391,
                 "user_id": 189109418,
-            }),
-            {},
+                "channel_type": "pinduoduo",
+            },
         )
         self.assertIn("商品卡片发送成功", result)
         self.assertEqual(len(self.calls), 1)
@@ -1323,10 +1323,16 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
         self.assertEqual(goods_id, 100123)
 
     def test_execute_tool_missing_params(self):
+        """身份字段齐全但缺少业务参数 goods_id → 工具自身校验拦截"""
         result = execute_tool(
             "send_goods_link",
-            json.dumps({"recipient_uid": "buyer1", "goods_id": 100123}),
-            {},
+            json.dumps({}),
+            {
+                "recipient_uid": "buyer1",
+                "shop_id": 661962391,
+                "user_id": 189109418,
+                "channel_type": "pinduoduo",
+            },
         )
         self.assertIn("缺少必要", result)
         self.assertEqual(self.calls, [])
