@@ -10,7 +10,14 @@ from utils.logger_loguru import get_logger
 from utils.db_pragma import setup_sqlite_pragmas
 from utils.runtime_path import resolve_data_path
 from utils.secret_store import protect_secret, unprotect_secret
-from database.models import Base, Channel, Shop, Account, Keyword
+from database.models import (
+    Base,
+    Channel,
+    Shop,
+    Account,
+    Keyword,
+    HandoffMarker,
+)
 
 
 class DatabaseManager:
@@ -48,6 +55,10 @@ class DatabaseManager:
         channel_name = "pinduoduo"
         description = "拼多多"
         self.add_channel(channel_name, description)
+
+        # 确保已转人工会话标记表存在（重启后转人工状态仍生效）。
+        # Base.metadata.create_all 已覆盖，这里显式执行一次并允许表已存在。
+        HandoffMarker.__table__.create(self.engine, checkfirst=True)
 
 
     def get_session(self):

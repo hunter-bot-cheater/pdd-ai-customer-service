@@ -25,6 +25,8 @@ B. 九条真人模拟硬性规则
 import asyncio
 import datetime as _real_dt
 import json
+import shutil
+import tempfile
 import threading
 import time
 import unittest
@@ -46,6 +48,11 @@ configure_standard_services(_app_config)
 from core.session_state import SessionState, session_state
 from core.uid_send_tracker import UIDSendTracker
 from core.notify_tracker import NotifyTracker, notify_tracker
+import importlib
+from database.db_manager import DatabaseManager
+# database/__init__.py 将包属性 db_manager 重绑定为 DI 代理，
+# 因此必须通过 importlib 取真实子模块才能 mock 其 get_db_manager。
+database_db_manager_module = importlib.import_module("database.db_manager")
 from Agent.CustomerAgent.tools import move_conversation as mc_module
 from Agent.CustomerAgent.tools.move_conversation import (
     transfer_conversation,
@@ -264,6 +271,55 @@ class TestSessionState(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
+
+    def test_persist_handoff_survives_memory_clear(self):
+        """转人工标记持久化到数据库：清空内存缓存（模拟进程重启）后仍能恢复"""
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_db = str(tmp_dir / "test_session_state.db")
+        temp_manager = DatabaseManager(db_path=tmp_db)
+        key = "persist:buyer1"
+        try:
+            with mock.patch.object(
+                database_db_manager_module,
+                "get_db_manager",
+                return_value=temp_manager,
+            ):
+                s = self.s
+                s._db = None  # 强制重新解析到被 mock 的 get_db_manager
+                s.mark_handoff(key)
+                # 清空内存缓存，模拟进程重启后内存丢失
+                with s._data_lock:
+                    s._handoffs.clear()
+                self.assertTrue(s.is_handoff(key))
+                s.clear_handoff(key)
+                self.assertFalse(s.is_handoff(key))
+        finally:
+            # 恢复单例状态，避免污染后续测试
+            with self.s._data_lock:
+                self.s._db = None
+                self.s._handoffs.pop(key, None)
+            temp_manager.dispose()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_memory_cache_works_when_db_unavailable(self):
+        """数据库不可用时降级为纯内存缓存，不抛异常"""
+        key = "memonly:buyer1"
+        try:
+            with mock.patch.object(
+                database_db_manager_module,
+                "get_db_manager",
+                side_effect=RuntimeError("db unavailable"),
+            ):
+                s = self.s
+                s._db = None
+                s.mark_handoff(key)  # 不应抛异常
+                self.assertTrue(s.is_handoff(key))
+                s.clear_handoff(key)
+                self.assertFalse(s.is_handoff(key))
+        finally:
+            with self.s._data_lock:
+                self.s._db = None
+                self.s._handoffs.pop(key, None)
 
 
 # ============================================================================
@@ -638,6 +694,30 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
     def test_cannot_handle_normal_message(self):
         context = make_context("这件衣服多大码")
         self.assertFalse(self.handler.can_handle(context))
+
+    def test_within_business_hours_invalid_format_allows_manual(self):
+        """配置 start/end 格式错误时保守返回 True（允许转人工），不禁用功能"""
+        handler = KeywordDetectionHandler(business_hours={"start": "bad", "end": "23:00"})
+        self.assertTrue(handler._within_business_hours())
+        handler = KeywordDetectionHandler(business_hours={"start": "08:00", "end": None})
+        self.assertTrue(handler._within_business_hours())
+
+    def test_within_business_hours_invalid_type_allows_manual(self):
+        """business_hours 非 dict（如字符串/缺失）时保守返回 True（允许转人工）"""
+        handler = KeywordDetectionHandler(business_hours="bad-config")
+        self.assertTrue(handler._within_business_hours())
+
+    def test_within_business_hours_missing_fields_uses_defaults(self):
+        """start/end 缺失时回退默认 08:00-23:00，返回正常布尔判断"""
+        handler = KeywordDetectionHandler(business_hours={})
+        result = handler._within_business_hours()
+        self.assertIsInstance(result, bool)
+
+    def test_within_business_hours_valid_config(self):
+        """有效配置按营业时间正常判断"""
+        handler = KeywordDetectionHandler(business_hours=_inside_business_hours_dict())
+        result = handler._within_business_hours()
+        self.assertTrue(result)
 
     async def test_after_sale_triggers_transfer_and_blocks(self):
         context = make_context("我要退款，商品有质量问题")

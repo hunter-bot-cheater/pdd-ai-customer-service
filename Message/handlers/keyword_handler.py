@@ -140,14 +140,28 @@ class KeywordDetectionHandler(BaseHandler):
         return self.keywords.copy()
 
     def _within_business_hours(self) -> bool:
-        """Return whether manual-service routing is currently enabled."""
+        """Return whether manual-service routing is currently enabled.
+
+        配置无效（缺失或格式错误）时保守返回 True（允许转人工），
+        避免配置问题导致功能被静默禁用。
+        """
+        bh = self.business_hours
+        if not isinstance(bh, dict):
+            self.logger.error(
+                f"营业时间配置无效（{bh!r}），应为包含 start/end 的配置对象，"
+                f"如 start=\"08:00\", end=\"23:00\"。已默认允许转人工。"
+            )
+            return True
         try:
-            start = time.fromisoformat(str(self.business_hours.get("start", "08:00")))
-            end = time.fromisoformat(str(self.business_hours.get("end", "23:00")))
+            start = time.fromisoformat(str(bh.get("start", "08:00")))
+            end = time.fromisoformat(str(bh.get("end", "23:00")))
             current = datetime.now().time()
             if start <= end:
                 return start <= current <= end
             return current >= start or current <= end
         except (TypeError, ValueError):
-            self.logger.warning("invalid business hours; manual routing disabled")
-            return False
+            self.logger.error(
+                f"营业时间配置无效（start={bh.get('start')!r}, end={bh.get('end')!r}），"
+                f"格式应为 HH:MM，如 \"08:00\"/\"23:00\"。已默认允许转人工。"
+            )
+            return True
