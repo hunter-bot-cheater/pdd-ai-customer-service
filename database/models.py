@@ -123,3 +123,15 @@ class CustomerServiceKnowledge(Base):
 
     def __repr__(self):
         return f"<CustomerServiceKnowledge(title='{self.title}', enabled={self.enabled})>"
+
+
+class HandoffMarker(Base):
+    """已转人工会话标记，持久化到数据库使标记在进程重启后仍生效。"""
+
+    __tablename__ = "handoff_markers"
+
+    session_key = Column(String(255), primary_key=True)
+    expiry = Column(Integer, nullable=False)
+
+    def __repr__(self):
+        return f"<HandoffMarker(session_key='{self.session_key}', expiry={self.expiry})>"

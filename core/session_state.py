@@ -6,10 +6,15 @@
 
 session_key 格式：{shop_id}:{from_uid}
 默认有效期 4 小时（14400 秒）。
+
+标记同时持久化到数据库（handoff_markers 表），
+进程重启后内存缓存丢失时从数据库恢复，保证转人工状态不丢失。
 """
 import time
 import threading
 from typing import Optional
+
+from utils.logger_loguru import get_logger
 
 
 class SessionState:
@@ -25,29 +30,118 @@ class SessionState:
                     obj = super().__new__(cls)
                     obj._handoffs = {}
                     obj._data_lock = threading.Lock()
+                    obj._db = None  # 懒加载的 DatabaseManager
+                    # 串行化数据库写操作，避免并发 merge 触发唯一约束冲突
+                    obj._db_lock = threading.Lock()
+                    obj._logger = get_logger("SessionState")
                     cls._instance = obj
         return cls._instance
 
     def mark_handoff(self, session_key: str, ttl_seconds: int = 14400) -> None:
-        """标记会话为已转人工，默认有效 4 小时"""
+        """标记会话为已转人工，默认有效 4 小时，并持久化到数据库"""
+        expiry = time.time() + ttl_seconds
         with self._data_lock:
-            self._handoffs[session_key] = time.time() + ttl_seconds
+            self._handoffs[session_key] = expiry
+        self._persist_marker(session_key, expiry)
 
     def is_handoff(self, session_key: str) -> bool:
         """判断会话是否处于转人工有效期内，过期自动清除"""
+        now = time.time()
+        expired = False
+        # 内存缓存快路径
         with self._data_lock:
             expiry = self._handoffs.get(session_key)
-            if expiry is None:
-                return False
-            if time.time() > expiry:
-                del self._handoffs[session_key]
-                return False
-            return True
+            if expiry is not None:
+                if now > expiry:
+                    del self._handoffs[session_key]
+                    expired = True
+                else:
+                    return True
+        if expired:
+            self._delete_marker(session_key)
+            return False
+
+        # 内存未命中：从数据库恢复（模拟进程重启后的场景）
+        expiry = self._load_marker(session_key)
+        if expiry is None:
+            return False
+        if now > expiry:
+            self._delete_marker(session_key)
+            return False
+        with self._data_lock:
+            self._handoffs[session_key] = expiry
+        return True
 
     def clear_handoff(self, session_key: str) -> None:
-        """手动清除转人工标记"""
+        """手动清除转人工标记（内存与数据库）"""
         with self._data_lock:
             self._handoffs.pop(session_key, None)
+        self._delete_marker(session_key)
+
+    # ==================== 数据库持久化辅助方法 ====================
+
+    def _get_db(self):
+        """懒加载 DatabaseManager 单例。
+
+        在调用时 import，确保数据库/模型导入顺序正确，
+        也便于测试通过 mock 替换 get_db_manager。
+        """
+        if self._db is None:
+            from database.db_manager import get_db_manager
+            self._db = get_db_manager()
+        return self._db
+
+    def _persist_marker(self, session_key: str, expiry: float) -> None:
+        """写入/更新数据库中的转人工标记（失败仅记录日志，不影响内存缓存）"""
+        try:
+            from database.models import HandoffMarker
+            db = self._get_db()
+            with self._db_lock:
+                with db.session_scope() as session:
+                    session.merge(
+                        HandoffMarker(session_key=session_key, expiry=int(expiry))
+                    )
+        except Exception as e:
+            self._logger.warning(
+                f"持久化转人工标记失败（不影响内存缓存）: "
+                f"session_key={session_key}, error_type={type(e).__name__}"
+            )
+
+    def _load_marker(self, session_key: str) -> Optional[float]:
+        """从数据库读取转人工标记的过期时间，读取失败返回 None"""
+        try:
+            from database.models import HandoffMarker
+            db = self._get_db()
+            with self._db_lock:
+                with db.session_scope() as session:
+                    row = (
+                        session.query(HandoffMarker)
+                        .filter(HandoffMarker.session_key == session_key)
+                        .first()
+                    )
+                    return float(row.expiry) if row is not None else None
+        except Exception as e:
+            self._logger.warning(
+                f"读取转人工标记失败: session_key={session_key}, "
+                f"error_type={type(e).__name__}"
+            )
+            return None
+
+    def _delete_marker(self, session_key: str) -> None:
+        """删除数据库中的转人工标记（失败仅记录日志）"""
+        try:
+            from database.models import HandoffMarker
+            db = self._get_db()
+            with self._db_lock:
+                with db.session_scope() as session:
+                    session.query(HandoffMarker).filter(
+                        HandoffMarker.session_key == session_key
+                    ).delete()
+        except Exception as e:
+            self._logger.warning(
+                f"删除转人工标记失败: session_key={session_key}, "
+                f"error_type={type(e).__name__}"
+            )
 
 
 # 全局单例实例（与 SessionState() 返回同一对象）
