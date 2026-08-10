@@ -20,6 +20,24 @@ from database.models import (
 )
 
 
+# 默认关键词类别常量。
+# transfer：必转硬短路词，命中立即转人工，不受意图判断影响（保留"转人工必转"）。
+# after_sale：售后软兜底词，命中仅作为意图分类提示，由 LLM 语义判断是否需要转人工。
+# 旧版代码把"售后词"硬编码在 keyword_handler.AFTER_SALE_KEYWORDS，无法在 UI 增删；
+# 现统一迁移进 DB 的 keywords 表并标记 after_sale，交由 UI 运营。
+DEFAULT_TRANSFER_KEYWORDS = [
+    "转人工", "人工客服", "真人", "客服", "人工", "工单",
+    "转售后客服", "转售后", "取消订单", "改地址", "开发票", "开票",
+]
+
+DEFAULT_AFTER_SALE_KEYWORDS = [
+    "退货", "退款", "售后", "质量问题", "破损", "漏发", "少发",
+    "不满意", "投诉", "赔偿", "换货", "维修", "差评", "给差评",
+    "假货", "质量差", "过敏", "没有效果", "骗人", "纠纷",
+    "烂", "取消", "备注",
+]
+
+
 class DatabaseManager:
     """数据库管理类，提供数据库操作的封装
 
@@ -47,8 +65,11 @@ class DatabaseManager:
         Base.metadata.create_all(self.engine)
 
         self.logger = get_logger()
-        # 初始化数据库
+        # 迁移：为存量库补 category 列，并把疑似售后的旧词归为 after_sale
+        self._migrate_keywords_table()
+        # 初始化数据库（播种默认关键词）
         self.init_db()
+        self._seed_default_keywords()
 
     def init_db(self):
         """初始化渠道信息"""
@@ -59,6 +80,56 @@ class DatabaseManager:
         # 确保已转人工会话标记表存在（重启后转人工状态仍生效）。
         # Base.metadata.create_all 已覆盖，这里显式执行一次并允许表已存在。
         HandoffMarker.__table__.create(self.engine, checkfirst=True)
+
+    def _migrate_keywords_table(self) -> None:
+        """为存量 keywords 表补充 category 列，并把疑似售后的旧词归为 after_sale。
+
+        兼容两种情况：
+        1. 全新库：create_all 已建好带 category 列的表，这里直接跳过。
+        2. 存量库：keywords 表无 category 列，ALTER 补列（NOT NULL + 默认值）。
+        随后把词面命中售后语义的旧词统一标记为 after_sale，使它们从"硬短路"
+        降级为"软兜底"，由意图分类接管。
+        """
+        try:
+            from sqlalchemy import text
+            with self.engine.connect() as conn:
+                cols = [r[1] for r in conn.execute(text("PRAGMA table_info(keywords)")).fetchall()]
+                if "category" not in cols:
+                    conn.execute(text(
+                        "ALTER TABLE keywords ADD COLUMN category VARCHAR NOT NULL DEFAULT 'transfer'"
+                    ))
+                    conn.commit()
+                    self.logger.info("keywords 表已补充 category 列（默认 transfer）")
+
+                after_set = {k.lower() for k in DEFAULT_AFTER_SALE_KEYWORDS}
+                if after_set:
+                    placeholders = ", ".join(f":w{i}" for i in range(len(after_set)))
+                    params = {f"w{i}": w for i, w in enumerate(after_set)}
+                    conn.execute(
+                        text(f"UPDATE keywords SET category='after_sale' WHERE lower(keyword) IN ({placeholders})"),
+                        params,
+                    )
+                    conn.commit()
+        except Exception as e:  # pragma: no cover
+            self.logger.error(f"keywords 表迁移失败（不影响主流程）: error_type={type(e).__name__}")
+
+    def _seed_default_keywords(self) -> None:
+        """播种默认关键词到 DB，使 after_sale 词在 UI 中可运营、可增删。
+
+        规则：
+        - after_sale 默认词：始终补全（insert-if-absent），把旧硬编码词搬进 DB。
+        - transfer 默认词：仅当表为空（首次运行）时补充，避免污染已有用户的词库。
+        """
+        try:
+            existing = self.get_all_keywords()
+            empty = not existing
+            for kw in DEFAULT_AFTER_SALE_KEYWORDS:
+                self.add_keyword(kw, "after_sale")
+            if empty:
+                for kw in DEFAULT_TRANSFER_KEYWORDS:
+                    self.add_keyword(kw, "transfer")
+        except Exception as e:  # pragma: no cover
+            self.logger.error(f"默认关键词播种失败（不影响主流程）: error_type={type(e).__name__}")
 
 
     def get_session(self):
@@ -482,16 +553,21 @@ class DatabaseManager:
             return True
 
     # 关键词相关操作
-    def add_keyword(self, keyword: str) -> bool:
-        """添加关键词"""
+    def add_keyword(self, keyword: str, category: str = "transfer") -> bool:
+        """添加关键词（按类别）。已存在时若类别不同则更新类别并返回 True。"""
+        cat = category or "transfer"
         with self.session_scope() as session:
             existing = session.query(Keyword).filter(Keyword.keyword == keyword).first()
             if existing:
+                if (existing.category or "transfer") != cat:
+                    existing.category = cat
+                    self.logger.info(f"更新关键词类别: {keyword} -> {cat}")
+                    return True
                 self.logger.warning(f"关键词 {keyword} 已存在")
                 return False
-            keyword_obj = Keyword(keyword=keyword)
+            keyword_obj = Keyword(keyword=keyword, category=cat)
             session.add(keyword_obj)
-            self.logger.info(f"成功添加关键词: {keyword}")
+            self.logger.info(f"成功添加关键词: {keyword} ({cat})")
             return True
 
     def get_keyword(self, keyword: str) -> Optional[Dict[str, Any]]:
@@ -502,23 +578,25 @@ class DatabaseManager:
                 return None
             return {
                 'id': keyword_obj.id,
-                'keyword': keyword_obj.keyword
+                'keyword': keyword_obj.keyword,
+                'category': keyword_obj.category or "transfer",
             }
 
     def get_all_keywords(self) -> List[Dict[str, Any]]:
-        """获取所有关键词"""
+        """获取所有关键词（含类别）"""
         with self.session_scope() as session:
             keywords = session.query(Keyword).all()
             return [
                 {
                     'id': keyword.id,
-                    'keyword': keyword.keyword
+                    'keyword': keyword.keyword,
+                    'category': keyword.category or "transfer",
                 }
                 for keyword in keywords
             ]
 
-    def update_keyword(self, old_keyword: str, new_keyword: str) -> bool:
-        """更新关键词"""
+    def update_keyword(self, old_keyword: str, new_keyword: str, category: Optional[str] = None) -> bool:
+        """更新关键词（可选更新类别）"""
         with self.session_scope() as session:
             keyword_obj = session.query(Keyword).filter(Keyword.keyword == old_keyword).first()
             if not keyword_obj:
@@ -530,6 +608,8 @@ class DatabaseManager:
                     self.logger.warning(f"关键词 {new_keyword} 已存在")
                     return False
             keyword_obj.keyword = new_keyword
+            if category is not None:
+                keyword_obj.category = category or "transfer"
             self.logger.info(f"成功更新关键词: {old_keyword} -> {new_keyword}")
             return True
 

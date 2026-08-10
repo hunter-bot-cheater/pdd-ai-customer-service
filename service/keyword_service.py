@@ -8,11 +8,11 @@ class KeywordService:
     def get_all_keywords(self):
         return db_manager.get_all_keywords()
 
-    def add_keyword(self, keyword: str) -> bool:
-        return db_manager.add_keyword(keyword)
+    def add_keyword(self, keyword: str, category: str = "transfer") -> bool:
+        return db_manager.add_keyword(keyword, category)
 
-    def update_keyword(self, old_keyword: str, new_keyword: str) -> bool:
-        return db_manager.update_keyword(old_keyword, new_keyword)
+    def update_keyword(self, old_keyword: str, new_keyword: str, category: str = None) -> bool:
+        return db_manager.update_keyword(old_keyword, new_keyword, category)
 
     def delete_keyword(self, keyword: str) -> bool:
         return db_manager.delete_keyword(keyword)

@@ -44,6 +44,7 @@ from Agent.CustomerAgent.custom.agent_config import (
 )
 from Agent.CustomerAgent.custom.llm_client import LLMClient, LLMResponse
 from Agent.CustomerAgent.custom.message_builder import MessageBuilder
+from Agent.CustomerAgent.custom.order_number_guard import enforce_order_number_guard
 from Agent.CustomerAgent.custom.tool_executor import ToolExecutor, ToolResult
 
 logger = get_logger("CustomerAgent")
@@ -258,6 +259,10 @@ class CustomerAgent(Bot):
             final_content = await self._run_agent_loop(
                 messages, dependencies, session_id=session_id
             )
+
+            # 订单号禁忌终态过滤：优先级高于一切内容源（含知识库复述）。
+            # 仅当用户明确提及具体订单时按配置豁免（见 order_number_guard）。
+            final_content = enforce_order_number_guard(final_content, query=query)
 
             # 保存最终回复到历史（DB 写入放工作线程，避免阻塞事件循环）
             await asyncio.to_thread(

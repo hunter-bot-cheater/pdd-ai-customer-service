@@ -153,6 +153,12 @@ def reload_keywords() -> None:
     """Reload the cached keyword handler after keyword CRUD operations."""
     for keyword_handler in list(_cached_keyword_handlers.values()):
         keyword_handler.reload_keywords()
+    # 同步刷新模块级售后软兜底词集合，供 ai_handler 意图分类器使用
+    try:
+        from .handlers import keyword_handler as _kh
+        _kh.reload_after_sale_global()
+    except Exception:  # pragma: no cover
+        pass
 
 
 # 提供兼容的handler_chain函数实现

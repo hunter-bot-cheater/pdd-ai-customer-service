@@ -88,6 +88,13 @@ config_base = {
         "api_key": "",
         "api_base": ""
     },
+    "intent": {
+        "enabled": True,
+        "threshold": 0.6,
+        "cache_ttl_seconds": 3600,
+        "timeout_seconds": 5.0,
+        "max_tokens": 32
+    },
     "prompt": {
         "instructions": [
             "1. 请用中文回复客户问题",
@@ -96,6 +103,32 @@ config_base = {
             "4. 如果知识库中有相关信息，请根据知识库内容回答用户问题",
             "5. 如果知识库中没有相关信息，再根据已有知识回答或建议用户联系人工客服"
         ]
+    },
+    "order_number_guard": {
+        "enabled": True,
+        "allow_when_user_references_order": True,
+        "user_order_patterns": [
+            "订单号\\s*[:：是]\\s*\\d+",
+            "我的订单",
+            "查询订单",
+            "查订单",
+            "订单状态",
+            "订单\\s*\\d+",
+            "帮我处理订单",
+            "处理订单"
+        ],
+        "solicit_patterns": [
+            "请提供(您|你)的订单号",
+            "请(您|你)提供订单号",
+            "(您|你)(的)?订单号(是|为)?(多少|什么)",
+            "把订单号发(给|我)",
+            "发(送)?(一下)?(您|你)的订单号",
+            "提供(一下)?订单号",
+            "订单号(发|给)(我|一下)",
+            "需(要|提供)订单号",
+            "告诉(我)?(您|你)(的)?订单号"
+        ],
+        "replacement": "亲，您可直接在订单页面自助操作哦。"
     }
 }
 
