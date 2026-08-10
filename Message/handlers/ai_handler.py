@@ -125,6 +125,11 @@ class AIReplyHandler(BaseHandler):
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)
 
+            # 1.5 意图识别路由：基于语义判断是否需要转人工（替代旧版售后关键词硬匹配）
+            # 售后咨询（consult）放行给 AI 自主回答；操作/投诉/负面情绪转人工+通知。
+            if await self._maybe_transfer_by_intent(context, metadata, processed_content):
+                return True
+
             # 2. 调用AI生成回复
             reply = await self._get_ai_reply(processed_content, context)
             if not reply:
@@ -336,6 +341,71 @@ class AIReplyHandler(BaseHandler):
         self.logger.debug(f"模拟已读+打字延迟: {delay:.1f}s (读{read_sec:.1f}s + 打{typing_sec:.1f}s)")
         await asyncio.sleep(delay)
 
+    async def _maybe_transfer_by_intent(
+        self, context: Context, metadata: Dict[str, Any], processed_content: str
+    ) -> bool:
+        """意图识别路由：若 LLM 判定为操作/投诉/负面情绪且置信度达标，则转人工。
+
+        失败/超时时保守返回 False（不转人工），避免把敏感诉求误交给 AI 回复，
+        也避免把正常咨询误转。子账号静默标记与通知规则由 transfer_conversation 处理。
+        """
+        try:
+            from Message.handlers import intent_classifier as ic_module
+            from Message.handlers.keyword_handler import match_after_sale_keyword
+
+            classifier = ic_module.get_intent_classifier()
+            if classifier is None or not classifier.enabled:
+                return False
+
+            after_sale_hint = match_after_sale_keyword(processed_content)
+            result = await classifier.classify(processed_content, after_sale_hint=after_sale_hint)
+        except Exception as e:
+            self.logger.warning(f"意图分类异常，保守不转人工: {e}")
+            return False
+
+        intent = (result or {}).get("intent")
+        confidence = float((result or {}).get("confidence", 0.0) or 0.0)
+        self.logger.info(f"意图分类结果: intent={intent}, confidence={confidence}")
+
+        if ic_module.IntentClassifier.should_transfer(intent, confidence, classifier.threshold):
+            return await self._transfer_by_intent(context, metadata, processed_content)
+        return False
+
+    async def _transfer_by_intent(self, context: Context, metadata: Dict[str, Any], last_message: str) -> bool:
+        """执行意图触发的转人工（语义层），保留营业时间/子账号静默规则。"""
+        shop_id = metadata.get('shop_id')
+        user_id = metadata.get('user_id')
+        from_uid = metadata.get('from_uid')
+        shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', None) or ""
+        if not all([shop_id, user_id, from_uid]):
+            return False
+
+        from Agent.CustomerAgent.tools.move_conversation import (
+            transfer_conversation,
+            TransferConversationParams,
+        )
+        params = TransferConversationParams(
+            shop_id=str(shop_id),
+            user_id=str(user_id),
+            recipient_uid=str(from_uid),
+            shop_name=str(shop_name),
+        )
+        try:
+            result = await asyncio.to_thread(
+                transfer_conversation, params, "AI意图识别触发转人工", True, last_message
+            )
+        except Exception as e:
+            self.logger.error(f"意图转人工调用异常: {e}")
+            return True
+
+        if "会话转接成功" in result:
+            self.logger.info(f"意图触发转接人工成功: {result}")
+            return True
+
+        self.logger.error(f"意图转接失败: {result}")
+        # 规则 6：转人工失败仍静默拦截，避免 AI 误答敏感诉求
+        return True
+
     async def _get_ai_reply(self, query: str, context: Context) -> Optional[str]:
         """获取AI回复"""
         if not self.bot:
@@ -360,15 +430,15 @@ class AIReplyHandler(BaseHandler):
             return None
 
     def _clean_text(self, text: str) -> str:
-        """需求二：移除所有中英文句号、逗号、问号，使回复更简洁自然"""
+        """需求二：移除所有中英文句号、逗号、问号、分号，使回复更简洁自然"""
         if not text:
             return text
         import re
-        return re.sub(r'[，,。.？?]', '', text)
+        return re.sub(r'[，,。.；;？?]', '', text)
 
     async def _send_reply(self, context: Context, reply: str, metadata: Dict[str, Any]) -> bool:
         """发送回复，并校验发送结果业务码（规则 5）"""
-        # 需求二：发送前清洗标点（句号、逗号、问号），清洗后为空则取消发送
+        # 需求二：发送前清洗标点（句号、逗号、问号、分号），清洗后为空则取消发送
         reply = self._clean_text(reply)
         if not reply.strip():
             self.logger.warning(f"清洗后回复为空，取消发送: reply={reply!r}")

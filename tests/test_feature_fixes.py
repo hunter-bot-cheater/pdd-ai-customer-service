@@ -681,7 +681,13 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
             self.assertIn(kw, KeywordDetectionHandler.AFTER_SALE_KEYWORDS)
 
     def test_can_handle_after_sale(self):
+        """改造后：售后软兜底词不再硬短路转人工，交由意图分类判断。"""
         context = make_context("我要退款")
+        self.assertFalse(self.handler.can_handle(context))
+
+    def test_transfer_keyword_hard_trigger(self):
+        """必转词仍硬短路转人工（保留'用户说转人工必转'）。"""
+        context = make_context("请转人工帮我")
         self.assertTrue(self.handler.can_handle(context))
 
     def test_can_handle_regular_keyword(self):
@@ -690,6 +696,20 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
             handler = KeywordDetectionHandler(business_hours=_inside_business_hours_dict())
         context = make_context("转人工")
         self.assertTrue(handler.can_handle(context))
+
+    def test_match_after_sale_keyword(self):
+        """模块级售后词匹配函数：命中 after_sale 词返回 True，普通词 False。"""
+        # 直接测试函数（不依赖实例），用注入集合验证逻辑
+        from Message.handlers import keyword_handler as kh
+        import Message.handlers.keyword_handler as kh_real
+        # 临时替换模块级集合
+        old = kh_real._AFTERSALE_KEYWORDS
+        kh_real._AFTERSALE_KEYWORDS = {"退款", "退货"}
+        try:
+            self.assertTrue(kh.match_after_sale_keyword("我要退款"))
+            self.assertFalse(kh.match_after_sale_keyword("这件衣服多大码"))
+        finally:
+            kh_real._AFTERSALE_KEYWORDS = old
 
     def test_cannot_handle_normal_message(self):
         context = make_context("这件衣服多大码")
@@ -720,7 +740,8 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
     async def test_after_sale_triggers_transfer_and_blocks(self):
-        context = make_context("我要退款，商品有质量问题")
+        """必转词命中即转人工并拦截（硬短路路径，保留规则 6 静默）。"""
+        context = make_context("请转人工")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
         # 转人工被触发
@@ -729,14 +750,14 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
         # 通知原因
         self.assertEqual(len(self.capture.messages), 1)
-        self.assertIn("售后关键词触发转人工", self.capture.messages[0])
-        self.assertIn("我要退款，商品有质量问题", self.capture.messages[0])
+        self.assertIn("用户主动转人工", self.capture.messages[0])
+        self.assertIn("请转人工", self.capture.messages[0])
 
     async def test_after_sale_failure_still_blocks_silently(self):
-        """规则 6: 转人工失败（无可用客服）时，售后场景仍拦截，但不发预设回复话术"""
+        """规则 6: 转人工失败（无可用客服）时仍拦截，但不发预设回复话术"""
         sender = FakeSender(cs_list={"cs_shop1_user1": {"username": "客服1"}})
         mc_module.get_sender = lambda: sender  # noqa: E731
-        context = make_context("我要投诉")
+        context = make_context("请转人工")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
         self.assertFalse(SessionState().is_handoff("shop1:buyer1"))
@@ -744,10 +765,10 @@ class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.calls["send_text"], [])
 
     async def test_sub_account_keyword_silent_mark_and_notify(self):
-        """规则 7: 子账号触发转人工关键词 → 不调用转人工 API，仅静默标记 + 通知"""
+        """规则 7: 子账号触发必转词 → 不调用转人工 API，仅静默标记 + 通知"""
         _app_config.set("transfer.sub_account_uids", ["cs_shop1_user1"], save=False)
         _app_config.set("transfer.main_account_user_ids", [], save=False)
-        context = make_context("退款", user_id="user1")
+        context = make_context("转人工", user_id="user1")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
         # 子账号不调用转人工 API
@@ -1280,6 +1301,16 @@ class TestCleanText(unittest.TestCase):
     def test_no_punctuation_unchanged(self):
         self.assertEqual(self.handler._clean_text("亲在的哦"), "亲在的哦")
 
+    def test_removes_semicolon(self):
+        self.assertEqual(
+            self.handler._clean_text("亲，已为您处理；请问还有其他需要？"),
+            "亲已为您处理请问还有其他需要",
+        )
+        self.assertEqual(
+            self.handler._clean_text("Done; please wait."),
+            "Done please wait",
+        )
+
 
 class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
     """需求二：发送前清洗；纯标点分条跳过；整条纯标点走备用回复（同样被清洗）"""
@@ -1420,3 +1451,206 @@ class TestSendGoodsLinkIntUid(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ============================================================================
+# 测试 14：意图分类器（轻量语义路由，替代售后关键词硬匹配）
+# ============================================================================
+
+from Message.handlers import intent_classifier as ic_module  # noqa: E402
+from Message.handlers.intent_classifier import IntentClassifier  # noqa: E402
+
+
+class TestIntentClassifier(unittest.IsolatedAsyncioTestCase):
+    """意图分类器纯单元测试（不发起真实网络请求）"""
+
+    def test_should_transfer_matrix(self):
+        """操作/投诉/负面情绪且置信度达标 → 转；咨询/其他/低置信 → 不转。"""
+        IC = IntentClassifier
+        self.assertTrue(IC.should_transfer("operation", 0.9, 0.6))
+        self.assertTrue(IC.should_transfer("complaint", 0.6, 0.6))
+        self.assertTrue(IC.should_transfer("negative_emotion", 0.7, 0.6))
+        self.assertFalse(IC.should_transfer("consult", 0.99, 0.6))
+        self.assertFalse(IC.should_transfer("operation", 0.3, 0.6))
+        self.assertFalse(IC.should_transfer("other", 0.9, 0.6))
+
+    def test_parse_valid(self):
+        c = IntentClassifier({})
+        resp = type("R", (), {"content": '前缀 {"intent":"operation","confidence":0.82} 后缀'})()
+        self.assertEqual(c._parse(resp), {"intent": "operation", "confidence": 0.82})
+
+    def test_parse_invalid(self):
+        c = IntentClassifier({})
+        self.assertEqual(
+            c._parse(type("R", (), {"content": "无法解析"})()),
+            {"intent": "unknown", "confidence": 0.0},
+        )
+
+    async def test_classify_disabled(self):
+        c = IntentClassifier({"enabled": False})
+        r = await c.classify("你好")
+        self.assertEqual(r["intent"], "unknown")
+
+    async def test_classify_empty(self):
+        c = IntentClassifier({})
+        r = await c.classify("")
+        self.assertEqual(r["intent"], "unknown")
+
+    async def test_classify_calls_llm_and_caches(self):
+        c = IntentClassifier({})
+        calls = []
+
+        async def fake(text, hint):
+            calls.append(text)
+            return {"intent": "consult", "confidence": 0.9}
+
+        with mock.patch.object(c, "_call_llm", fake):
+            r1 = await c.classify("运费谁出")
+            r2 = await c.classify("运费谁出")
+        self.assertEqual(r1["intent"], "consult")
+        self.assertEqual(len(calls), 1)  # 第二次命中缓存，不再调用 LLM
+
+
+# ============================================================================
+# 测试 15：AI 处理器意图路由（基于语义转人工，保留既有规则）
+# ============================================================================
+
+class _StubClassifier:
+    """测试替身：直接返回指定意图，跳过真实 LLM。"""
+
+    def __init__(self, intent, confidence=0.9, threshold=0.6, enabled=True):
+        self.intent = intent
+        self.confidence = confidence
+        self.threshold = threshold
+        self.enabled = enabled
+
+    async def classify(self, text, after_sale_hint=False):
+        return {"intent": self.intent, "confidence": self.confidence}
+
+
+class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        notify_tracker.clear("shop1:buyer1")
+        _zero_ai_reply_delays()
+        _set_inside_business_hours()
+        self.bot = MockBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        self.sender = FakeSender()
+        # AI 回复路径在方法内动态 from bridge.sender import get_sender，需 patch 该模块
+        self._sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
+        self._sender_patch.start()
+        # 转人工路径使用 move_conversation 模块顶层导入的 get_sender，需单独 patch
+        self._mc_sender_patch = mock.patch.object(mc_module, "get_sender", return_value=self.sender)
+        self._mc_sender_patch.start()
+        self.capture = CaptureWebhook()
+        self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
+        self._notify_patch.start()
+        self._orig_main = get_config("transfer.main_account_user_ids", [])
+        self._orig_sub = get_config("transfer.sub_account_uids", [])
+
+    def tearDown(self):
+        self._sender_patch.stop()
+        self._mc_sender_patch.stop()
+        self._notify_patch.stop()
+        _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
+        _app_config.set("transfer.sub_account_uids", self._orig_sub, save=False)
+        _restore_ai_reply_delays()
+
+    async def _route(self, message, intent, confidence=0.9):
+        stub = _StubClassifier(intent, confidence=confidence)
+        with mock.patch.object(ic_module, "get_intent_classifier", return_value=stub):
+            return await self.handler.handle(make_context(message), make_metadata())
+
+    async def test_consult_does_not_transfer(self):
+        """售后咨询（consult）→ AI 自主回答，不转人工。"""
+        ok = await self._route("退货流程是什么", "consult")
+        self.assertTrue(ok)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        self.assertEqual(len(self.bot.calls), 1)  # AI 已回答
+
+    async def test_operation_transfers(self):
+        """操作诉求（operation）→ 转人工 + 企业微信通知。"""
+        ok = await self._route("立刻给我退款", "operation")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        self.assertEqual(len(self.capture.messages), 1)
+        self.assertIn("AI意图识别触发转人工", self.capture.messages[0])
+
+    async def test_complaint_transfers(self):
+        ok = await self._route("投诉你们", "complaint")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertEqual(len(self.capture.messages), 1)
+
+    async def test_negative_emotion_transfers(self):
+        """负面情绪（negative_emotion）→ 转人工（即便未明确要求操作）。"""
+        ok = await self._route("你们太慢了，气死我了", "negative_emotion")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertEqual(len(self.capture.messages), 1)
+
+    async def test_unknown_no_transfer(self):
+        """分类未知 → 保守不转人工，AI 自主回答。"""
+        ok = await self._route("在吗", "unknown")
+        self.assertTrue(ok)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        self.assertEqual(len(self.bot.calls), 1)
+
+    async def test_low_confidence_no_transfer(self):
+        """置信度低于阈值 → 不转人工。"""
+        ok = await self._route("我要退货", "operation", confidence=0.2)
+        self.assertTrue(ok)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+
+    async def test_disabled_no_transfer(self):
+        """意图分类禁用 → 不转人工，走 AI 回复。"""
+        stub = _StubClassifier("operation", enabled=False)
+        with mock.patch.object(ic_module, "get_intent_classifier", return_value=stub):
+            ok = await self.handler.handle(make_context("立刻给我退款"), make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+
+    async def test_sub_account_intent_silent(self):
+        """规则 7：子账号意图转人工 → 不调 API，仅静默标记 + 通知。"""
+        _app_config.set("transfer.sub_account_uids", ["cs_shop1_user1"], save=False)
+        _app_config.set("transfer.main_account_user_ids", [], save=False)
+        ok = await self._route("我要退货", "operation")
+        self.assertTrue(ok)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
+        self.assertEqual(len(self.capture.messages), 1)
+
+
+# ============================================================================
+# 测试 16：关键词类别（category）持久化与迁移播种
+# ============================================================================
+
+class TestKeywordCategoryDB(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = DatabaseManager(db_path=str(Path(self.tmp) / "kw.db"))
+
+    def tearDown(self):
+        self.db.dispose()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_add_and_get_category(self):
+        self.assertTrue(self.db.add_keyword("测试售后词", "after_sale"))
+        row = self.db.get_keyword("测试售后词")
+        self.assertEqual(row["category"], "after_sale")
+        all_kw = self.db.get_all_keywords()
+        self.assertTrue(
+            any(k["keyword"] == "测试售后词" and k["category"] == "after_sale" for k in all_kw)
+        )
+
+    def test_default_category_transfer(self):
+        self.assertTrue(self.db.add_keyword("必转测试词"))
+        self.assertEqual(self.db.get_keyword("必转测试词")["category"], "transfer")
+
+    def test_seed_after_sale_present(self):
+        """迁移播种：after_sale 默认词存在且为 after_sale，必转词为 transfer。"""
+        all_kw = {k["keyword"]: k["category"] for k in self.db.get_all_keywords()}
+        self.assertEqual(all_kw.get("退款"), "after_sale")
+        self.assertEqual(all_kw.get("转人工"), "transfer")

@@ -77,9 +77,12 @@ class Keyword(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     keyword = Column(String(100), nullable=False)
+    # 类别：transfer=必转硬短路词（如"转人工"），after_sale=售后软兜底词（如"退款"）。
+    # 软兜底词不再直接转人工，仅作为意图分类的提示，由 LLM 语义判断是否转人工。
+    category = Column(String(50), nullable=False, default="transfer")
 
     def __repr__(self):
-        return f"<Keyword(keyword='{self.keyword}')>"
+        return f"<Keyword(keyword='{self.keyword}', category='{self.category}')>"
 
 
 class ProductKnowledge(Base):
