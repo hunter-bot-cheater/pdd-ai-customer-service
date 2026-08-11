@@ -60,3 +60,20 @@ CLAUDE.md
 .github/*
 !.github/workflows/
 !.github/workflows/**
+
+# ===== 项目本地/调试/临时文件（不提交） =====
+# 运行时生成的浏览器反爬 stealth 脚本（混淆压缩生成物，非手写源码）
+_acrawler.js
+# 运行时探针 profile 缓存目录
+.pdd_probe_profile/
+# 调试脚本（非测试套件）
+tests/debug_buyerid_field.py
+tests/debug_userallorder.py
+# Word 编辑时产生的临时锁文件（如 ~$Agent-Customer 使用指南.docx）
+~$*.docx
+# 使用指南 docx（二进制交付物，本地维护，不入库）
+Agent-Customer 使用指南.docx
+# 实验性/冗余测试（如 e2e 副本）
+tests/test_query_order_e2e2.py
+# 配置备份文件（含 api_key 等密钥，禁止提交）
+*.bak

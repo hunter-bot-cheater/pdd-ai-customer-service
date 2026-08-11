@@ -8,11 +8,12 @@
 - operation         ：明确要求售后操作（我要退货 / 立刻退款）→ 转人工
 - complaint         ：投诉 / 给差评 / 要求赔偿 → 转人工
 - negative_emotion  ：强烈不满 / 愤怒 / 催促（太慢了 / 气死我了）→ 转人工
-- other / unknown   ：其他 / 分类失败 → 保守不转人工
+- other / unknown   ：其他 / 分类失败 → 保守转人工（识别不出意图即升级）
 
 设计约束（来自改造需求）：
-- 不引入外部 API，复用 config.json 中已有的 LLM 配置。
-- 轻量：极小输出 token + 哈希缓存 + 超时回退；分类失败保守不转，避免误转。
+- 不引入外部 API，直接复用 config.json 顶层 llm 段的模型与 API（model_name / api_key / api_base）。
+  意图段不再单独配置 model_name，改 llm 段即全局生效（意图分类与主回复用同一模型）。
+- 轻量：极小输出 token + 哈希缓存 + 超时回退；分类失败（unknown）与其它意图保守转人工，避免 AI 在不确定时硬答误答。
 - 可测试：LLM 调用封装在 _call_llm，测试可整体替换 get_intent_classifier 返回值。
 """
 import asyncio
@@ -45,7 +46,11 @@ DEFAULT_PROMPT = (
     '- "other"：其它\n'
     "输出格式：{\"intent\": \"上述之一\", \"confidence\": 0.0到1.0之间的数字}\n"
     "注意：如果消息包含售后相关词（如退货/退款），但只是在询问流程或政策，应判为 consult；"
-    "只有真正要求执行操作、投诉或宣泄强烈负面情绪时才判为非 consult。"
+    "只有真正要求执行操作、投诉或宣泄强烈负面情绪时才判为非 consult。\n"
+    "关键：当前消息可能只是对上一句「客服提问」的简短回应（如「要」「不用了」「好的」「嗯」"
+    "「发吧」），请结合「对话上下文」判断其真实意图——它通常是在延续前面的咨询，"
+    "而非独立的新诉求。孤立地看这类短句容易误判为 other，务必放回上下文判定。"
+    "上下文里客服刚问「需要推荐吗」、买家回「要」，应判为 consult（续接咨询）。"
 )
 
 
@@ -55,13 +60,18 @@ class IntentClassifier:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
         self.enabled = bool(cfg.get("enabled", True))
-        self.model_name = cfg.get("model_name") or get_config("llm.model_name", "glm-4-flash")
-        self.api_key = cfg.get("api_key") or get_config("llm.api_key", "")
-        self.api_base = cfg.get("api_base") or get_config("llm.api_base", "")
+        # 模型与 API 直接复用顶层 llm 配置（model_name / api_key / api_base），
+        # 意图段不再单独设置 model_name，改 config.json 的 llm 段即全局生效。
+        self.model_name = get_config("llm.model_name", "glm-4-flash")
+        self.api_key = get_config("llm.api_key", "")
+        self.api_base = get_config("llm.api_base", "")
         self.threshold = float(cfg.get("threshold", 0.6))
         self.cache_ttl = float(cfg.get("cache_ttl_seconds", cfg.get("cache_ttl", 600)))
         self.timeout = float(cfg.get("timeout_seconds", cfg.get("timeout", 0.8)))
         self.max_tokens = int(cfg.get("max_tokens", 32))
+        # 路由阶段注入的分类上下文轮数（最近 N 条消息）；由调用方取历史时控制，
+        # 这里仅记录默认值以便 debug。设为 0 表示不使用上下文（仅当前句）。
+        self.context_turns = int(cfg.get("context_turns", 12))
         self.prompt = cfg.get("prompt") or DEFAULT_PROMPT
         self._client = None
         self._cache: Dict[str, tuple] = {}  # key -> (expiry_ts, result)
@@ -79,8 +89,18 @@ class IntentClassifier:
         return self._client
 
     # ===== 缓存 =====
-    def _cache_key(self, text: str, after_sale_hint: bool) -> str:
-        return hashlib.md5(f"{text}|{int(after_sale_hint)}".encode("utf-8")).hexdigest()
+    def _cache_key(self, text: str, after_sale_hint: bool, history=None) -> str:
+        # 同一句话在不同对话上下文里意图可能不同（如「要」单独看是 other，
+        # 但在「需要推荐吗」之后是 consult），故把上下文摘要一并纳入缓存 key，
+        # 保证不同上下文的分类结果互不污染。
+        history_sig = ""
+        if history:
+            history_sig = "|".join(
+                f"{h.get('role','')}:{h.get('content','')}" for h in history[-self.context_turns:]
+            )
+        return hashlib.md5(
+            f"{text}|{int(after_sale_hint)}|{history_sig}".encode("utf-8")
+        ).hexdigest()
 
     def _get_cache(self, key: str) -> Optional[Dict[str, Any]]:
         item = self._cache.get(key)
@@ -93,8 +113,14 @@ class IntentClassifier:
         self._cache[key] = (time.time() + self.cache_ttl, result)
 
     # ===== 对外接口 =====
-    async def classify(self, text: str, after_sale_hint: bool = False) -> Dict[str, Any]:
+    async def classify(
+        self, text: str, after_sale_hint: bool = False, history: Optional[list] = None
+    ) -> Dict[str, Any]:
         """分类单条消息。返回 {intent, confidence}。失败/禁用返回 unknown。
+
+        history：可选的对话历史（list of {role, content}，按时间升序）。传入后，
+        分类器会把最近若干轮拼进 prompt，使简短回应（如「要」「好的」）能在上下文中
+        正确判为 consult 而非孤立的 other。
 
         超时/异常产生的保守 unknown 结果**不写入缓存**，避免一次瞬时超时把该
         消息永久污染为 unknown（在 TTL 内不再重试）。只有 LLM 真实返回的结果
@@ -102,36 +128,58 @@ class IntentClassifier:
         """
         if not self.enabled or not text:
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0}
-        key = self._cache_key(text, after_sale_hint)
+        key = self._cache_key(text, after_sale_hint, history)
         cached = self._get_cache(key)
         if cached is not None:
             return cached
         try:
             result = await asyncio.wait_for(
-                self._call_llm(text, after_sale_hint), timeout=self.timeout
+                self._call_llm(text, after_sale_hint, history), timeout=self.timeout
             )
         except asyncio.TimeoutError:
-            logger.warning("意图分类超时，保守返回 unknown（不转人工），本次不缓存以便重试")
+            logger.warning("意图分类超时，保守返回 unknown（下游判为转人工），本次不缓存以便重试")
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0}
         except Exception as e:  # pragma: no cover
-            logger.warning(f"意图分类异常，保守返回 unknown（不转人工），本次不缓存: {e}")
+            logger.warning(f"意图分类异常，保守返回 unknown（下游判为转人工），本次不缓存: {e}")
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0}
         self._set_cache(key, result)
         return result
 
-    async def _call_llm(self, text: str, after_sale_hint: bool) -> Dict[str, Any]:
+    async def _call_llm(self, text: str, after_sale_hint: bool, history=None) -> Dict[str, Any]:
         client = self._ensure_client()
         if getattr(client, "_client", None) is None:
             await client.initialize()
         messages = [
             {"role": "system", "content": self.prompt},
-            {"role": "user", "content": self._build_user(text, after_sale_hint)},
+            {"role": "user", "content": self._build_user(text, after_sale_hint, history)},
         ]
         resp = await client.chat(messages)
         return self._parse(resp)
 
-    def _build_user(self, text: str, after_sale_hint: bool) -> str:
-        user = f"消息：{text}"
+    def _build_user(self, text: str, after_sale_hint: bool, history: Optional[list] = None) -> str:
+        parts = []
+        if history:
+            # 拼接最近若干轮对话上下文（role 映射为可读标签）
+            turns = history[-self.context_turns:]
+            lines = []
+            for h in turns:
+                role = (h or {}).get("role", "")
+                content = (h or {}).get("content", "")
+                if not content:
+                    continue
+                if role == "user":
+                    label = "买家"
+                elif role == "assistant":
+                    label = "客服"
+                elif role == "system":
+                    label = "系统"
+                else:
+                    label = role
+                lines.append(f"{label}：{content}")
+            if lines:
+                parts.append("对话上下文（按时间顺序，最近若干轮）：\n" + "\n".join(lines))
+        parts.append(f"当前消息：{text}")
+        user = "\n\n".join(parts)
         if after_sale_hint:
             user += "\n提示：该消息命中售后相关词，请重点判断是咨询还是操作/投诉/情绪。"
         return user
@@ -156,7 +204,15 @@ class IntentClassifier:
 
     @staticmethod
     def should_transfer(intent: str, confidence: float, threshold: float) -> bool:
-        """判断给定意图是否应转人工（操作/投诉/负面情绪且置信度达标）。"""
+        """判断给定意图是否应转人工。
+
+        - operation / complaint / negative_emotion：置信度达标才转（避免误转）。
+        - other / unknown：识别不出用户意图 / 分类失败 → 保守转人工
+          （AI 不知道怎么回复时即升级给人工，不卡置信度阈值；unknown 多由超时、
+          异常或解析失败产生，代表"未能识别意图"，同样保守升级）。
+        """
+        if intent in (INTENT_OTHER, INTENT_UNKNOWN):
+            return True
         if intent not in _TRANSFER_INTENTS:
             return False
         return float(confidence or 0.0) >= float(threshold)

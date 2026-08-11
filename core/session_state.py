@@ -5,7 +5,8 @@
 用于记录"已转人工"状态，防止转人工后 AI 继续抢答。
 
 session_key 格式：{shop_id}:{from_uid}
-默认有效期 4 小时（14400 秒）。
+默认有效期由 config.json 的 handoff.valid_hours 决定（单位：小时，默认 4 小时）。
+改这个值即可把"转人工后 AI 静默多久"调整为 3 小时、5 小时或任意时长。
 
 标记同时持久化到数据库（handoff_markers 表），
 进程重启后内存缓存丢失时从数据库恢复，保证转人工状态不丢失。
@@ -15,6 +16,7 @@ import threading
 from typing import Optional
 
 from utils.logger_loguru import get_logger
+from config import get_config
 
 
 class SessionState:
@@ -37,8 +39,18 @@ class SessionState:
                     cls._instance = obj
         return cls._instance
 
-    def mark_handoff(self, session_key: str, ttl_seconds: int = 14400) -> None:
-        """标记会话为已转人工，默认有效 4 小时，并持久化到数据库"""
+    def mark_handoff(self, session_key: str, ttl_seconds: Optional[int] = None) -> None:
+        """标记会话为已转人工，并持久化到数据库。
+
+        有效期默认由 config.handoff.valid_hours（小时）决定，缺省 4 小时。
+        也可显式传入 ttl_seconds（秒）临时覆盖（测试用）。
+        """
+        if ttl_seconds is None:
+            try:
+                hours = float(get_config("handoff.valid_hours", 4))
+            except (TypeError, ValueError):
+                hours = 4.0
+            ttl_seconds = int(hours * 3600)
         expiry = time.time() + ttl_seconds
         with self._data_lock:
             self._handoffs[session_key] = expiry
