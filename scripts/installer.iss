@@ -51,6 +51,11 @@ ShowLanguageDialog=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
+; 允许用户自定义安装目录：默认仍装到用户目录，但向导会显示"选择目标文件夹"页，
+; 可改成任意当前用户有写权限的目录（如 D:\Agent-Customer）。
+; 注意：不要选 C:\Program Files 等需要管理员权限的路径——当前 PrivilegesRequired=lowest
+; （免管理员模式）会因无权限而写入失败。
+DisableDirPage=no
 
 [Languages]
 ; 官方未附带中文 .isl，用英文编译，下方 [CustomMessages] 覆盖为中文
