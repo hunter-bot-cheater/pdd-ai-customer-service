@@ -44,7 +44,6 @@ from Agent.CustomerAgent.custom.agent_config import (
 )
 from Agent.CustomerAgent.custom.llm_client import LLMClient, LLMResponse
 from Agent.CustomerAgent.custom.message_builder import MessageBuilder
-from Agent.CustomerAgent.custom.order_number_guard import enforce_order_number_guard
 from Agent.CustomerAgent.custom.tool_executor import ToolExecutor, ToolResult
 
 logger = get_logger("CustomerAgent")
@@ -260,10 +259,6 @@ class CustomerAgent(Bot):
                 messages, dependencies, session_id=session_id
             )
 
-            # 订单号禁忌终态过滤：优先级高于一切内容源（含知识库复述）。
-            # 仅当用户明确提及具体订单时按配置豁免（见 order_number_guard）。
-            final_content = enforce_order_number_guard(final_content, query=query)
-
             # 保存最终回复到历史（DB 写入放工作线程，避免阻塞事件循环）
             await asyncio.to_thread(
                 self._session_manager.add_message,
@@ -383,6 +378,22 @@ class CustomerAgent(Bot):
         if context is not None and context_scope(context).get("recipient_uid"):
             return make_conversation_key(context)
         return self._fallback_session_id
+
+    def get_session_history(
+        self, session_id: str, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """获取指定会话的历史消息（供意图路由等轻量场景复用，避免重复实例化）。
+
+        返回按时间升序的 {role, content, ...} 列表；未初始化或异常时返回空列表。
+        注意：路由阶段调用时当前 inbound 消息尚未落库，故返回的是「上一句之前」的上下文。
+        """
+        if self._session_manager is None:
+            return []
+        try:
+            return self._session_manager.get_history(session_id, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"获取会话历史失败，意图路由回退到无上下文: {type(exc).__name__}: {exc}")
+            return []
 
     async def _compress_with_llm(
         self,

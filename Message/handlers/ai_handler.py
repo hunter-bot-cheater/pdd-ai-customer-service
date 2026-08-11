@@ -19,6 +19,22 @@ from core.uid_send_tracker import UIDSendTracker
 class AIReplyHandler(BaseHandler):
     """专注的AI回复处理器"""
 
+    # 订单/物流意图关键词：命中即主动查证「该客户在本店的订单」，不依赖 LLM 函数调用可靠性。
+    # （glm-4-flash 函数调用不可靠，日志多次证实其漏选 query_order_status 工具，
+    #   故在调 LLM 之前凭会话买家 uid 主动查证并注入结果，确保订单类问题一定有人工查单行为。）
+    _ORDER_INTENT_KEYWORDS = (
+        "订单", "快递", "物流", "到哪了", "到哪里了", "到哪儿了", "到货", "签收",
+        "单号", "运单", "物流信息", "物流进度", "发货", "寄出", "寄没寄", "什么时候到",
+        "多久到", "哪天到", "未发货", "已发货", "发货状态", "发货时间", "发货了吗",
+        "发货了没", "发货没", "查物流", "物流到哪", "货到哪",
+    )
+    # 发货地/发货速度等通用咨询（与"我的订单状态"无关），命中则不触发查证
+    _SHIP_ORIGIN_NEGATIVES = (
+        "哪里发货", "从哪里发货", "发货地", "发货地点", "哪个仓", "产地", "哪个地区",
+        "从哪发", "物流快吗", "发货快吗", "发货速度", "多久发货", "几天发货",
+        "什么时候能发", "几天能发", "发货快不快", "物流快慢", "发货快不", "发货快么",
+    )
+
     def __init__(self, bot: Bot = None, auto_reply_types: set = None):
         super().__init__("AIReplyHandler")
         # 从 DI 容器获取 CustomerAgent 单例（如果未传入）
@@ -130,8 +146,13 @@ class AIReplyHandler(BaseHandler):
             if await self._maybe_transfer_by_intent(context, metadata, processed_content):
                 return True
 
-            # 2. 调用AI生成回复
-            reply = await self._get_ai_reply(processed_content, context)
+            # 1.6 订单/物流意图主动查证（双重保险）：glm-4-flash 函数调用不可靠，
+            #   常漏选 query_order_status，故在调 LLM 之前凭会话买家 uid 主动查证并注入结果，
+            #   行为等同真人客服在后台直接看到「这个客户的订单」。
+            order_hint = await self._prefetch_order_if_needed(metadata, processed_content)
+
+            # 2. 调用AI生成回复（订单数据已由 1.6 预取注入；LLM 基于已知事实回复即可）
+            reply = await self._get_ai_reply(processed_content, context, order_hint=order_hint)
             if not reply:
                 self.logger.warning("AI回复生成失败，使用备用回复")
                 return await self._handle_fallback(context, metadata)
@@ -204,9 +225,11 @@ class AIReplyHandler(BaseHandler):
         优先在句号/问号/感叹号等句末标点处断句，其次在逗号/顿号处细分，
         单段仍超长时按字符硬切，保证每条消息字数不超限。
 
-        URL 保护：先用占位符（__URL_n__）替换文本中的 URL，拆分完成后还原，
-        确保 URL 完整无损、不被截断。含 URL 的消息允许略超字数上限
-        （URL 无法拆分）。
+        保护机制：
+        - URL → 占位符（__URL_n__），确保完整不被截断
+        - 订单号 → 占位符（__ORD_n__），同上。PDD 订单号形如 260811-xxxxxxxxxxxxx，
+          通常 22~26 字符，接近 max_message_len(25)，极易被硬切断导致订单号跨消息断裂。
+        拆分完成后统一还原为原始内容。含受保护 token 的消息允许略超上限。
         """
         if not reply:
             return []
@@ -214,8 +237,12 @@ class AIReplyHandler(BaseHandler):
             return [reply]
 
         import re
-        # 1. URL → 占位符，避免拆分过程中截断 URL
+        # 1. URL + 订单号 → 占位符，避免拆分过程中截断
         masked, url_map = self._mask_urls(reply)
+        masked, ord_map = self._mask_order_numbers(masked)
+
+        # 合并保护映射（占位符命名空间隔离：URL / ORD 不冲突）
+        protected_map = {**url_map, **ord_map}
 
         # 2. 按句末标点拆分，保留分隔符
         sentences = re.split(r'(?<=[。！？；\n])', masked)
@@ -234,8 +261,8 @@ class AIReplyHandler(BaseHandler):
             current = ""
             for part in parts:
                 if len(part) > self.max_message_len:
-                    # 仍超长：按字符硬切（URL 占位符整体不可拆分）
-                    for sub in self._split_overlong(part, url_map):
+                    # 仍超长：按字符硬切（受保护占位符整体不可拆分）
+                    for sub in self._split_overlong(part, protected_map):
                         if current and len(current) + len(sub) <= self.max_message_len:
                             current += sub
                         else:
@@ -250,8 +277,8 @@ class AIReplyHandler(BaseHandler):
             if current:
                 chunks.append(current)
 
-        # 3. 还原占位符为原始 URL
-        return [self._restore_urls(c, url_map) for c in chunks]
+        # 3. 还原占位符为原始内容（URL + 订单号）
+        return [self._restore_protected(c, protected_map) for c in chunks]
 
     def _mask_urls(self, text: str):
         """将文本中的 URL 替换为占位符，返回 (掩码文本, {占位符: 原始URL})
@@ -283,27 +310,59 @@ class AIReplyHandler(BaseHandler):
         return ''.join(parts), url_map
 
     def _restore_urls(self, text: str, url_map: Dict[str, str]) -> str:
-        """将占位符还原为原始 URL"""
-        if not text or not url_map:
+        """将占位符还原为原始 URL（保留向后兼容）"""
+        return self._restore_protected(text, url_map)
+
+    def _restore_protected(self, text: str, protected_map: Dict[str, str]) -> str:
+        """将所有受保护占位符（URL / 订单号等）还原为原始内容"""
+        if not text or not protected_map:
             return text
-        for placeholder, url in url_map.items():
-            text = text.replace(placeholder, url)
+        for placeholder, original in protected_map.items():
+            text = text.replace(placeholder, original)
         return text
 
-    def _split_overlong(self, text: str, url_map: Dict[str, str]) -> List[str]:
+    def _mask_order_numbers(self, text: str):
+        """将文本中的拼多多订单号替换为占位符，返回 (掩码文本, {占位符: 原始订单号})
+
+        PDD 订单号形如 260811-xxxxxxxxxxxxx（8 位日期 + 连字符 + 15~18 位数字），
+        通常 22~26 字符，接近 max_message_len(25)，在 _split_overlong 中极易被
+        按字符硬切断导致订单号跨消息断裂。用占位符保护其完整性。
+        """
+        import re
+        if not text:
+            return text, {}
+        ord_map: Dict[str, str] = {}
+        parts = []
+        last = 0
+        i = 0
+        # 匹配 PDD 订单号：日期前缀(6~8位) + 可选连字符 + 数字序列(12~20位)
+        for m in re.finditer(r'\b\d{6,8}-?\d{12,20}\b', text):
+            raw = m.group(0)
+            placeholder = f'__ORD_{i}__'
+            ord_map[placeholder] = raw
+            parts.append(text[last:m.start()])
+            parts.append(placeholder)
+            last = m.end()
+            i += 1
+        parts.append(text[last:])
+        return ''.join(parts), ord_map
+
+    def _split_overlong(self, text: str, protected_map: Dict[str, str]) -> List[str]:
         """将超长文本按字符硬切为不超过 max_message_len 的分片
 
-        URL 占位符视为原子 token，绝不截断；含 URL 的分片允许略超上限。
+        受保护占位符（URL / 订单号等）视为原子 token，绝不截断；
+        含受保护 token 的分片允许略超上限。
         """
         if not text:
             return []
         import re
-        tokens = [t for t in re.split(r'(__URL_\d+__)', text) if t]
+        # 同时匹配 URL 和订单号占位符，均视为不可拆分的原子 token
+        tokens = [t for t in re.split(r'(__URL_\d+__|__ORD_\d+__)', text) if t]
         chunks: List[str] = []
         current = ""
         for tok in tokens:
-            if tok in url_map:
-                # URL 占位符整体不可拆分；塞不下时单独成条（允许略超）
+            if tok in protected_map:
+                # 受保护占位符整体不可拆分；塞不下时单独成条（允许略超）
                 if current and len(current) + len(tok) <= self.max_message_len:
                     current += tok
                 else:
@@ -344,21 +403,38 @@ class AIReplyHandler(BaseHandler):
     async def _maybe_transfer_by_intent(
         self, context: Context, metadata: Dict[str, Any], processed_content: str
     ) -> bool:
-        """意图识别路由：若 LLM 判定为操作/投诉/负面情绪且置信度达标，则转人工。
+        """意图识别路由：若 LLM 判定为操作/投诉/负面情绪（置信度达标）或识别不出意图（other/unknown），则转人工。
 
         失败/超时时保守返回 False（不转人工），避免把敏感诉求误交给 AI 回复，
         也避免把正常咨询误转。子账号静默标记与通知规则由 transfer_conversation 处理。
+
+        上下文注入：路由阶段只看到当前这一句，极易把「要」「好的」这类对上一句客服
+        提问的简短回应误判为 other（→ 转人工）。这里从会话历史取最近若干轮拼进分类
+        prompt，让分类器能结合上下文正确判为 consult（续接咨询）。
         """
         try:
             from Message.handlers import intent_classifier as ic_module
             from Message.handlers.keyword_handler import match_after_sale_keyword
+            from bridge.context import make_conversation_key
 
             classifier = ic_module.get_intent_classifier()
             if classifier is None or not classifier.enabled:
                 return False
 
+            # 取最近若干轮对话上下文（当前 inbound 消息尚未落库，故返回的是上一句之前的语境）
+            history = []
+            try:
+                context_turns = int(get_config("intent.context_turns", 12))
+                if context_turns > 0 and self.bot is not None:
+                    session_id = make_conversation_key(context)
+                    history = self.bot.get_session_history(session_id, limit=context_turns) or []
+            except Exception as e:
+                self.logger.warning(f"取意图分类上下文失败，降级为无上下文分类: {e}")
+
             after_sale_hint = match_after_sale_keyword(processed_content)
-            result = await classifier.classify(processed_content, after_sale_hint=after_sale_hint)
+            result = await classifier.classify(
+                processed_content, after_sale_hint=after_sale_hint, history=history
+            )
         except Exception as e:
             self.logger.warning(f"意图分类异常，保守不转人工: {e}")
             return False
@@ -406,18 +482,96 @@ class AIReplyHandler(BaseHandler):
         # 规则 6：转人工失败仍静默拦截，避免 AI 误答敏感诉求
         return True
 
-    async def _get_ai_reply(self, query: str, context: Context) -> Optional[str]:
-        """获取AI回复"""
+    # 订单/物流查询改为「意图预取 + LLM 函数调用」双重保险（2026-08-11 移除后，
+    # 实测 glm-4-flash 稳定漏选 query_order_status，故重新启用预取）。
+    # 买家身份字段（recipient_uid/shop_id/user_id）由 tool_decorator 从
+    # 受信任的 dependencies 自动注入，LLM 无需也无法指定。
+
+    # ------------------------------------------------------------------
+
+    async def _prefetch_order_if_needed(self, metadata: Dict[str, Any], text: str) -> str:
+        """订单/物流意图主动查证（双重保险的第一道闸门）。
+
+        真人客服在后台能直接看到「这个客户的订单」，无需用户报单号。但 glm-4-flash
+        函数调用不可靠，常漏选 query_order_status，导致订单类问题只拿到泛泛的售前回复。
+        故在调 LLM 之前，凭会话买家 uid 主动查证该客户在本店订单，把结果作为「已知事实」
+        注入，确保订单/物流类问题一定有人工查单行为。
+
+        返回注入给 LLM 的提示串；非订单意图或查证失败时返回空串（走 LLM 自主调用路径）。
+        """
+        content = (text or "").lower()
+        # 负向词优先：发货地/发货速度等通用咨询不触发查证
+        if any(p in content for p in self._SHIP_ORIGIN_NEGATIVES):
+            return ""
+        if not any(k in content for k in self._ORDER_INTENT_KEYWORDS):
+            return ""
+
+        from_uid = metadata.get("from_uid")
+        shop_id = metadata.get("shop_id")
+        user_id = metadata.get("user_id")
+        if not all([from_uid, shop_id, user_id]):
+            self.logger.warning("订单预取缺少必要参数，跳过: "
+                                f"from_uid={from_uid}, shop_id={shop_id}, user_id={user_id}")
+            return ""
+
+        try:
+            from Agent.CustomerAgent.tools.query_order_status import (
+                query_order_status, QueryOrderStatusParams,
+            )
+            params = QueryOrderStatusParams(
+                shop_id=str(shop_id), user_id=str(user_id), recipient_uid=str(from_uid),
+            )
+            # 工具内部可能起浏览器（首访约 10~15s），放线程避免阻塞事件循环
+            result = await asyncio.to_thread(query_order_status, params)
+        except Exception as e:
+            self.logger.warning(f"订单预取异常，降级走 LLM 自主调用: {type(e).__name__}: {e}")
+            return ""
+
+        if not result:
+            return ""
+
+        # 清理客户话术里不允许的波浪号与感叹号（工具输出偶带 "~" 或 "！"），避免泄漏到最终回复
+        result = result.replace("~", "").replace("～", "").replace("！", "").replace("!", "")
+
+        if result.startswith("[untrusted_order_data]"):
+            return (
+                "【系统已为您查证该客户在本店的订单，请直接基于下方数据回复用户，"
+                "不要说“暂时查不到”，也不要向用户索要订单号：】\n" + result
+            )
+        if "未查询到您在本店的订单" in result:
+            return (
+                "【系统已查证：该客户在本店暂无订单记录。请如实告知用户“未查询到您在本店的订单”，"
+                "不要编造状态，也不要索要订单号。】\n" + result
+            )
+        # 其余（接口未返回 / 程序异常等）：原样转告，不要改写、不要索要订单号
+        return (
+            "【系统暂时取不到订单数据，请将下面这句话原样转告用户，"
+            "不要改写、不要索要订单号：】\n" + result
+        )
+
+    async def _get_ai_reply(self, query: str, context: Context, order_hint: str = "") -> Optional[str]:
+        """获取AI回复
+
+        Args:
+            query: 用户消息
+            context: 上下文
+        """
         if not self.bot:
             return None
+
+        effective_query = query
+        if order_hint:
+            # 把系统已查证的订单数据作为「已知事实」注入，让 LLM 直接据此回复，
+            # 避免其漏选工具或编造状态。
+            effective_query = f"{query}\n\n{order_hint}"
 
         try:
             # 优先使用异步接口，其次回退到同步接口
             if hasattr(self.bot, 'async_reply'):
-                res = await self.bot.async_reply(query, context)
+                res = await self.bot.async_reply(effective_query, context)
                 return getattr(res, 'content', str(res))
             elif hasattr(self.bot, 'reply'):
-                res = self.bot.reply(query, context)
+                res = self.bot.reply(effective_query, context)
                 return getattr(res, 'content', str(res))
             else:
                 self.logger.warning("Bot不支持reply或async_reply方法")
@@ -434,7 +588,7 @@ class AIReplyHandler(BaseHandler):
         if not text:
             return text
         import re
-        return re.sub(r'[，,。.；;？?]', '', text)
+        return re.sub(r'[，,。.；;？?！!]', '', text)
 
     async def _send_reply(self, context: Context, reply: str, metadata: Dict[str, Any]) -> bool:
         """发送回复，并校验发送结果业务码（规则 5）"""

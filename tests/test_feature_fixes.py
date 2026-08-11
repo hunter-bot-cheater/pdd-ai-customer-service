@@ -73,6 +73,36 @@ from Agent.CustomerAgent.tools.get_product_list import _format_products_output
 from Agent.CustomerAgent.custom.tool_decorator import TOOL_REGISTRY, execute_tool
 
 from bridge.context import Context, ContextType, ChannelType
+
+from Message.handlers import intent_classifier as _ic_module
+
+
+class _ConsultIntentClassifier:
+    """测试桩：意图恒为 consult（不触发转人工），用于隔离发送/回复/转人工静默等
+    逻辑的单元测试，避免这些用例被真实意图路由（含 other/unknown→转人工）干扰。
+
+    意图路由本身由 TestAIHandlerIntentRouting / TestIntentClassifier 单独覆盖。
+    """
+
+    enabled = True
+    threshold = 0.6
+    model_name = "stub"
+    api_key = ""
+    api_base = ""
+
+    async def classify(self, text, after_sale_hint=False, history=None):
+        return {"intent": "consult", "confidence": 0.99}
+
+    @staticmethod
+    def should_transfer(intent, confidence, threshold):
+        return _ic_module.IntentClassifier.should_transfer(intent, confidence, threshold)
+
+
+def _patch_intent_to_consult():
+    """返回已启动的 patch，使 get_intent_classifier 返回 consult 桩。"""
+    return mock.patch.object(
+        _ic_module, "get_intent_classifier", return_value=_ConsultIntentClassifier()
+    )
 from bridge.reply import Reply, ReplyType
 
 
@@ -592,10 +622,14 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         self.capture = CaptureWebhook()
         self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
         self._notify_patch.start()
+        # 隔离意图路由：本类只测"转人工后静默/忽略"，不涉及意图触发转人工
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
 
     def tearDown(self):
         self._sender_patch.stop()
         self._notify_patch.stop()
+        self._intent_patch.stop()
         _restore_ai_reply_delays()
 
     async def test_handoff_active_skips_ai_and_notifies(self):
@@ -791,8 +825,12 @@ class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
+        # 隔离意图路由：本类只测发送/拆分/清洗规则，避免意图触发转人工干扰断言
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
 
     def tearDown(self):
+        self._intent_patch.stop()
         _restore_ai_reply_delays()
 
     def test_split_reply_respects_max_len(self):
@@ -971,11 +1009,15 @@ class TestBusinessHours(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda msg: (self.capture.messages.append(msg), True)[1],
         )
         self._notify_patch.start()
+        # 隔离意图路由：本类只测营业时间逻辑，避免意图触发转人工干扰正常回复断言
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
 
     def tearDown(self):
         _app_config.set("business_hours", self._orig_bh, save=False)
         self._bridge_sender_patch.stop()
         self._notify_patch.stop()
+        self._intent_patch.stop()
         _restore_ai_reply_delays()
 
     def _set_business_window(self, start, end):
@@ -1321,6 +1363,12 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
         _set_inside_business_hours()
         self.sender = FakeSender()
         self.bot = MockBot()
+        # 隔离意图路由：本类只测发送前清洗/跳过规则，避免意图触发转人工干扰断言
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
+
+    def tearDown(self):
+        self._intent_patch.stop()
 
     def tearDown(self):
         _restore_ai_reply_delays()
@@ -1465,14 +1513,15 @@ class TestIntentClassifier(unittest.IsolatedAsyncioTestCase):
     """意图分类器纯单元测试（不发起真实网络请求）"""
 
     def test_should_transfer_matrix(self):
-        """操作/投诉/负面情绪且置信度达标 → 转；咨询/其他/低置信 → 不转。"""
+        """操作/投诉/负面情绪且置信度达标 → 转；咨询/低置信 → 不转；其它/未知 → 转（保守升级）。"""
         IC = IntentClassifier
         self.assertTrue(IC.should_transfer("operation", 0.9, 0.6))
         self.assertTrue(IC.should_transfer("complaint", 0.6, 0.6))
         self.assertTrue(IC.should_transfer("negative_emotion", 0.7, 0.6))
         self.assertFalse(IC.should_transfer("consult", 0.99, 0.6))
         self.assertFalse(IC.should_transfer("operation", 0.3, 0.6))
-        self.assertFalse(IC.should_transfer("other", 0.9, 0.6))
+        self.assertTrue(IC.should_transfer("other", 0.9, 0.6))
+        self.assertTrue(IC.should_transfer("unknown", 0.0, 0.6))
 
     def test_parse_valid(self):
         c = IntentClassifier({})
@@ -1500,7 +1549,7 @@ class TestIntentClassifier(unittest.IsolatedAsyncioTestCase):
         c = IntentClassifier({})
         calls = []
 
-        async def fake(text, hint):
+        async def fake(text, hint, history=None):
             calls.append(text)
             return {"intent": "consult", "confidence": 0.9}
 
@@ -1509,6 +1558,42 @@ class TestIntentClassifier(unittest.IsolatedAsyncioTestCase):
             r2 = await c.classify("运费谁出")
         self.assertEqual(r1["intent"], "consult")
         self.assertEqual(len(calls), 1)  # 第二次命中缓存，不再调用 LLM
+
+    def test_build_user_includes_history(self):
+        """_build_user 在有上下文时拼接最近若干轮，并标注当前消息；无上下文时不出现上下文块。"""
+        c = IntentClassifier({})
+        history = [
+            {"role": "user", "content": "有没有适合冬天的帽子"},
+            {"role": "assistant", "content": "有的亲，这几款毛线帽都不错，需要推荐吗"},
+            {"role": "system", "content": "（系统提示）"},
+        ]
+        user = c._build_user("要", False, history=history)
+        self.assertIn("对话上下文", user)
+        self.assertIn("买家：有没有适合冬天的帽子", user)
+        self.assertIn("客服：有的亲，这几款毛线帽都不错，需要推荐吗", user)
+        self.assertIn("当前消息：要", user)
+        # system 角色也按角色名标注（不丢失）
+        self.assertIn("系统：", user)
+        # 无上下文：不应出现上下文块，仅当前消息
+        user2 = c._build_user("要", False)
+        self.assertNotIn("对话上下文", user2)
+        self.assertIn("当前消息：要", user2)
+
+    async def test_classify_passes_history_to_llm(self):
+        """classify 把传入的 history 透传给 _call_llm / _build_user。"""
+        c = IntentClassifier({})
+        captured = {}
+
+        async def fake(text, hint, history=None):
+            captured["text"] = text
+            captured["history"] = history
+            return {"intent": "consult", "confidence": 0.9}
+
+        hist = [{"role": "assistant", "content": "需要推荐吗"}]
+        with mock.patch.object(c, "_call_llm", fake):
+            await c.classify("要", after_sale_hint=False, history=hist)
+        self.assertEqual(captured["text"], "要")
+        self.assertEqual(captured["history"], hist)
 
 
 # ============================================================================
@@ -1524,8 +1609,29 @@ class _StubClassifier:
         self.threshold = threshold
         self.enabled = enabled
 
-    async def classify(self, text, after_sale_hint=False):
+    async def classify(self, text, after_sale_hint=False, history=None):
         return {"intent": self.intent, "confidence": self.confidence}
+
+
+class _ContextAwareStub:
+    """测试替身：模拟真实分类器的「上下文判意图」行为，并记录收到的 history。
+
+    行为：孤立的「要」→ 判 other（→ 转人工）；但当上下文里客服刚问过「需要推荐吗」
+    时，「要」应判 consult（续接咨询，不转人工）。用于验证方案 A 的上下文注入修复。
+    """
+
+    def __init__(self):
+        self.captured = None  # (text, history)
+        self.enabled = True
+        self.threshold = 0.6
+
+    async def classify(self, text, after_sale_hint=False, history=None):
+        self.captured = (text, history)
+        if "要" in text and history:
+            for h in history:
+                if h.get("role") == "assistant" and "需要推荐吗" in (h.get("content") or ""):
+                    return {"intent": "consult", "confidence": 0.9}
+        return {"intent": "other", "confidence": 0.5}
 
 
 class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
@@ -1591,12 +1697,12 @@ class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
         self.assertEqual(len(self.capture.messages), 1)
 
-    async def test_unknown_no_transfer(self):
-        """分类未知 → 保守不转人工，AI 自主回答。"""
+    async def test_unknown_transfers(self):
+        """分类未知（识别不出意图）→ 保守转人工。"""
         ok = await self._route("在吗", "unknown")
         self.assertTrue(ok)
-        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
-        self.assertEqual(len(self.bot.calls), 1)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertEqual(self.bot.calls, [])
 
     async def test_low_confidence_no_transfer(self):
         """置信度低于阈值 → 不转人工。"""
@@ -1621,6 +1727,37 @@ class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sender.calls["transfer_to_cs"], [])
         self.assertTrue(SessionState().is_handoff("shop1:buyer1"))
         self.assertEqual(len(self.capture.messages), 1)
+
+    async def test_short_reply_in_context_does_not_transfer(self):
+        """方案 A 修复验证：孤立看是 other 的「要」，在「需要推荐吗」上下文中应判 consult，不转人工。
+
+        路由阶段取最近若干轮历史注入分类器；上下文里客服刚问「需要推荐吗」，
+        买家回「要」应续接咨询（consult），而非被误判 other 转人工。
+        """
+        _app_config.set("intent.context_turns", 12, save=False)
+        fake_history = [
+            {"role": "user", "content": "有没有适合冬天的帽子"},
+            {"role": "assistant", "content": "有的亲，这几款毛线帽都不错，需要推荐吗"},
+        ]
+        stub = _ContextAwareStub()
+        # MockBot 无 get_session_history；临时挂上，让路由阶段取到上下文
+        self.handler.bot.get_session_history = lambda sid, limit=None: fake_history
+        with mock.patch.object(ic_module, "get_intent_classifier", return_value=stub):
+            ok = await self.handler.handle(make_context("要"), make_metadata())
+        self.assertTrue(ok)
+        # 分类器确实拿到了上下文，且其中包含客服的「需要推荐吗」
+        self.assertIsNotNone(stub.captured)
+        _text, _history = stub.captured
+        self.assertIn("要", _text)
+        self.assertTrue(
+            any(
+                h.get("role") == "assistant" and "需要推荐吗" in (h.get("content") or "")
+                for h in (_history or [])
+            )
+        )
+        # 上下文判为 consult → 不转人工
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+        self.assertFalse(SessionState().is_handoff("shop1:buyer1"))
 
 
 # ============================================================================
