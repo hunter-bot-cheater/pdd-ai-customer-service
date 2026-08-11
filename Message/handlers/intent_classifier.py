@@ -207,12 +207,18 @@ class IntentClassifier:
         """判断给定意图是否应转人工。
 
         - operation / complaint / negative_emotion：置信度达标才转（避免误转）。
-        - other / unknown：识别不出用户意图 / 分类失败 → 保守转人工
-          （AI 不知道怎么回复时即升级给人工，不卡置信度阈值；unknown 多由超时、
-          异常或解析失败产生，代表"未能识别意图"，同样保守升级）。
+        - other：仅当置信度达标时才转——高置信度的 other 表示 LLM 确认
+          这条消息确实不属于我们能处理的类别；低置信度的 other 表示分类器
+          自己都没把握，应让 AI 先尝试回复，避免"什么都转人工"。
+        - unknown：分类失败/超时/解析异常 → 保守转人工（不卡阈值，
+          代表"未能识别意图"，安全起见升级给人工）。
         """
-        if intent in (INTENT_OTHER, INTENT_UNKNOWN):
+        if intent == INTENT_UNKNOWN:
             return True
+        if intent == INTENT_OTHER:
+            # 只有 LLM 有把握说"这确实不是我该管的"才转；
+            # 低置信度 = 分类器不确定，让 AI 试着回。
+            return confidence >= threshold
         if intent not in _TRANSFER_INTENTS:
             return False
         return float(confidence or 0.0) >= float(threshold)

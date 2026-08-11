@@ -1513,14 +1513,20 @@ class TestIntentClassifier(unittest.IsolatedAsyncioTestCase):
     """意图分类器纯单元测试（不发起真实网络请求）"""
 
     def test_should_transfer_matrix(self):
-        """操作/投诉/负面情绪且置信度达标 → 转；咨询/低置信 → 不转；其它/未知 → 转（保守升级）。"""
+        """操作/投诉/负面情绪且置信度达标 → 转；咨询/低置信 → 不转；
+        other 高置信(≥阈值) → 转（LLM确认无法处理）；other 低置信(<阈值) → 不转（分类器不确定，让AI回）；
+        unknown → 保守转（分类失败/超时）。"""
         IC = IntentClassifier
         self.assertTrue(IC.should_transfer("operation", 0.9, 0.6))
         self.assertTrue(IC.should_transfer("complaint", 0.6, 0.6))
         self.assertTrue(IC.should_transfer("negative_emotion", 0.7, 0.6))
         self.assertFalse(IC.should_transfer("consult", 0.99, 0.6))
         self.assertFalse(IC.should_transfer("operation", 0.3, 0.6))
+        # other: 高置信才转，低置信不转
         self.assertTrue(IC.should_transfer("other", 0.9, 0.6))
+        self.assertFalse(IC.should_transfer("other", 0.5, 0.6))   # 低置信 other → AI 先回
+        self.assertFalse(IC.should_transfer("other", 0.3, 0.6))
+        # unknown: 无论置信度都转（保守兜底）
         self.assertTrue(IC.should_transfer("unknown", 0.0, 0.6))
 
     def test_parse_valid(self):
