@@ -78,11 +78,37 @@ class ConfigModel(BaseModel):
 
 # 默认配置基础数据
 config_base = {
+    "notification": {
+        # 企业微信群机器人 Webhook：转人工/紧急通知发到这里
+        # 创建方式：群聊 -> 右键 -> 群机器人 -> 添加 -> 复制 Webhook 地址
+        # 留空则不发送转人工通知（仍会转接，但不发群消息）
+        "wechat_webhook": "",
+        "handoff_cooldown_seconds": 300
+    },
+    "transfer": {
+        "main_account_user_ids": [],
+        "sub_account_uids": []
+    },
+    "handoff": {
+        "valid_hours": 4
+    },
     "business_hours": {
-        "start": "08:00",
-        "end": "23:00"
+        "start": "00:00",
+        "end": "23:59"
     },
     "db_path": "./temp/channel_shop.db",
+    "ai_reply": {
+        "read_seconds_min": 6,
+        "read_seconds_max": 8,
+        "typing_seconds_min": 4,
+        "typing_seconds_max": 6,
+        "split_interval_min": 3,
+        "split_interval_max": 6,
+        "max_message_len": 25,
+        # 单次回复最多句数（按句号/问号/感叹号切分）。配合 max_message_len 让回复更像真人客服。
+        "uid_min_interval": 4,
+        "max_sentences": 4
+    },
     "llm": {
         "model_name": "",
         "api_key": "",
@@ -94,9 +120,6 @@ config_base = {
         "cache_ttl_seconds": 3600,
         "timeout_seconds": 5.0,
         "max_tokens": 32
-    },
-    "handoff": {
-        "valid_hours": 4
     },
     "prompt": {
         "instructions": [

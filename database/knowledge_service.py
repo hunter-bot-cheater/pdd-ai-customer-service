@@ -377,6 +377,7 @@ class KnowledgeService:
         query: Optional[str] = None,
         goods_id: Optional[int] = None,
         limit: int = 10,
+        minimum_score: int = 2,
     ) -> Dict[str, Any]:
         """
         检索知识库
@@ -386,6 +387,9 @@ class KnowledgeService:
             query: 关键词查询，可为空
             goods_id: 精确查询特定商品，可为空
             limit: 返回结果最大数量
+            minimum_score: 最低命中分（命中词数）。过滤掉单关键词偶然命中的噪音条目，
+                例如用户问"床品四件套"时，不会因 KB 退换货政策含"商品"二字就被拉出来。
+                默认 2：要求至少 2 个 ≥2 字词共现；单关键词查询可传 1。
 
         Returns:
             {
@@ -450,6 +454,9 @@ class KnowledgeService:
                     key=lambda x: (x["score"], x["obj"].id),
                     reverse=True,
                 )
+                # minimum_score 过滤掉只命中 1 个词（甚至 0 词但进了 dict 的）的噪音条目，
+                # 避免"商品""使用"等通用词把无关 KB 拉进来。
+                sorted_hits = [h for h in sorted_hits if h["score"] >= minimum_score]
                 result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
 
                 # 产品知识也按类似 OR 逻辑
