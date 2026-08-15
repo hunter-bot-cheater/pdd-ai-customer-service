@@ -412,40 +412,74 @@ class KnowledgeService:
             # 如果有关键词查询
             elif query and query.strip():
                 # 分词
-                words = jieba.cut_for_search(query.strip())
-                product_conditions = [ProductKnowledge.shop_id == db_shop_id]
-                cs_conditions = [
-                    CustomerServiceKnowledge.shop_id == db_shop_id,
-                    CustomerServiceKnowledge.enabled == True,
-                ]
+                words = [w.strip() for w in jieba.cut_for_search(query.strip()) if len(w.strip()) >= 2]
+                if not words:
+                    # 无 ≥2 字关键词（如寒暄"在吗""你好"），返回最新 N 条作为兜底
+                    return self._search_knowledge(db_shop_id, query=None, goods_id=goods_id, limit=limit)
 
-                # 对每个关键词添加 LIKE 条件
+                # OR 逻辑：任一关键词命中即返回（更符合"按关键词模糊匹配"的心智）
+                # 旧版用 AND，导致带寒暄词的消息（如"老板 支持7天无理由吗"含"老板"）根本无法命中。
+                # 对每个词单独查 + 用 score（命中词数）排序，命中词越多越靠前。
+                scored_results: Dict[int, Dict[str, Any]] = {}
+
                 for word in words:
-                    if len(word.strip()) >= 2:  # 太短的词忽略
-                        product_conditions.append(
-                            or_(
-                                ProductKnowledge.goods_name.contains(word),
-                                ProductKnowledge.extracted_content.contains(word),
+                    stmt_word = (
+                        select(CustomerServiceKnowledge)
+                        .where(
+                            and_(
+                                CustomerServiceKnowledge.shop_id == db_shop_id,
+                                CustomerServiceKnowledge.enabled == True,
+                                or_(
+                                    CustomerServiceKnowledge.title.contains(word),
+                                    CustomerServiceKnowledge.content.contains(word),
+                                ),
                             )
                         )
-                        cs_conditions.append(
-                            or_(
-                                CustomerServiceKnowledge.title.contains(word),
-                                CustomerServiceKnowledge.content.contains(word),
+                        .order_by(CustomerServiceKnowledge.created_at.desc())
+                    )
+                    for cs in session.scalars(stmt_word):
+                        entry = scored_results.setdefault(
+                            cs.id,
+                            {"obj": cs, "score": 0},
+                        )
+                        entry["score"] += 1
+
+                # 按 score DESC 排序（命中词越多越靠前），再按 id 倒序兜底
+                sorted_hits = sorted(
+                    scored_results.values(),
+                    key=lambda x: (x["score"], x["obj"].id),
+                    reverse=True,
+                )
+                result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
+
+                # 产品知识也按类似 OR 逻辑
+                scored_products: Dict[int, Dict[str, Any]] = {}
+                for word in words:
+                    stmt_word = (
+                        select(ProductKnowledge)
+                        .where(
+                            and_(
+                                ProductKnowledge.shop_id == db_shop_id,
+                                or_(
+                                    ProductKnowledge.goods_name.contains(word),
+                                    ProductKnowledge.extracted_content.contains(word),
+                                ),
                             )
                         )
-
-                # 查询产品知识
-                stmt_p = select(ProductKnowledge).where(and_(*product_conditions))\
-                    .order_by(ProductKnowledge.created_at.desc())\
-                    .limit(limit)
-                result["product_knowledge"] = list(session.scalars(stmt_p))
-
-                # 查询客服知识
-                stmt_cs = select(CustomerServiceKnowledge).where(and_(*cs_conditions))\
-                    .order_by(CustomerServiceKnowledge.created_at.desc())\
-                    .limit(limit)
-                result["customer_service_knowledge"] = list(session.scalars(stmt_cs))
+                        .order_by(ProductKnowledge.created_at.desc())
+                    )
+                    for p in session.scalars(stmt_word):
+                        entry = scored_products.setdefault(
+                            p.id,
+                            {"obj": p, "score": 0},
+                        )
+                        entry["score"] += 1
+                sorted_products = sorted(
+                    scored_products.values(),
+                    key=lambda x: (x["score"], x["obj"].id),
+                    reverse=True,
+                )
+                result["product_knowledge"] = [it["obj"] for it in sorted_products[:limit]]
             else:
                 # 没有关键词，返回最新的产品知识和客服知识
                 stmt_p = select(ProductKnowledge).where(ProductKnowledge.shop_id == db_shop_id)\

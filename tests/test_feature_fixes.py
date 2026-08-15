@@ -1353,6 +1353,17 @@ class TestCleanText(unittest.TestCase):
             "Done please wait",
         )
 
+    def test_preserves_decimal_points(self):
+        """小数点（如 1.5米、2.5米、17.5元）在标点清洗中必须保留，不能被吞成 15/25/175。"""
+        h = self.handler
+        # 小数点保留，句末 。！， 等标点照删（、 顿号不在清洗范围，保持原样）
+        self.assertEqual(h._clean_text("宽度有1.5米、2.5米和3米可选"), "宽度有1.5米、2.5米和3米可选")
+        self.assertEqual(h._clean_text("价格17.5元！"), "价格17.5元")
+        self.assertEqual(h._clean_text("约3.14米，"), "约3.14米")
+        # 句末独立 . 被删除
+        self.assertEqual(h._clean_text("结束。"), "结束")
+        self.assertEqual(h._clean_text("Done."), "Done")
+
 
 class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
     """需求二：发送前清洗；纯标点分条跳过；整条纯标点走备用回复（同样被清洗）"""
