@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from Agent.bot import Bot
+from config import get_config
 
 # 导入工具模块，触发 @agent_tool 装饰器注册
 from Agent.CustomerAgent.tools import (
@@ -213,7 +214,8 @@ class CustomerAgent(Bot):
         # 延迟初始化
         if not self._is_initialized:
             if not await self.initialize_async():
-                return Reply(ReplyType.TEXT, "AI客服初始化失败，请检查配置。")
+                # 返回空串，由 ai_handler 静默转人工（严禁暴露"初始化失败"等内部信息）
+                return Reply(ReplyType.TEXT, "")
 
         try:
             # 构建 session_id 和 dependencies
@@ -259,6 +261,14 @@ class CustomerAgent(Bot):
                 messages, dependencies, session_id=session_id
             )
 
+            # 句数精简重试：若 LLM 一次生成了太多句话（如 10 句），
+            # 直接截断会丢失意思。这里把「太长，请精简」作为新的一轮对话
+            # 追加到 messages 末尾再调一次 LLM（tool_choice="none" 强制纯文本），
+            # 让它重写成不超 max_sentences 句的版本。最多重试 2 次，仍超则按句截断兜底。
+            final_content = await self._condense_to_sentence_limit(
+                messages, final_content
+            )
+
             # 保存最终回复到历史（DB 写入放工作线程，避免阻塞事件循环）
             await asyncio.to_thread(
                 self._session_manager.add_message,
@@ -267,13 +277,109 @@ class CustomerAgent(Bot):
                 content=final_content,
             )
 
-            return Reply(ReplyType.TEXT, final_content or "抱歉，我暂时无法回复。")
+            return Reply(ReplyType.TEXT, final_content or "")
 
         except Exception as e:
             logger.error(
-                f"CustomerAgent 回复失败: error_type={type(e).__name__}"
+                f"CustomerAgent 回复失败: error_type={type(e).__name__}: {e}"
             )
-            return Reply(ReplyType.TEXT, "抱歉，我现在无法回复，请稍后再试。")
+            # 返回空内容，让 ai_handler 走真人化 fallback（"客服正在为您处理，请稍等片刻"）。
+            # 严禁返回"抱歉""无法回复"等暴露机器人身份的话术。
+            return Reply(ReplyType.TEXT, "")
+
+    async def _condense_to_sentence_limit(
+        self, messages: List[Dict[str, Any]], content: str
+    ) -> str:
+        """按"消息条数"上限精简 LLM 回复：超条数则打回重生成，最多重试 3 次。
+
+        关键判断：LLM 生成的 3 句如果每句 25+ 字，会被 _split_reply 按 max_message_len
+        切碎成 6+ 条消息。所以不能用"句数"判断，要用"切分后的消息条数"判断。
+        兜底硬切到上限 max_sentences 条（按字符硬切，可能从词中间断，但保证不超限）。
+        """
+        max_sentences = int(get_config("ai_reply.max_sentences", 4))
+        max_message_len = int(get_config("ai_reply.max_message_len", 25))
+        if max_sentences <= 0 or not content:
+            return content
+
+        import re
+
+        def _split_by_sentence(text: str) -> List[str]:
+            return [p for p in re.split(r'(?<=[。！？；!?;\n])', text) if p]
+
+        def _estimate_message_count(text: str) -> int:
+            """预估切分后的消息条数：按 max_message_len 字符硬切（每句）。"""
+            count = 0
+            for sent in _split_by_sentence(text):
+                if not sent:
+                    continue
+                if len(sent) <= max_message_len:
+                    count += 1
+                else:
+                    count += (len(sent) + max_message_len - 1) // max_message_len
+            return count
+
+        if _estimate_message_count(content) <= max_sentences:
+            return content
+
+        for attempt in range(3):
+            cur_msg_count = _estimate_message_count(content)
+            cur_sent_count = len(_split_by_sentence(content))
+            # 追加精简指令：每条 ≤ N 字、总条数 ≤ M 条（双重硬性目标）。
+            condense_msgs = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        f"【硬性要求 - 必须遵守】你刚才的回复会被切成 {cur_msg_count} 条消息 "
+                        f"（{cur_sent_count} 句话，每句太长被切碎），"
+                        f"超过了上限 {max_sentences} 条。这是不允许的。\n"
+                        f"请重写并严格控制：\n"
+                        f"  1. 每条消息 ≤ {max_message_len} 字（短句，不要超长）\n"
+                        f"  2. 总消息条数 ≤ {max_sentences} 条\n"
+                        f"方法：合并重复表述，删除寒暄/感叹/废话，"
+                        f"保留对买家最关键的信息（政策要点、订单号、金额、规格等）。\n"
+                        f"直接输出精简后的回复正文，不要加任何解释、道歉、'好的'等前缀。"
+                    ),
+                }
+            ]
+            try:
+                resp = await self._llm_client.chat(
+                    condense_msgs, tool_choice="none"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"回复精简重试失败（第 {attempt + 1} 次）: {type(e).__name__}: {e}"
+                )
+                break
+            new_content = getattr(resp, "content", "") or ""
+            if not new_content.strip():
+                break
+            content = new_content
+            if _estimate_message_count(content) <= max_sentences:
+                logger.info(
+                    f"回复经精简重试后达标：{_estimate_message_count(content)} 条 "
+                    f"（{len(_split_by_sentence(content))} 句，第 {attempt + 1} 次）"
+                )
+                return content
+
+        # 兜底：重试 3 次后仍超，按 max_message_len 字符硬切，截前 max_sentences 条。
+        # 硬切可能从词中间断，但保证不超过上限（用户硬性要求）。
+        final_msg_count = _estimate_message_count(content)
+        if final_msg_count > max_sentences:
+            logger.warning(
+                f"回复精简重试 3 次后仍超 {final_msg_count} 条（上限 {max_sentences}），"
+                f"按字符硬切到上限兜底"
+            )
+            all_chunks: List[str] = []
+            for sent in _split_by_sentence(content):
+                if not sent:
+                    continue
+                if len(sent) <= max_message_len:
+                    all_chunks.append(sent)
+                else:
+                    for i in range(0, len(sent), max_message_len):
+                        all_chunks.append(sent[i:i + max_message_len])
+            return "".join(all_chunks[:max_sentences])
+        return content
 
     async def _run_agent_loop(
         self,
@@ -297,12 +403,13 @@ class CustomerAgent(Bot):
                     f"LLM 调用失败: error_type={type(e).__name__}"
                 )
                 if loop_count == 0:
-                    return "抱歉，AI 服务暂时不可用，请稍后再试。"
+                    # 返回空串，由 ai_handler 静默转人工（严禁"抱歉"等暴露机器人身份的话术）
+                    return ""
                 # 已有中间结果，返回已生成的内容
                 for msg in reversed(messages):
                     if msg.get("role") == "assistant" and msg.get("content"):
                         return msg["content"]
-                return "抱歉，AI 服务暂时不可用，请稍后再试。"
+                return ""
 
             # 2. 解析响应
             if not response.has_tool_calls:

@@ -65,8 +65,23 @@ class AIReplyHandler(BaseHandler):
         self.split_interval_max = float(get_config("ai_reply.split_interval_max", 6))
         # 规则 3: 单条消息最大字数
         self.max_message_len = int(get_config("ai_reply.max_message_len", 25))
+        # 单次回复最多句数（按句末标点切分）。<=0 表示不限制。
+        self.max_sentences = int(get_config("ai_reply.max_sentences", 4))
         # 规则 2: 同一买家连续回复间隔跟踪器
         self.uid_tracker = UIDSendTracker()
+
+        # 同一买家消息串行化锁：consumer 有多个并发 worker，同买家的多条消息
+        # 会并行处理导致回复穿插（先答问题2再答问题1）。按 (shop_id:from_uid) 加锁，
+        # 保证同一买家的消息严格按到达顺序处理，前一条回复发完才处理下一条。
+        self._buyer_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_buyer_lock(self, key: str) -> asyncio.Lock:
+        """获取（或创建）同一买家串行锁。单事件循环内安全。"""
+        lock = self._buyer_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._buyer_locks[key] = lock
+        return lock
 
     def can_handle(self, context: Context) -> bool:
         """检查是否可以处理该消息"""
@@ -115,6 +130,18 @@ class AIReplyHandler(BaseHandler):
 
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """处理AI回复（支持分条短消息发送 + 真人时序模拟）"""
+        # 同一买家串行锁：多条消息并发时按到达顺序处理，回复不穿插。
+        # 锁 key 用 shop_id:from_uid；拿不到身份时退化为并发（极端场景可接受）。
+        shop_id0 = metadata.get('shop_id')
+        from_uid0 = metadata.get('from_uid')
+        lock_key = f"{shop_id0}:{from_uid0}" if shop_id0 and from_uid0 else None
+        if lock_key:
+            async with self._get_buyer_lock(lock_key):
+                return await self._handle_unlocked(context, metadata)
+        return await self._handle_unlocked(context, metadata)
+
+    async def _handle_unlocked(self, context: Context, metadata: Dict[str, Any]) -> bool:
+        """处理AI回复（已持有买家串行锁）"""
         try:
             # ===== 0. 营业时间检查：非营业时间静默转人工，不执行 AI 回复 =====
             if self._is_outside_business_hours():
@@ -264,6 +291,29 @@ class AIReplyHandler(BaseHandler):
             parts = re.split(r'(?<=[，、])', sent)
             parts = [p.strip() for p in parts if p.strip()]
 
+            # 顿号并列链合并：连续以顿号结尾的 part（款式、材质、价格）必须并到
+            # 同一段，不能让顿号孤悬末尾。允许合并后超 max_message_len（语义正确优先）。
+            merged: List[str] = []
+            i = 0
+            while i < len(parts):
+                p = parts[i]
+                if p.endswith("、"):
+                    j = i + 1
+                    # 吸收连续顿号结尾的 part
+                    while j < len(parts) and parts[j].endswith("、"):
+                        p += parts[j]
+                        j += 1
+                    # 把链后第一个非顿号 part 也并入（即并列的最后一项，如"价格"）
+                    if j < len(parts):
+                        p += parts[j]
+                        j += 1
+                    merged.append(p)
+                    i = j
+                else:
+                    merged.append(p)
+                    i += 1
+            parts = merged
+
             current = ""
             for part in parts:
                 if len(part) > self.max_message_len:
@@ -285,6 +335,8 @@ class AIReplyHandler(BaseHandler):
 
         # 3. 还原占位符为原始内容（URL + 订单号）
         return [self._restore_protected(c, protected_map) for c in chunks]
+        # 注：不做发送条数截断。句数精简由 CustomerAgent._condense_to_sentence_limit
+        # 负责（打回重生成）；若重试仍超，语义优先原则下原样发送完整回复。
 
     def _mask_urls(self, text: str):
         """将文本中的 URL 替换为占位符，返回 (掩码文本, {占位符: 原始URL})
@@ -361,6 +413,33 @@ class AIReplyHandler(BaseHandler):
     _STICKY_PARTICLES = set("的了是在有和但而或也就都还才已要会可会能所因为当若那这")
     # 用于判定"实词"（不是黏着助词、也不是标点）。实词开头可能是词内断裂点。
     _SPLIT_PUNCTUATION = set("，。！？；、,.!?;:）】》」』")
+
+    # 判断用户消息是否表达了"提问"意图（用于 KB 预取防护）。
+    # 纯商品链接/商品名/寒暄不查 KB，避免 LLM 自作多情回答用户没问的政策/价格。
+    _QUESTION_HINTS = (
+        "?", "？",
+        "怎么", "如何", "为何", "为什么", "为啥", "咋", "怎样",
+        "多少", "几", "多久", "多大", "几天", "几件",
+        "哪个", "哪种", "什么", "啥", "谁", "哪里", "哪儿",
+        "是否", "能否", "能不能", "可以", "能",
+        "吗", "呢", "嘛",
+        "支持", "有没有", "有吗",
+        "区别", "对比", "比较", "推荐", "建议",
+        "贵", "便宜", "划算",
+        "何时", "什么时候", "尺寸", "颜色", "材质",
+    )
+
+    def _looks_like_user_question(self, text: str) -> bool:
+        """判断用户消息是否在提问。含问号或典型问句关键词返回 True。
+
+        用于 KB 预取防护：纯商品链接/寒暄不查 KB，避免 LLM 自作多情。
+        """
+        if not text:
+            return False
+        # 问号是最强信号
+        if "?" in text or "？" in text:
+            return True
+        return any(w in text for w in self._QUESTION_HINTS)
 
     def _split_overlong(self, text: str, protected_map: Dict[str, str]) -> List[str]:
         """将超长文本切分为不超过 max_message_len 的分片
@@ -608,6 +687,12 @@ class AIReplyHandler(BaseHandler):
         if not content:
             return ""
 
+        # 关键防护：客户消息没有"问"的特征时，不查 KB，避免 LLM 看到 KB 内容后
+        # 自作多情地回复用户没问的东西（典型场景：客户只发了商品链接/商品名/寒暄，
+        # bot 却主动答了价格、退换货等政策）。含问号或典型问句关键词才算"在提问"。
+        if not self._looks_like_user_question(content):
+            return ""
+
         shop_id = metadata.get("shop_id")
         if not shop_id:
             return ""
@@ -637,6 +722,9 @@ class AIReplyHandler(BaseHandler):
                 shop_id=int(shop_id),
                 query=content,
                 limit=3,
+                # minimum_score=2：过滤掉只命中 1 个词的偶然匹配（如"商品""使用"等通用词），
+                # 避免把无关 KB 条目拉出来。
+                minimum_score=2,
             )
         except Exception as e:
             self.logger.warning(f"KB 比对异常，降级走 LLM 自主调用: {type(e).__name__}: {e}")
@@ -648,7 +736,12 @@ class AIReplyHandler(BaseHandler):
         if not enabled_hits:
             return ""
 
-        lines = ["【系统已比对客服知识库，命中的店铺政策如下，请严格依据下方条目回答，不要用预训练通用知识编造政策】"]
+        lines = [
+            "【系统已比对客服知识库，命中的店铺政策如下。",
+            "请严格依据下方条目回答，不要用预训练通用知识编造政策；",
+            "下方内容仅作事实参考，不是可直接抄录的模板——请用你自己的话组织措辞，",
+            "每次回复都换一种表达方式，避免反复使用相同句式。】"
+        ]
         for i, cs in enumerate(enabled_hits, 1):
             title = (getattr(cs, "title", "") or "").replace("<", "＜").replace(">", "＞")
             content_text = (getattr(cs, "content", "") or "").replace("<", "＜").replace(">", "＞")
@@ -682,14 +775,16 @@ class AIReplyHandler(BaseHandler):
             # 优先使用异步接口，其次回退到同步接口
             if hasattr(self.bot, 'async_reply'):
                 res = await self.bot.async_reply(effective_query, context)
-                return getattr(res, 'content', str(res))
+                content = getattr(res, 'content', str(res))
             elif hasattr(self.bot, 'reply'):
                 res = self.bot.reply(effective_query, context)
-                return getattr(res, 'content', str(res))
+                content = getattr(res, 'content', str(res))
             else:
                 self.logger.warning("Bot不支持reply或async_reply方法")
                 return None
-
+            # 句数精简已在 CustomerAgent._condense_to_sentence_limit 内做（打回重生成，
+            # 非截断）；这里不再二次截断，避免把 LLM 精简后的完整语义砍掉。
+            return content
         except Exception as e:
             self.logger.error(
                 f"AI Bot调用失败: error_type={type(e).__name__}"
@@ -776,23 +871,19 @@ class AIReplyHandler(BaseHandler):
         return False
 
     async def _handle_fallback(self, context: Context, metadata: Dict[str, Any]) -> bool:
-        """备用回复处理"""
+        """AI 回复失败时的兜底处理。
+
+        不发送任何话术给买家（bot 扮演的就是真人客服，出现"客服正在为您处理"
+        等机器话术会暴露身份），直接静默转人工：
+        - 标记会话转人工，通知企业微信人工客服接手；
+        - 买家侧无任何机器回复，避免露馅。
+        """
         try:
-            # 简单的自动回复
-            reply_text = "亲，感谢您的咨询！客服正在为您处理，请稍等片刻。"
-
-            # 记录备用回复
-            self.logger.info("使用备用回复")
-
-            # 尝试发送备用回复
-            success = await self._send_reply(context, reply_text, metadata)
-            if not success:
-                # 如果发送失败，记录日志并返回False让下游有机会处理
-                await self.log_message(context, "备用回复发送失败", f"内容: {reply_text}")
-                return False
-
-            await self.log_message(context, "备用回复发送成功", f"内容: {reply_text}")
-            return True
+            # 记录备用处理日志（仅日志，不发送）
+            self.logger.info("AI回复失败，静默转人工（不发送机器话术）")
+            last_message = getattr(context, 'content', '') or ''
+            # 复用意图转人工的完整链路（标记会话 + 企业微信通知 + 子账号静默规则）
+            return await self._transfer_by_intent(context, metadata, last_message)
 
         except Exception as e:
             self.logger.error(

@@ -1411,7 +1411,9 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["你好"])
 
     async def test_pure_punctuation_reply_falls_back_cleaned(self):
-        # 整条回复仅由标点组成 → 清洗后为空，走备用回复（备用回复同样被清洗）
+        # 整条回复仅由标点组成 → 清洗后为空，走备用处理。
+        # 新语义：fallback 不再发送"客服正在为您处理"等机器话术，
+        # 而是静默转人工（无文本发送，避免暴露机器人身份）。
         self.bot = MockBot(reply_text="？？？")
         handler = AIReplyHandler(bot=self.bot)
         with mock.patch("bridge.sender.get_sender", return_value=self.sender):
@@ -1419,10 +1421,11 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
             ok = await handler.handle(context, make_metadata())
         self.assertTrue(ok)
         texts = [call[3] for call in self.sender.calls["send_text"]]
-        self.assertTrue(texts)
+        # 无任何机器话术文本发送（fallback 静默转人工）
         for t in texts:
-            for p in "，,。.？?":
-                self.assertNotIn(p, t)
+            self.assertNotIn("客服正在为您处理", t)
+            self.assertNotIn("抱歉", t)
+            self.assertNotIn("无法回复", t)
 
 
 # ============================================================================

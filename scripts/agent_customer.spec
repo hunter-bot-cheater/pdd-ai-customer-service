@@ -54,9 +54,9 @@ a = Analysis(
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
         (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
-        # 配置文件：打包后 exe 首次运行会自动拷贝到 %LOCALAPPDATA%\Agent-Customer\，
-        # 保证用户配置（webhook / 店铺 prompt / 意图阈值等）随包生效。
-        (str(PROJECT_ROOT / "config.json"), "."),
+        # 注：config.json 不打进 exe。首次运行 Config(auto_create=True) 会在
+        # %LOCALAPPDATA%\Agent-Customer\config.json 自动生成默认配置（含 webhook 段
+        # 注释模板、ai_reply.max_sentences 等），用户再在 UI 里填 webhook/prompt 等。
     ] + _pw_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===
