@@ -104,7 +104,7 @@ config_base = {
             "2. 当用户询问特定商品的信息、成分、使用方法、价格、规格等问题时，请优先使用 get_product_knowledge 工具获取商品详细知识，必须提供 goods_id（商品ID）和 shop_id（店铺ID）",
             "3. 当用户询问售后政策、物流信息、退换货规则、常见问题解答等非产品特定问题时，请使用 search_customer_service_knowledge 工具搜索客服知识，必须提供 query（搜索关键词）和 shop_id（店铺ID）",
             "4. 如果知识库中有相关信息，请根据知识库内容回答用户问题",
-            "5. 如果知识库中没有相关信息，再根据已有知识回答或建议用户联系人工客服"
+            "5. 如果知识库中没有相关信息，回复『亲，这块我帮您确认一下哈，稍等给您答复』，严禁说『联系客服』『咨询人工』等推诿话术"
         ]
     },
 }
@@ -357,6 +357,18 @@ class Config:
         with self._lock:
             if self._config is None:
                 raise ConfigError("没有可保存的配置")
+
+            # 防覆盖保护：若上次加载失败已降级为默认配置（last_error 非空），
+            # 禁止把默认配置写回磁盘，避免覆盖用户已配置好的 config.json。
+            # 场景：reload() 因 JSON 损坏/校验失败降级到 config_base，随后
+            # config_updater（认证写入 transfer）触发 save()，会把空配置写盘，
+            # 导致 webhook / prompt / llm 等用户配置"神秘消失"。
+            if self.last_error:
+                logger.error(
+                    f"拒绝保存：配置加载失败已降级为默认值（{self.last_error}），"
+                    f"不覆盖磁盘配置 {self.config_path}"
+                )
+                return False
 
             try:
                 # 创建目录（如果不存在）

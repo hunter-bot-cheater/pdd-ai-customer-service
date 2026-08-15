@@ -151,8 +151,14 @@ class AIReplyHandler(BaseHandler):
             #   行为等同真人客服在后台直接看到「这个客户的订单」。
             order_hint = await self._prefetch_order_if_needed(metadata, processed_content)
 
+            # 1.7 客服知识库预取（双重保险）：售后类问题同样存在 glm-4-flash 漏调
+            #   search_customer_service_knowledge 的问题，会绕开工具直接用预训练通用
+            #   知识回答（如默认"支持7天无理由"），与店铺真实政策冲突。
+            #   故在调 LLM 之前主动按关键词查 KB，把结果作为「已知事实」注入。
+            kb_hint = await self._prefetch_kb_if_needed(metadata, processed_content)
+
             # 2. 调用AI生成回复（订单数据已由 1.6 预取注入；LLM 基于已知事实回复即可）
-            reply = await self._get_ai_reply(processed_content, context, order_hint=order_hint)
+            reply = await self._get_ai_reply(processed_content, context, order_hint=order_hint, kb_hint=kb_hint)
             if not reply:
                 self.logger.warning("AI回复生成失败，使用备用回复")
                 return await self._handle_fallback(context, metadata)
@@ -347,42 +353,76 @@ class AIReplyHandler(BaseHandler):
         parts.append(text[last:])
         return ''.join(parts), ord_map
 
-    def _split_overlong(self, text: str, protected_map: Dict[str, str]) -> List[str]:
-        """将超长文本按字符硬切为不超过 max_message_len 的分片
+    # 断句：jieba 按词边界切分（杜绝词内断裂），块首孤立助词（结构/语气词）并回上一块。
+    # 允许当前块超过 max_message_len 1~2 字，换取自然的断点。
+    # 词级孤立助词（单字结构助词/语气词），块首出现时并回上一块。
+    _STICKY_WORDS = {"的", "了", "哦", "呢", "哈", "呀", "吧", "嘛", "啊", "啦"}
+    # 字符级备用（jieba 降级时用）
+    _STICKY_PARTICLES = set("的了是在有和但而或也就都还才已要会可会能所因为当若那这")
+    # 用于判定"实词"（不是黏着助词、也不是标点）。实词开头可能是词内断裂点。
+    _SPLIT_PUNCTUATION = set("，。！？；、,.!?;:）】》」』")
 
+    def _split_overlong(self, text: str, protected_map: Dict[str, str]) -> List[str]:
+        """将超长文本切分为不超过 max_message_len 的分片
+
+        核心策略：jieba 按词边界切分后填充，词（如"换货""因为"）绝不被劈开。
         受保护占位符（URL / 订单号等）视为原子 token，绝不截断；
-        含受保护 token 的分片允许略超上限。
+        超长单词（如长英文/数字串）整体成块，允许略超。
+
+        边界自然化：若某块以孤立助词（的/了/哦...）开头，将其并回上一块末尾，
+        避免"上一句末尾字词被强行放到下一句开头"的突兀感。允许超限 1~2 字。
         """
         if not text:
             return []
         import re
         # 同时匹配 URL 和订单号占位符，均视为不可拆分的原子 token
         tokens = [t for t in re.split(r'(__URL_\d+__|__ORD_\d+__)', text) if t]
-        chunks: List[str] = []
-        current = ""
+
+        # 展开为词序列（占位符 = 一个原子词）
+        word_seq: List[str] = []
         for tok in tokens:
             if tok in protected_map:
-                # 受保护占位符整体不可拆分；塞不下时单独成条（允许略超）
-                if current and len(current) + len(tok) <= self.max_message_len:
-                    current += tok
-                else:
-                    if current:
-                        chunks.append(current)
-                    current = tok
+                word_seq.append(tok)
                 continue
-            # 普通文本：逐字符填充
-            while tok:
-                room = self.max_message_len - len(current)
-                if room <= 0:
+            try:
+                import jieba
+                ws = [w for w in jieba.lcut(tok) if w and w.strip()]
+                word_seq.extend(ws if ws else list(tok))
+            except Exception:
+                # jieba 不可用时降级为逐字符（行为等同旧字符切分）
+                word_seq.extend(list(tok))
+
+        chunks: List[str] = []
+        current = ""
+        for w in word_seq:
+            # 超长单词（长英文/数字串等）：单独成块（允许略超）
+            if len(w) > self.max_message_len:
+                if current:
                     chunks.append(current)
                     current = ""
-                    continue
-                take = min(len(tok), room)
-                current += tok[:take]
-                tok = tok[take:]
+                chunks.append(w)
+                continue
+            if current and len(current) + len(w) <= self.max_message_len:
+                current += w
+            else:
+                if current:
+                    chunks.append(current)
+                current = w
         if current:
             chunks.append(current)
-        return chunks
+
+        # 块首孤立助词并回上一块（词级，最多并回 2 个连续助词字）
+        fixed: List[str] = []
+        for c in chunks:
+            if not fixed or c[0] not in self._STICKY_WORDS:
+                fixed.append(c)
+                continue
+            pull = 0
+            while pull < min(2, len(c)) and c[pull] in self._STICKY_WORDS:
+                pull += 1
+            fixed[-1] = fixed[-1] + c[:pull]
+            fixed.append(c[pull:])
+        return [f for f in fixed if f]
 
     async def _simulate_human_delay(self, uid: Optional[str]) -> None:
         """模拟真人已读+打字延迟（规则 1），并补齐同一买家回复间隔（规则 2）"""
@@ -549,7 +589,78 @@ class AIReplyHandler(BaseHandler):
             "不要改写、不要索要订单号：】\n" + result
         )
 
-    async def _get_ai_reply(self, query: str, context: Context, order_hint: str = "") -> Optional[str]:
+    # KB 预取：所有消息都先与客服知识库比对，有命中则按知识库回答，无命中走 LLM 自主路径。
+    # 背景：glm-4-flash 在 tool_choice="auto" 下对"看起来像常识"的政策问题（7天无理由、
+    # 保修期限、发货时效）会漏调 search_customer_service_knowledge，直接用预训练答案，
+    # 与店铺真实政策冲突。故在调 LLM 前主动按整句查 KB 并注入命中条目。
+    async def _prefetch_kb_if_needed(
+        self, metadata: Dict[str, Any], text: str
+    ) -> str:
+        """客服知识库主动比对（全量预取）。
+
+        对每条用户消息都执行一次 KB 检索：
+        - 有命中（enabled 的客服知识条目）→ 注入为「系统已查证的客服知识」，LLM 严格据此回答；
+        - 无命中 → 返回空串，走 LLM 自主路径（不增延迟、不误导上下文）。
+
+        返回注入给 LLM 的提示串；无有效关键词、无命中或查证失败时返回空串。
+        """
+        content = (text or "").strip()
+        if not content:
+            return ""
+
+        shop_id = metadata.get("shop_id")
+        if not shop_id:
+            return ""
+
+        try:
+            from database.knowledge_service import KnowledgeService
+            from core.di_container import container
+            ks = container.get(KnowledgeService)
+        except Exception as e:
+            self.logger.warning(f"获取 KnowledgeService 失败，跳过 KB 比对: {type(e).__name__}: {e}")
+            return ""
+
+        # 关键防误注入：search_knowledge 在分词全为单字（如"在吗""你好呀"）时会回退
+        # 返回「最新 N 条」而非真正命中，导致无关消息也注入 KB 内容。此处自检：
+        # 无 ≥2 字关键词时不查询，直接走 LLM 自主路径。
+        try:
+            import jieba
+            words = [w.strip() for w in jieba.cut_for_search(content) if len(w.strip()) >= 2]
+        except Exception:
+            words = [w for w in content if len(w.strip()) >= 2]
+        if not words:
+            return ""
+
+        try:
+            result = await asyncio.to_thread(
+                ks.search_knowledge,
+                shop_id=int(shop_id),
+                query=content,
+                limit=3,
+            )
+        except Exception as e:
+            self.logger.warning(f"KB 比对异常，降级走 LLM 自主调用: {type(e).__name__}: {e}")
+            return ""
+
+        cs_hits = result.get("customer_service_knowledge") or []
+        # search_knowledge 内部已过滤 enabled=True，这里再保险
+        enabled_hits = [cs for cs in cs_hits if getattr(cs, "enabled", True)]
+        if not enabled_hits:
+            return ""
+
+        lines = ["【系统已比对客服知识库，命中的店铺政策如下，请严格依据下方条目回答，不要用预训练通用知识编造政策】"]
+        for i, cs in enumerate(enabled_hits, 1):
+            title = (getattr(cs, "title", "") or "").replace("<", "＜").replace(">", "＞")
+            content_text = (getattr(cs, "content", "") or "").replace("<", "＜").replace(">", "＞")
+            # 单条截断 300 字，避免上下文膨胀
+            if len(content_text) > 300:
+                content_text = content_text[:300] + "…"
+            lines.append(f"{i}. {title}")
+            lines.append(f"   {content_text}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    async def _get_ai_reply(self, query: str, context: Context, order_hint: str = "", kb_hint: str = "") -> Optional[str]:
         """获取AI回复
 
         Args:
@@ -560,10 +671,12 @@ class AIReplyHandler(BaseHandler):
             return None
 
         effective_query = query
+        # 优先合并 KB 预取结果（售后政策等），再合并订单数据；
+        # 二者皆为系统已查证的「已知事实」，LLM 直接据此回复即可。
+        if kb_hint:
+            effective_query = f"{query}\n\n{kb_hint}"
         if order_hint:
-            # 把系统已查证的订单数据作为「已知事实」注入，让 LLM 直接据此回复，
-            # 避免其漏选工具或编造状态。
-            effective_query = f"{query}\n\n{order_hint}"
+            effective_query = f"{effective_query}\n\n{order_hint}"
 
         try:
             # 优先使用异步接口，其次回退到同步接口
@@ -584,11 +697,28 @@ class AIReplyHandler(BaseHandler):
             return None
 
     def _clean_text(self, text: str) -> str:
-        """需求二：移除所有中英文句号、逗号、问号、分号，使回复更简洁自然"""
+        """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""
         if not text:
             return text
         import re
-        return re.sub(r'[，,。.；;？?！!]', '', text)
+        # 先保护小数点数字（如 1.5、2.5、3.14），避免被后续清洗吞掉
+        protected = text
+        placeholders = []
+
+        def _protect_decimal(m):
+            placeholders.append(m.group(0))
+            return f"\x00DEC{len(placeholders)-1}\x00"
+
+        protected = re.sub(r'(?<=\d)\.(?=\d)', _protect_decimal, protected)
+
+        # 清洗句末标点（含英文句号，小数点已在上方保护）
+        cleaned = re.sub(r'[，,。.；;？?！!]', '', protected)
+
+        # 恢复小数点
+        for i, original in enumerate(placeholders):
+            cleaned = cleaned.replace(f"\x00DEC{i}\x00", original)
+
+        return cleaned
 
     async def _send_reply(self, context: Context, reply: str, metadata: Dict[str, Any]) -> bool:
         """发送回复，并校验发送结果业务码（规则 5）"""

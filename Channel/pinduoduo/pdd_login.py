@@ -159,16 +159,17 @@ class PDDLogin():
     ]
 
     # 本地浏览器可执行文件的常见安装位置，用于显式定位（channel 方式在部分安装
-    # 下会找不到）。按优先级：Chrome > Edge。
+    # 下会找不到）。按优先级：Edge > Chrome。Edge 为 Windows 自带，作为首选可
+    # 绕过部分机器上 Chrome 自动更新后与 Playwright 版本失配导致的启动挂死。
     _BROWSER_PATHS = [
-        # Google Chrome
+        # Microsoft Edge（Windows 自带，优先）
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        # Google Chrome（兜底）
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         # 用户级安装
         r"{localappdata}\Google\Chrome\Application\chrome.exe",
-        # Microsoft Edge（Windows 自带）
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ]
 
     @staticmethod
@@ -212,13 +213,18 @@ class PDDLogin():
         全部失败抛出明确错误，提示用户安装。
         """
         exe_path, channel = self._resolve_browser_path()
+        if exe_path:
+            self.logger.info(f"探测到本地浏览器: {channel} -> {exe_path}")
+        else:
+            self.logger.warning("未探测到本地浏览器 exe，将依次尝试 channel / CDP / 自带 Chromium")
         attempts = []
 
         # 启动前清理上次崩溃可能残留的 profile 锁，避免浏览器检测到
         # "profile 被占用" 而秒退（本仓库历史上存在 Edge 秒退问题）
         self._clean_profile_locks(user_data_dir)
 
-        # 1) 用探测到的真实路径启动本地浏览器（比 channel 更可靠）
+        # 1) 用探测到的真实路径启动本地浏览器（比 channel 更可靠）。
+        #    timeout 显式限制单次启动等待，避免坏浏览器无限挂死拖垮整个回退链。
         if exe_path:
             try:
                 return await playwright.chromium.launch_persistent_context(
@@ -226,29 +232,35 @@ class PDDLogin():
                     executable_path=exe_path,
                     headless=headless,
                     args=self._LAUNCH_ARGS,
+                    timeout=30000,
                 )
             except Exception as e:
-                attempts.append(f"{channel}({exe_path}): error_type={type(e).__name__}")
-                self.logger.warning(f"启动本地浏览器 {channel} 失败: {type(e).__name__}")
+                attempts.append(f"{channel}({exe_path}): {type(e).__name__}: {e}")
+                self.logger.warning(f"启动本地浏览器 {channel} 失败: {type(e).__name__}: {e}")
 
-        # 2) 回退：channel 方式（路径探测未命中时的兜底）。
-        # 级 1 已用 executable_path 试过同一浏览器（pipe 模式同样秒退），跳过。
-        tried_channel = channel if exe_path else None
-        for ch in ("chrome", "msedge"):
-            if ch == tried_channel:
-                continue
-            try:
-                return await playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    channel=ch,
-                    headless=headless,
-                    args=self._LAUNCH_ARGS,
-                )
-            except Exception as e:
-                attempts.append(f"{ch}(channel): error_type={type(e).__name__}")
-                self.logger.warning(f"启动本地浏览器 {ch} 失败: {type(e).__name__}")
+                # 1a) 浏览器 exe 存在但 pipe 模式失败（常见于 Edge 高版本），
+                #     直接走 CDP 端口回退，不再试 channel 方式（会多耗 30s 且大概率也失败）。
+                handle = await self._launch_via_cdp(playwright, exe_path, user_data_dir, headless)
+                if handle is not None:
+                    return handle
+                attempts.append(f"{channel}(cdp-over-port): 启动后未就绪")
 
-        # 3) 回退：手动启动浏览器用 remote-debugging-port，再 connect_over_cdp。
+        # 2) 回退：channel 方式（仅当路径探测未命中任何浏览器时才走这里）。
+        if not exe_path:
+            for ch in ("msedge", "chrome"):
+                try:
+                    return await playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        channel=ch,
+                        headless=headless,
+                        args=self._LAUNCH_ARGS,
+                        timeout=30000,
+                    )
+                except Exception as e:
+                    attempts.append(f"{ch}(channel): {type(e).__name__}: {e}")
+                    self.logger.warning(f"启动本地浏览器 {ch} 失败: {type(e).__name__}: {e}")
+
+        # 3) 最后回退：Playwright 自带 Chromium（若已安装）
         # 部分电脑 Edge 在 Playwright 的 --remote-debugging-pipe 下启动后秒退
         # （Target page, context or browser has been closed），改用端口调试可绕过。
         if exe_path:
@@ -263,10 +275,11 @@ class PDDLogin():
                 user_data_dir,
                 headless=headless,
                 args=self._LAUNCH_ARGS,
+                timeout=30000,
             )
         except Exception as e:
-            attempts.append(f"chromium(bundled): error_type={type(e).__name__}")
-            self.logger.warning(f"启动 Playwright Chromium 失败: {type(e).__name__}")
+            attempts.append(f"chromium(bundled): {type(e).__name__}: {e}")
+            self.logger.warning(f"启动 Playwright Chromium 失败: {type(e).__name__}: {e}")
 
         raise RuntimeError(
             "未找到可用的浏览器。尝试过的方案：\n  - " +

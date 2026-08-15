@@ -54,6 +54,9 @@ a = Analysis(
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
         (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
+        # 配置文件：打包后 exe 首次运行会自动拷贝到 %LOCALAPPDATA%\Agent-Customer\，
+        # 保证用户配置（webhook / 店铺 prompt / 意图阈值等）随包生效。
+        (str(PROJECT_ROOT / "config.json"), "."),
     ] + _pw_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===

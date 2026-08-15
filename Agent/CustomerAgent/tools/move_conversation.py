@@ -21,6 +21,11 @@ class TransferConversationParams(BaseModel):
     user_id: Optional[Union[str, int]] = Field(default=None, description="用户ID（账号ID）")
     recipient_uid: Optional[Union[str, int]] = Field(default=None, description="接收转接的用户UID")
     shop_name: Optional[str] = Field(default=None, description="店铺名称")
+    reason: Optional[str] = Field(
+        default=None,
+        description="转人工原因（用于通知商家，如『知识库未覆盖：用户咨询XXX，建议补充知识库』）。"
+        "由 AI 在知识库无覆盖时填写，以便商家知道该补充哪条知识。留空则用默认值。",
+    )
 
 
 def _is_main_account(shop_id, user_id) -> bool:
@@ -105,12 +110,16 @@ def transfer_conversation(
     将当前会话转接给人工客服。
 
     Args:
-        params: 转接参数
-        reason: 转人工原因（用于通知文案）
+        params: 转接参数（reason 字段可由 AI 填写，提示商家补充知识库）
+        reason: 转人工原因（用于通知文案），当 params.reason 为空时生效
         send_notification: 是否发送企业微信通知
         last_message: 触发转人工的用户消息
     """
     try:
+        # 优先使用 AI 在知识库无覆盖时填写的具体原因（如『知识库未覆盖：XXX』），
+        # 该原因进入企业微信通知，提示商家补充对应知识库条目。
+        effective_reason = (params.reason or "").strip() or reason
+
         if not all([params.shop_id, params.user_id, params.recipient_uid]):
             return "转接失败：缺少必要的会话信息"
 
@@ -122,7 +131,7 @@ def transfer_conversation(
             )
             _mark_handoff(params)
             if send_notification:
-                _notify_handoff(params, reason, last_message)
+                _notify_handoff(params, effective_reason, last_message)
             return "会话转接成功"
 
         sender = get_sender()
@@ -143,7 +152,7 @@ def transfer_conversation(
                     # 转接成功后标记会话，防止 AI 抢答
                     _mark_handoff(params)
                     if send_notification:
-                        _notify_handoff(params, reason, last_message)
+                        _notify_handoff(params, effective_reason, last_message)
                     return "会话转接成功"
                 else:
                     logger.warning(f"会话转接失败: transfer_result={transfer_result}")
