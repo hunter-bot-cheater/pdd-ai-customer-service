@@ -457,6 +457,11 @@ class KnowledgeService:
                 # minimum_score 过滤掉只命中 1 个词（甚至 0 词但进了 dict 的）的噪音条目，
                 # 避免"商品""使用"等通用词把无关 KB 拉进来。
                 sorted_hits = [h for h in sorted_hits if h["score"] >= minimum_score]
+                # 降级兜底：若 score≥N 无结果（如用户问"可以裁剪吗"只命中"裁剪"一个关键词，
+                # score=1 < 默认的 2），放宽到 score≥1 重试，避免精准单关键词匹配被误杀。
+                if not sorted_hits and minimum_score > 1:
+                    _all = sorted(scored_results.values(), key=lambda x: (x["score"], x["obj"].id), reverse=True)
+                    sorted_hits = [h for h in _all if h["score"] >= 1]
                 result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
 
                 # 产品知识也按类似 OR 逻辑
