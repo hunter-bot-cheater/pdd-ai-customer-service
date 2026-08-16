@@ -416,13 +416,26 @@ class KnowledgeService:
                     result["product_knowledge"] = [product]
             # 如果有关键词查询
                 elif query and query.strip():
+                    # 寒暄/纯打招呼黑名单：这些消息不含实质问题，不查 KB，
+                    # 避免"有人吗""在吗""在不在"等通过 CJK 单字兜底误命中 KB。
+                    _GREETING_PATTERNS = (
+                        "有人吗", "在吗", "在不在", "在的", "你好", "您好",
+                        "嗨", "hi", "hello", "在呢", "在的亲", "亲在",
+                    )
+                    q_clean = query.strip()
+                    if q_clean.lower() in {p.lower() for p in _GREETING_PATTERNS} or \
+                       re.match(r'^[在有你嗨好亲himelo]+[吗呢啊哦呀吧]*$', q_clean):
+                        return result
+
                     # 分词
-                    words = [w.strip() for w in jieba.cut_for_search(query.strip()) if len(w.strip()) >= 2]
+                    words = [w.strip() for w in jieba.cut_for_search(q_clean) if len(w.strip()) >= 2]
+                    is_cjk_fallback = False
                     if not words:
                         # jieba 切不出 ≥2 字词（如纯数字口语"4米送2米吧""送不送"），
                         # 退回 CJK 单字匹配，避免这类短口语完全召回不到 KB。
                         # 仅取汉字并去重，排除数字/标点（数字"2"会误命中"24小时"等）。
-                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', query)})
+                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', q_clean)})
+                        is_cjk_fallback = True
 
                 # OR 逻辑：任一关键词命中即返回（更符合"按关键词模糊匹配"的心智）
                 # 旧版用 AND，导致带寒暄词的消息（如"老板 支持7天无理由吗"含"老板"）根本无法命中。
@@ -459,12 +472,18 @@ class KnowledgeService:
                 )
                 # minimum_score 过滤掉只命中 1 个词（甚至 0 词但进了 dict 的）的噪音条目，
                 # 避免"商品""使用"等通用词把无关 KB 拉进来。
-                sorted_hits = [h for h in sorted_hits if h["score"] >= minimum_score]
+                # CJK 单字兜底模式（is_cjk_fallback）下提高门槛：单字太通用，
+                # 要求至少 3 个不同汉字共现才认为有语义相关性（如"送不送"命中"送"×2
+                # 仍不够，需搭配"米/赠/优"等才能通过；"有人吗"的"有/人/吗"通常凑不齐 3 个）。
+                effective_min = (minimum_score if not is_cjk_fallback else max(minimum_score, 3))
+                sorted_hits = [h for h in sorted_hits if h["score"] >= effective_min]
                 # 降级兜底：若 score≥N 无结果（如用户问"可以裁剪吗"只命中"裁剪"一个关键词，
                 # score=1 < 默认的 2），放宽到 score≥1 重试，避免精准单关键词匹配被误杀。
-                if not sorted_hits and minimum_score > 1:
+                # CJK 兜底模式下降级门槛也相应提高到 2（单字至少命中 2 个不同汉字）。
+                if not sorted_hits and effective_min > 1:
+                    fallback_min = (1 if not is_cjk_fallback else 2)
                     _all = sorted(scored_results.values(), key=lambda x: (x["score"], x["obj"].id), reverse=True)
-                    sorted_hits = [h for h in _all if h["score"] >= 1]
+                    sorted_hits = [h for h in _all if h["score"] >= fallback_min]
                 result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
 
                 # 产品知识也按类似 OR 逻辑
