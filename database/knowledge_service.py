@@ -378,7 +378,7 @@ class KnowledgeService:
         query: Optional[str] = None,
         goods_id: Optional[int] = None,
         limit: int = 10,
-        minimum_score: int = 2,
+            minimum_score: int = 2,
     ) -> Dict[str, Any]:
         """
         检索知识库
@@ -388,9 +388,10 @@ class KnowledgeService:
             query: 关键词查询，可为空
             goods_id: 精确查询特定商品，可为空
             limit: 返回结果最大数量
-            minimum_score: 最低命中分（命中词数）。过滤掉单关键词偶然命中的噪音条目，
-                例如用户问"床品四件套"时，不会因 KB 退换货政策含"商品"二字就被拉出来。
-                默认 2：要求至少 2 个 ≥2 字词共现；单关键词查询可传 1。
+            minimum_score: 最低命中分（加权分，非纯词数）。标题命中 +2、正文命中 +1。
+                过滤掉单关键词偶然命中的噪音条目，例如用户问"床品四件套"时，
+                不会因 KB 退换货政策含"商品"二字就被拉出来。默认 2：要求加权分 ≥ 2
+                （等价于至少 1 个标题命中，或 2 个正文命中）；单关键词查询可传 1。
 
         Returns:
             {
@@ -462,7 +463,14 @@ class KnowledgeService:
                             cs.id,
                             {"obj": cs, "score": 0},
                         )
-                        entry["score"] += 1
+                        # 标题命中权重高于正文命中：标题是 KB 的主题词，正文是长文本
+                        # 易混入"面料""质量"等通用词。标题命中 +2、正文命中 +1，
+                        # 让"裁剪质量"这类查询稳定命中标题含"裁剪/质量"的条目，
+                        # 而非被正文恰好含这两个词的退换货政策抢走（语义错配防护）。
+                        if word in cs.title:
+                            entry["score"] += 2
+                        else:
+                            entry["score"] += 1
 
                 # 按 score DESC 排序（命中词越多越靠前），再按 id 倒序兜底
                 sorted_hits = sorted(
@@ -484,7 +492,11 @@ class KnowledgeService:
                     fallback_min = (1 if not is_cjk_fallback else 2)
                     _all = sorted(scored_results.values(), key=lambda x: (x["score"], x["obj"].id), reverse=True)
                     sorted_hits = [h for h in _all if h["score"] >= fallback_min]
-                result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
+                # 注入上限：客服知识最多返回 top 3 条。KB 条目少时影响不大，
+                # 但 KB 增长到几十上百条后，命中词共现会让弱相关条目进入列表，
+                # 截断可避免 LLM 收到过多噪音、答非所问。
+                _CS_KB_INJECT_CAP = 3
+                result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:min(limit, _CS_KB_INJECT_CAP)]]
 
                 # 产品知识也按类似 OR 逻辑
                 scored_products: Dict[int, Dict[str, Any]] = {}
