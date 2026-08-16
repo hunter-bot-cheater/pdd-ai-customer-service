@@ -685,8 +685,73 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
 
 
 # ============================================================================
-# 测试 5：售后关键词触发转人工（规则 6 静默处理）
+# 测试 4.5：无法回答（LLM 输出"我不太清楚"等推脱话）→ 强制转人工，不发给买家
 # ============================================================================
+
+class TestCannotAnswerTransfers(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        notify_tracker.clear("shop1:buyer1")
+        _zero_ai_reply_delays()
+        _set_inside_business_hours()
+        # 必须在构造 handler 之前关闭合并：_coalesce_enabled 在 __init__ 时按当时 config 缓存，
+        # 若先构造再设 False，handler 仍会缓冲消息、永不 flush，bot 不会被调用。
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
+        self.bot = MockBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        self.sender = FakeSender()
+        self._sender_patch = mock.patch.object(mc_module, "get_sender", return_value=self.sender)
+        self._sender_patch.start()
+        # 发送路径（_send_reply）走 bridge.sender.get_sender，需同步替换为同一 FakeSender
+        self._bridge_sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
+        self._bridge_sender_patch.start()
+        self.capture = CaptureWebhook()
+        self._notify_patch = mock.patch.object(notify_module, "send_wechat_notification_sync", self.capture.send)
+        self._notify_patch.start()
+        # 隔离意图路由，确保"无法回答"判定只来自兜底拦截、而非意图分类
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
+
+    def tearDown(self):
+        self._sender_patch.stop()
+        self._bridge_sender_patch.stop()
+        self._notify_patch.stop()
+        self._intent_patch.stop()
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
+        _restore_ai_reply_delays()
+
+    async def test_cannot_answer_reply_forces_transfer(self):
+        """LLM 输出『我不太清楚』→ 强制静默转人工，不把推脱话发给买家。"""
+        self.bot.reply_text = "亲，这个我不太清楚呢"
+        context = make_context("你们家这款面料成分是什么")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        # 没有把推脱话术发给买家
+        self.assertEqual(self.sender.calls["send_text"], [])
+        # 已转人工（调用了转接 API 或至少通知了人工）
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        self.assertIn("AI无法回答→转人工", self.capture.messages[0])
+
+    async def test_normal_reply_not_transferred(self):
+        """正常有帮助的回复 → 正常发送，不转人工（无 false positive）。"""
+        self.bot.reply_text = "亲，这款有红色和蓝色两种哦"
+        context = make_context("有什么颜色")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["send_text"]), 1)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+
+    async def test_clarifying_question_not_transferred(self):
+        """澄清反问（不含『我/呢』等推脱标记）→ 不误转人工。"""
+        self.bot.reply_text = "亲，不太清楚您想要哪个颜色呢"
+        context = make_context("有颜色可选吗")
+        ok = await self.handler.handle(context, make_metadata())
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["send_text"]), 1)
+        self.assertEqual(self.sender.calls["transfer_to_cs"], [])
+
+
+
 
 class TestKeywordHandler(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

@@ -37,6 +37,19 @@ class AIReplyHandler(BaseHandler):
         "什么时候能发", "几天能发", "发货快不快", "物流快慢", "发货快不", "发货快么",
     )
 
+    # 用户要求：无法回答一律直接转人工，禁止说"我不太清楚"等推脱话。
+    # 兜底拦截：LLM 未调用 transfer_conversation 却输出下列推脱话术时，
+    # 强制静默转人工，不把推脱话发给买家。模式特意保守，仅匹配明确"答不上来"的措辞，
+    # 避免误伤正常回复（如"不太清楚您想要哪个颜色"是反问澄清，不含"我/呢"等标记，不拦截）。
+    _CANNOT_ANSWER_PATTERNS = (
+        "我不太清楚", "我不大清楚", "我不太懂", "我不大懂",
+        "不太清楚呢", "不清楚呢", "不大清楚呢",
+        "回答不了", "没法回答", "不能回答", "帮不了您", "帮不到您",
+        "没法给您准确", "无法给您准确", "给您准确答复", "没法给您确切",
+        "这块我没法", "这个我回答不来", "我回答不上来",
+        "我确实不知道", "我真的不知道", "不太了解这方面", "这块我不太了解",
+    )
+
     def __init__(self, bot: Bot = None, auto_reply_types: set = None):
         super().__init__("AIReplyHandler")
         # 从 DI 容器获取 CustomerAgent 单例（如果未传入）
@@ -319,6 +332,19 @@ class AIReplyHandler(BaseHandler):
             if not reply:
                 self.logger.warning("AI回复生成失败，使用备用回复")
                 return await self._handle_fallback(context, metadata)
+
+            # 2.5 兜底拦截：用户要求"无法回答直接转人工、禁止说'我不太清楚'"。
+            #     若 LLM 未真正转人工却输出推脱话术，强制静默转人工，绝不能把推脱话发给买家。
+            if self._is_cannot_answer(reply):
+                session_key = f"{metadata.get('shop_id')}:{metadata.get('from_uid')}"
+                if SessionState().is_handoff(session_key):
+                    self.logger.warning("LLM 输出推脱话术，但会话已转人工，直接拦截不发送")
+                    return True
+                self.logger.warning("LLM 输出推脱话术（疑似无法回答），强制静默转人工")
+                return await self._transfer_by_intent(
+                    context, metadata, processed_content or "",
+                    reason="AI无法回答→转人工",
+                )
 
             # 3. 规则 3: 拆分为不超过 max_message_len 字的短消息
             messages = self._split_reply(reply)
@@ -731,8 +757,12 @@ class AIReplyHandler(BaseHandler):
             return await self._transfer_by_intent(context, metadata, processed_content)
         return False
 
-    async def _transfer_by_intent(self, context: Context, metadata: Dict[str, Any], last_message: str) -> bool:
-        """执行意图触发的转人工（语义层），保留营业时间/子账号静默规则。"""
+    async def _transfer_by_intent(self, context: Context, metadata: Dict[str, Any], last_message: str, reason: str = "AI意图识别触发转人工") -> bool:
+        """执行意图触发的转人工（语义层），保留营业时间/子账号静默规则。
+
+        Args:
+            reason: 转人工原因，进入企业微信通知文案（如"AI无法回答→转人工"）。
+        """
         shop_id = metadata.get('shop_id')
         user_id = metadata.get('user_id')
         from_uid = metadata.get('from_uid')
@@ -752,7 +782,7 @@ class AIReplyHandler(BaseHandler):
         )
         try:
             result = await asyncio.to_thread(
-                transfer_conversation, params, "AI意图识别触发转人工", True, last_message
+                transfer_conversation, params, reason, True, last_message
             )
         except Exception as e:
             self.logger.error(f"意图转人工调用异常: {e}")
@@ -955,6 +985,14 @@ class AIReplyHandler(BaseHandler):
                 f"AI Bot调用失败: error_type={type(e).__name__}"
             )
             return None
+
+    def _is_cannot_answer(self, reply: str) -> bool:
+        """判断 LLM 回复是否为『答不上来』的推脱话术（需强制转人工）。"""
+        if not reply:
+            return False
+        # 去掉空格与波浪号噪声，降低规避匹配的可能
+        r = reply.replace(" ", "").replace("~", "").replace("～", "")
+        return any(pat in r for pat in self._CANNOT_ANSWER_PATTERNS)
 
     def _clean_text(self, text: str) -> str:
         """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""
