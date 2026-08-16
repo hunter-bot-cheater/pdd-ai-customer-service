@@ -107,7 +107,11 @@ config_base = {
         "max_message_len": 25,
         # 单次回复最多句数（按句号/问号/感叹号切分）。配合 max_message_len 让回复更像真人客服。
         "uid_min_interval": 4,
-        "max_sentences": 4
+        "max_sentences": 4,
+        # 消息合并：同一买家短时间连发多条消息时，缓冲后合并为一条一次性回答
+        # （避免每条独立回复导致不同话题穿插、看起来像自言自语）。
+        "enable_coalesce": True,
+        "coalesce_window_sec": 6
     },
     "llm": {
         "model_name": "",

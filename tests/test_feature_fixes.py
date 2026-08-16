@@ -1811,3 +1811,84 @@ class TestKeywordCategoryDB(unittest.TestCase):
         all_kw = {k["keyword"]: k["category"] for k in self.db.get_all_keywords()}
         self.assertEqual(all_kw.get("退款"), "after_sale")
         self.assertEqual(all_kw.get("转人工"), "transfer")
+
+
+# ============================================================================
+
+class TestMessageCoalescing(unittest.IsolatedAsyncioTestCase):
+    """消息合并：同一买家短时间连发多条消息应合并为一条处理"""
+
+    def setUp(self):
+        SessionState().clear_handoff("shop1:buyer1")
+        _zero_ai_reply_delays()
+        _set_inside_business_hours()
+        self.bot = MockBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        # 开启合并（默认关闭，测试需显式开启）
+        self.handler._coalesce_enabled = True
+        # 缩短防抖窗口到 0.3 秒加速测试
+        self.handler._COALESCE_WINDOW_SEC = 0.3
+        self.sender = FakeSender()
+        self._sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
+        self._intent_patch = _patch_intent_to_consult()
+        self._sender_patch.start()
+        self._intent_patch.start()
+
+    def tearDown(self):
+        self._sender_patch.stop()
+        self._intent_patch.stop()
+        # 清理残留缓冲/定时器
+        self.handler._msg_buffers.clear()
+        for t in self.handler._coalesce_timers.values():
+            if not t.done():
+                t.cancel()
+        self.handler._coalesce_timers.clear()
+        _restore_ai_reply_delays()
+
+    async def test_two_messages_coalesced_into_one_reply(self):
+        """连发两条消息 → 合并为一条查询，LLM 只被调用一次"""
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            ctx1 = make_context("裁剪质量怎么样")
+            ok1 = await self.handler.handle(ctx1, make_metadata())
+            self.assertTrue(ok1)
+
+            ctx2 = make_context("会起球吗")
+            ok2 = await self.handler.handle(ctx2, make_metadata())
+            self.assertTrue(ok2)
+
+            # 等待防抖窗口到期 + 处理完成
+            await asyncio.sleep(0.8)
+
+        # LLM 应该只收到一次调用（合并后的文本包含两个问题）
+        self.assertEqual(len(self.bot.calls), 1)
+        merged_input = self.bot.calls[0][0]
+        self.assertIn("裁剪质量", merged_input)
+        self.assertIn("起球", merged_input)
+
+    async def test_trivial_message_appended_to_previous(self):
+        """极短消息（"吗"）拼接到上一条末尾而非独立成条"""
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            ctx1 = make_context("会起球")
+            await self.handler.handle(ctx1, make_metadata())
+
+            ctx2 = make_context("吗")
+            await self.handler.handle(ctx2, make_metadata())
+
+            await asyncio.sleep(0.8)
+
+        # LLM 收到的文本应该包含 "会起球吗"（拼接后）
+        self.assertEqual(len(self.bot.calls), 1)
+        merged_input = self.bot.calls[0][0]
+        self.assertIn("会起球吗", merged_input)
+
+    async def test_coalesce_disabled_falls_back_to_sequential(self):
+        """合并关闭时恢复原有逐条处理行为"""
+        self.handler._coalesce_enabled = False
+        with mock.patch("bridge.sender.get_sender", return_value=self.sender):
+            ctx1 = make_context("第一条")
+            ok1 = await self.handler.handle(ctx1, make_metadata())
+            self.assertTrue(ok1)
+
+            # 不需要等定时器，同步返回
+            self.assertEqual(len(self.bot.calls), 1)
+            self.assertIn("第一条", self.bot.calls[0][0])

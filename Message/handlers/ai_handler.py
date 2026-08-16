@@ -75,6 +75,13 @@ class AIReplyHandler(BaseHandler):
         # 保证同一买家的消息严格按到达顺序处理，前一条回复发完才处理下一条。
         self._buyer_locks: Dict[str, asyncio.Lock] = {}
 
+        # 消息合并缓冲：key=lock_key, value=[(context, metadata), ...]
+        self._msg_buffers: Dict[str, list] = {}
+        # 防抖定时器：key=lock_key, value=asyncio.Task
+        self._coalesce_timers: Dict[str, asyncio.Task] = {}
+        # 合并开关（默认关闭；生产环境通过 ai_reply.enable_coalesce=true 开启）
+        self._coalesce_enabled = bool(get_config("ai_reply.enable_coalesce", False))
+
     def _get_buyer_lock(self, key: str) -> asyncio.Lock:
         """获取（或创建）同一买家串行锁。单事件循环内安全。"""
         lock = self._buyer_locks.get(key)
@@ -82,6 +89,13 @@ class AIReplyHandler(BaseHandler):
             lock = asyncio.Lock()
             self._buyer_locks[key] = lock
         return lock
+
+    # ===== 消息合并（防连发逐条回复）=====
+    # 同一买家短时间内连发多条消息（如"裁剪质量怎么样"+"会起球吗"），
+    # 不应每条独立生成回复再分条发送，导致不同话题的回复穿插、看起来像自言自语。
+    # 改为缓冲 + 防抖：窗口期内的新消息追加到缓冲区，窗口到期后合并为一条处理。
+    _COALESCE_WINDOW_SEC = 6.0  # 秒，同一买家消息合并窗口
+    _TRIVIAL_MSG_MAX_LEN = 2   # 极短消息阈值：清理后 ≤ 此值视为前一条的尾缀/补发
 
     def can_handle(self, context: Context) -> bool:
         """检查是否可以处理该消息"""
@@ -129,16 +143,108 @@ class AIReplyHandler(BaseHandler):
             self.logger.warning(f"非营业时间通知发送异常: {e}")
 
     async def handle(self, context: Context, metadata: Dict[str, Any]) -> bool:
-        """处理AI回复（支持分条短消息发送 + 真人时序模拟）"""
-        # 同一买家串行锁：多条消息并发时按到达顺序处理，回复不穿插。
-        # 锁 key 用 shop_id:from_uid；拿不到身份时退化为并发（极端场景可接受）。
+        """处理AI回复（支持消息合并防连发逐条回复 + 分条短消息发送 + 真人时序模拟）"""
         shop_id0 = metadata.get('shop_id')
         from_uid0 = metadata.get('from_uid')
         lock_key = f"{shop_id0}:{from_uid0}" if shop_id0 and from_uid0 else None
+
         if lock_key:
+            # ===== 消息合并：同一买家短时间连发的消息缓冲后一次性处理 =====
+            if self._coalesce_enabled:
+                return await self._coalesce_and_handle(lock_key, context, metadata)
+            # 合并关闭时走原有同步路径
             async with self._get_buyer_lock(lock_key):
                 return await self._handle_unlocked(context, metadata)
         return await self._handle_unlocked(context, metadata)
+
+    async def _coalesce_and_handle(self, lock_key: str, context: Context, metadata: Dict[str, Any]) -> bool:
+        """将消息加入买家缓冲区，防抖窗口到期后合并处理。
+
+        行为：
+        - 首条消息：启动防抖定时器（_COALESCE_WINDOW_SEC 秒），消息入缓冲。
+        - 窗口内新消息：追加到缓冲区，重置定时器（延长等待）。
+        - 极短消息（≤2字）：视为前一条的尾缀/补发，拼接到上一条末尾。
+        - 定时器到期：取全部缓冲消息，合并文本，走 _handle_unlocked 一次处理。
+        """
+        raw_text = (context.content or "").strip()
+        cleaned = self._clean_text(raw_text)
+
+        # 极短消息（"吗""呢""好"等）：拼接上一条而非独立成条
+        is_trivial = len(cleaned) <= self._TRIVIAL_MSG_MAX_LEN
+
+        buf = self._msg_buffers.get(lock_key)
+        if buf is not None:
+            # 缓冲区已有消息 → 追加
+            if is_trivial and buf:
+                # 拼接到上一条消息末尾（用户打字分段发送）
+                last_ctx, last_meta = buf[-1]
+                last_ctx.content = (last_ctx.content or "") + raw_text
+                self.logger.debug(f"极短消息拼接: '{raw_text}' → 上一条末尾 (key={lock_key})")
+            else:
+                buf.append((context, metadata))
+                self.logger.debug(f"消息追加到缓冲区: '{raw_text[:20]}' (key={lock_key}, 共{len(buf)}条)")
+
+            # 重置防抖定时器
+            self._reset_coalesce_timer(lock_key)
+            return True  # 已缓冲，稍后统一处理
+
+        # 首条消息 → 创建缓冲区 + 启动定时器
+        self._msg_buffers[lock_key] = [(context, metadata)]
+        self._start_coalesce_timer(lock_key)
+        return True  # 已缓冲，定时器到期后处理
+
+    def _start_coalesce_timer(self, lock_key: str) -> None:
+        """启动/重启防抖定时器。到期后触发合并处理。"""
+        # 取消旧定时器（如果有）
+        old = self._coalesce_timers.pop(lock_key, None)
+        if old and not old.done():
+            old.cancel()
+
+        async def _on_coalesce_window_expired():
+            try:
+                await asyncio.sleep(self._COALESCE_WINDOW_SEC)
+            except asyncio.CancelledError:
+                return  # 被新消息重置，忽略
+            await self._flush_coalesced_messages(lock_key)
+
+        self._coalesce_timers[lock_key] = asyncio.create_task(_on_coalesce_window_expired())
+
+    def _reset_coalesce_timer(self, lock_key: str) -> None:
+        """重置防抖定时器（等效于取消旧的 + 启动新的）。"""
+        self._start_coalesce_timer(lock_key)
+
+    async def _flush_coalesced_messages(self, lock_key: str) -> None:
+        """防抖窗口到期：取出缓冲区所有消息，合并处理后清空。"""
+        buf = self._msg_buffers.pop(lock_key, None)
+        self._coalesce_timers.pop(lock_key, None)
+        if not buf:
+            return
+
+        self.logger.info(f"消息合并处理: key={lock_key}, 缓冲{len(buf)}条消息")
+
+        # 合并多条消息文本为一条（换行分隔，保留 LLM 对多问的感知能力）
+        merged_contexts = []
+        merged_texts = []
+        for ctx, meta in buf:
+            text = (ctx.content or "").strip()
+            if text:
+                merged_texts.append(text)
+                merged_contexts.append((ctx, meta))
+
+        if not merged_texts:
+            return
+
+        # 用第一条消息的 context/metadata 作为主上下文（含会话信息、shop_id 等），
+        # 但把合并后的文本替换进去。
+        primary_ctx, primary_meta = merged_contexts[0]
+        merged_text = "\n".join(merged_texts)
+        primary_ctx.content = merged_text
+
+        self.logger.info(f"合并后文本({len(merged_texts)}条→1条): {merged_text[:80]}...")
+
+        # 持有串行锁处理（保证与直接调用 _handle_unlocked 的互斥）
+        async with self._get_buyer_lock(lock_key):
+            await self._handle_unlocked(primary_ctx, primary_meta)
 
     async def _handle_unlocked(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """处理AI回复（已持有买家串行锁）"""
