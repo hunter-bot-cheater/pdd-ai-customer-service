@@ -465,6 +465,32 @@ class KnowledgeService:
                         candidates[cs.id] = cs
                         term_doc_ids.setdefault(word, set()).add(cs.id)
 
+                # 二次兜底：≥2字词全部未命中任何文档（如"好裁吗"→jieba切出"好裁"
+                # 但KB中无此词），退回CJK单字重试，避免因分词粒度不匹配导致完全漏召回。
+                if not candidates and not is_cjk_fallback:
+                    cjk_words = list({c for c in re.findall(r'[\u4e00-\u9fff]', q_clean)})
+                    if cjk_words:
+                        is_cjk_fallback = True
+                        words = cjk_words
+                        for word in words:
+                            stmt_word = (
+                                select(CustomerServiceKnowledge)
+                                .where(
+                                    and_(
+                                        CustomerServiceKnowledge.shop_id == db_shop_id,
+                                        CustomerServiceKnowledge.enabled == True,
+                                        or_(
+                                            CustomerServiceKnowledge.title.contains(word),
+                                            CustomerServiceKnowledge.content.contains(word),
+                                        ),
+                                    )
+                                )
+                                .order_by(CustomerServiceKnowledge.created_at.desc())
+                            )
+                            for cs in session.scalars(stmt_word):
+                                candidates[cs.id] = cs
+                                term_doc_ids.setdefault(word, set()).add(cs.id)
+
                 if candidates:
                     # 统计语料规模 N 与平均文档长度，用于 BM25 的 IDF 与长度归一化
                     all_cs = session.scalars(
@@ -517,8 +543,8 @@ class KnowledgeService:
                     if not passed:
                         passed = [h for h in sorted_hits if h["score"] >= 0.03]
                     sorted_hits = passed
-                    # 注入上限：客服知识最多返回 top 3 条，防止 KB 规模化后噪音过多
-                    _CS_KB_INJECT_CAP = 3
+                    # 注入上限：客服知识最多返回 top 2 条，防止 KB 规模化后噪音过多
+                    _CS_KB_INJECT_CAP = 2
                     result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:min(limit, _CS_KB_INJECT_CAP)]]
                 else:
                     result["customer_service_knowledge"] = []
@@ -552,20 +578,11 @@ class KnowledgeService:
                 )
                 result["product_knowledge"] = [it["obj"] for it in sorted_products[:limit]]
             else:
-                # 没有关键词，返回最新的产品知识和客服知识
-                stmt_p = select(ProductKnowledge).where(ProductKnowledge.shop_id == db_shop_id)\
-                    .order_by(ProductKnowledge.created_at.desc())\
-                    .limit(limit)
-                result["product_knowledge"] = list(session.scalars(stmt_p))
-
-                stmt_cs = select(CustomerServiceKnowledge).where(
-                    and_(
-                        CustomerServiceKnowledge.shop_id == db_shop_id,
-                        CustomerServiceKnowledge.enabled == True,
-                    )
-                ).order_by(CustomerServiceKnowledge.created_at.desc())\
-                    .limit(limit)
-                result["customer_service_knowledge"] = list(session.scalars(stmt_cs))
+                # 无关键词或关键词未命中任何知识库条目：不注入 KB，
+                # 避免"好裁吗"等查询因分词粒度不匹配（jieba切出"好裁"但KB中无此词）
+                # 触发旧版「返回全部」兜底导致无关宽度/退换货等信息污染回复。
+                result["product_knowledge"] = []
+                result["customer_service_knowledge"] = []
 
         return result
 
