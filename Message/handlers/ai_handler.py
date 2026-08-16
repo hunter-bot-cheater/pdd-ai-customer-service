@@ -5,6 +5,7 @@ AI回复处理器
 import random
 import asyncio
 import datetime
+import time
 from typing import Dict, Any, Optional, List
 from bridge.context import Context, ContextType
 from .base import BaseHandler
@@ -79,6 +80,11 @@ class AIReplyHandler(BaseHandler):
         self._msg_buffers: Dict[str, list] = {}
         # 防抖定时器：key=lock_key, value=asyncio.Task
         self._coalesce_timers: Dict[str, asyncio.Task] = {}
+        # 合并窗口（秒）：同一买家该时间内的连发消息会被合并。可配置，默认 4 秒。
+        self._coalesce_window = float(get_config("ai_reply.coalesce_window_sec", 4.0))
+        # 合并窗口内"已读"计时起点：收到首条即开始，使已读延迟与窗口并行消耗，
+        # 避免「6秒窗口 + 已读6~8秒 + 打字4~6秒」叠加导致冷启动过慢。
+        self._coalesce_read_starts: Dict[str, float] = {}
         # 合并开关（默认关闭；生产环境通过 ai_reply.enable_coalesce=true 开启）
         self._coalesce_enabled = bool(get_config("ai_reply.enable_coalesce", False))
 
@@ -94,7 +100,6 @@ class AIReplyHandler(BaseHandler):
     # 同一买家短时间内连发多条消息（如"裁剪质量怎么样"+"会起球吗"），
     # 不应每条独立生成回复再分条发送，导致不同话题的回复穿插、看起来像自言自语。
     # 改为缓冲 + 防抖：窗口期内的新消息追加到缓冲区，窗口到期后合并为一条处理。
-    _COALESCE_WINDOW_SEC = 6.0  # 秒，同一买家消息合并窗口
     _TRIVIAL_MSG_MAX_LEN = 2   # 极短消息阈值：清理后 ≤ 此值视为前一条的尾缀/补发
 
     def can_handle(self, context: Context) -> bool:
@@ -190,6 +195,8 @@ class AIReplyHandler(BaseHandler):
 
         # 首条消息 → 创建缓冲区 + 启动定时器
         self._msg_buffers[lock_key] = [(context, metadata)]
+        # 收到首条即开始「已读」计时（语义上此刻视为已读，后续窗口期并行消耗已读延迟）
+        self._coalesce_read_starts[lock_key] = time.monotonic()
         self._start_coalesce_timer(lock_key)
         return True  # 已缓冲，定时器到期后处理
 
@@ -202,7 +209,7 @@ class AIReplyHandler(BaseHandler):
 
         async def _on_coalesce_window_expired():
             try:
-                await asyncio.sleep(self._COALESCE_WINDOW_SEC)
+                await asyncio.sleep(self._coalesce_window)
             except asyncio.CancelledError:
                 return  # 被新消息重置，忽略
             await self._flush_coalesced_messages(lock_key)
@@ -221,6 +228,11 @@ class AIReplyHandler(BaseHandler):
             return
 
         self.logger.info(f"消息合并处理: key={lock_key}, 缓冲{len(buf)}条消息")
+
+        # 计算合并窗口期间已消耗的「已读」时间，传给后续延迟模拟予以扣除，
+        # 避免已读延迟与窗口等待叠加导致总延迟过长（收到首条即开始已读计时）。
+        read_start = self._coalesce_read_starts.pop(lock_key, None)
+        elapsed_read = (time.monotonic() - read_start) if read_start else 0.0
 
         # 合并多条消息文本为一条（换行分隔，保留 LLM 对多问的感知能力）
         merged_contexts = []
@@ -243,6 +255,7 @@ class AIReplyHandler(BaseHandler):
         self.logger.info(f"合并后文本({len(merged_texts)}条→1条): {merged_text[:80]}...")
 
         # 持有串行锁处理（保证与直接调用 _handle_unlocked 的互斥）
+        primary_meta["_coalesce_read_elapsed"] = elapsed_read
         async with self._get_buyer_lock(lock_key):
             await self._handle_unlocked(primary_ctx, primary_meta)
 
@@ -300,7 +313,9 @@ class AIReplyHandler(BaseHandler):
             messages = self._split_reply(reply)
 
             # 4. 规则 1+2: 模拟已读+打字延迟（合计 10~14 秒），并补齐同一买家回复间隔
-            await self._simulate_human_delay(from_uid)
+            #    合并场景下扣除窗口期已消耗的已读时间（_coalesce_read_elapsed），避免双重计时。
+            already_read = float(metadata.pop("_coalesce_read_elapsed", 0.0) or 0.0)
+            await self._simulate_human_delay(from_uid, already_elapsed_read=already_read)
 
             # 5. 逐条发送，遵守分条间隔与业务码校验（规则 4、5）
             self.logger.info(f"分条发送：共 {len(messages)} 条")
@@ -609,10 +624,16 @@ class AIReplyHandler(BaseHandler):
             fixed.append(c[pull:])
         return [f for f in fixed if f]
 
-    async def _simulate_human_delay(self, uid: Optional[str]) -> None:
-        """模拟真人已读+打字延迟（规则 1），并补齐同一买家回复间隔（规则 2）"""
+    async def _simulate_human_delay(self, uid: Optional[str], already_elapsed_read: float = 0.0) -> None:
+        """模拟真人已读+打字延迟（规则 1），并补齐同一买家回复间隔（规则 2）
+
+        already_elapsed_read: 合并场景下窗口等待期间已消耗的已读秒数，予以扣除，
+        使「已读延迟」与「合并窗口」并行而非叠加。
+        """
         # 规则 1: 已读 6~8 秒 + 打字 4~6 秒 = 总计 10~14 秒
         read_sec = random.uniform(self.read_seconds_min, self.read_seconds_max)
+        # 扣除窗口期已消耗的已读时间（如窗口 4 秒，则已读只剩 2~4 秒）
+        read_sec = max(0.0, read_sec - already_elapsed_read)
         typing_sec = random.uniform(self.typing_seconds_min, self.typing_seconds_max)
         delay = read_sec + typing_sec
 

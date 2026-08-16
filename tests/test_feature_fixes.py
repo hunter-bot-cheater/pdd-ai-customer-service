@@ -1827,7 +1827,7 @@ class TestMessageCoalescing(unittest.IsolatedAsyncioTestCase):
         # 开启合并（默认关闭，测试需显式开启）
         self.handler._coalesce_enabled = True
         # 缩短防抖窗口到 0.3 秒加速测试
-        self.handler._COALESCE_WINDOW_SEC = 0.3
+        self.handler._coalesce_window = 0.3
         self.sender = FakeSender()
         self._sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
         self._intent_patch = _patch_intent_to_consult()
