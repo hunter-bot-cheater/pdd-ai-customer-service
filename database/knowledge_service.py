@@ -415,28 +415,31 @@ class KnowledgeService:
                 product = self.get_product_by_goods_id(db_shop_id, goods_id)
                 if product:
                     result["product_knowledge"] = [product]
+                # 商品知识查询完毕（无论是否命中），直接返回
+                # 不跌落到下方的客服知识 BM25 评分逻辑
+                return result
             # 如果有关键词查询
-                elif query and query.strip():
-                    # 寒暄/纯打招呼黑名单：这些消息不含实质问题，不查 KB，
-                    # 避免"有人吗""在吗""在不在"等通过 CJK 单字兜底误命中 KB。
-                    _GREETING_PATTERNS = (
-                        "有人吗", "在吗", "在不在", "在的", "你好", "您好",
-                        "嗨", "hi", "hello", "在呢", "在的亲", "亲在",
-                    )
-                    q_clean = query.strip()
-                    if q_clean.lower() in {p.lower() for p in _GREETING_PATTERNS} or \
-                       re.match(r'^[在有你嗨好亲himelo]+[吗呢啊哦呀吧]*$', q_clean):
-                        return result
+            if query and query.strip():
+                # 寒暄/纯打招呼黑名单：这些消息不含实质问题，不查 KB，
+                # 避免"有人吗""在吗""在不在"等通过 CJK 单字兜底误命中 KB。
+                _GREETING_PATTERNS = (
+                    "有人吗", "在吗", "在不在", "在的", "你好", "您好",
+                    "嗨", "hi", "hello", "在呢", "在的亲", "亲在",
+                )
+                q_clean = query.strip()
+                if q_clean.lower() in {p.lower() for p in _GREETING_PATTERNS} or \
+                   re.match(r'^[在有你嗨好亲himelo]+[吗呢啊哦呀吧]*$', q_clean):
+                    return result
 
-                    # 分词
-                    words = [w.strip() for w in jieba.cut_for_search(q_clean) if len(w.strip()) >= 2]
-                    is_cjk_fallback = False
-                    if not words:
-                        # jieba 切不出 ≥2 字词（如纯数字口语"4米送2米吧""送不送"），
-                        # 退回 CJK 单字匹配，避免这类短口语完全召回不到 KB。
-                        # 仅取汉字并去重，排除数字/标点（数字"2"会误命中"24小时"等）。
-                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', q_clean)})
-                        is_cjk_fallback = True
+                # 分词
+                words = [w.strip() for w in jieba.cut_for_search(q_clean) if len(w.strip()) >= 2]
+                is_cjk_fallback = False
+                if not words:
+                    # jieba 切不出 ≥2 字词（如纯数字口语"4米送2米吧""送不送"），
+                    # 退回 CJK 单字匹配，避免这类短口语完全召回不到 KB。
+                    # 仅取汉字并去重，排除数字/标点（数字"2"会误命中"24小时"等）。
+                    words = list({c for c in re.findall(r'[\u4e00-\u9fff]', q_clean)})
+                    is_cjk_fallback = True
 
                 # BM25 评分（含 IDF 逆文档频率降权）：
                 # 朴素计数（命中词数/标题加权）在 KB 规模化后会出问题——"面料""质量"
@@ -648,6 +651,12 @@ class KnowledgeService:
             "你必须如实转告买家，禁止自行补充『可以选择其他XX宽度』『还有其他XX可选』"
             "『可以换成别的尺寸』等任何相反或替代性暗示，也不要编造知识库未提及的规格、选项或变通方案。\n"
             "2. 只依据上方知识库内容作答，不得凭空杜撰未写入知识库的信息。\n"
+            "3. 【身份约束 - 绝对禁止】你本身就是卖家/店铺客服，绝对禁止输出以下任何表述：\n"
+            "   『联系卖家』『联系客服』『咨询卖家』『咨询客服』『联系商家』『联系店主』\n"
+            "   『建议联系卖家』『请联系客服获取』『向卖家确认』『与卖家沟通』等。\n"
+            "   买家就是在和你（卖家）对话，让买家『联系卖家』完全荒谬且会造成严重客诉。\n"
+            "   如果确实无法回答某个问题，直接说『这个我不太清楚呢』或『不好意思这块我没法给您准确答复哦』即可，\n"
+            "   绝不能把问题推给『卖家』或『客服』。\n"
             "＜untrusted_knowledge＞\n"
             + "\n".join(output_parts).strip()
             + "\n＜/untrusted_knowledge＞"
