@@ -6,6 +6,7 @@
 """
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import re
 from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import Session
 import jieba
@@ -414,12 +415,14 @@ class KnowledgeService:
                 if product:
                     result["product_knowledge"] = [product]
             # 如果有关键词查询
-            elif query and query.strip():
-                # 分词
-                words = [w.strip() for w in jieba.cut_for_search(query.strip()) if len(w.strip()) >= 2]
-                if not words:
-                    # 无 ≥2 字关键词（如寒暄"在吗""你好"），返回最新 N 条作为兜底
-                    return self._search_knowledge(db_shop_id, query=None, goods_id=goods_id, limit=limit)
+                elif query and query.strip():
+                    # 分词
+                    words = [w.strip() for w in jieba.cut_for_search(query.strip()) if len(w.strip()) >= 2]
+                    if not words:
+                        # jieba 切不出 ≥2 字词（如纯数字口语"4米送2米吧""送不送"），
+                        # 退回 CJK 单字匹配，避免这类短口语完全召回不到 KB。
+                        # 仅取汉字并去重，排除数字/标点（数字"2"会误命中"24小时"等）。
+                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', query)})
 
                 # OR 逻辑：任一关键词命中即返回（更符合"按关键词模糊匹配"的心智）
                 # 旧版用 AND，导致带寒暄词的消息（如"老板 支持7天无理由吗"含"老板"）根本无法命中。
