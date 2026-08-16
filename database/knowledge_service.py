@@ -7,6 +7,7 @@
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import re
+import math
 from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import Session
 import jieba
@@ -378,19 +379,19 @@ class KnowledgeService:
         query: Optional[str] = None,
         goods_id: Optional[int] = None,
         limit: int = 10,
-        minimum_score: int = 2,
+            minimum_score: int = 2,
     ) -> Dict[str, Any]:
         """
-        检索知识库
+        检索知识库（客服知识采用 BM25 + IDF 评分）
 
         Args:
             shop_id: 店铺原始ID
             query: 关键词查询，可为空
             goods_id: 精确查询特定商品，可为空
             limit: 返回结果最大数量
-            minimum_score: 最低命中分（命中词数）。过滤掉单关键词偶然命中的噪音条目，
-                例如用户问"床品四件套"时，不会因 KB 退换货政策含"商品"二字就被拉出来。
-                默认 2：要求至少 2 个 ≥2 字词共现；单关键词查询可传 1。
+            minimum_score: 保留参数（兼容旧调用）。客服知识现已改用 BM25 评分，
+                内部以 BM25 分阈值过滤噪音（通用高频词经 IDF 自动降权），
+                不再依赖此整数阈值；产品知识路径仍按命中词数排序。
 
         Returns:
             {
@@ -416,19 +417,35 @@ class KnowledgeService:
                     result["product_knowledge"] = [product]
             # 如果有关键词查询
                 elif query and query.strip():
+                    # 寒暄/纯打招呼黑名单：这些消息不含实质问题，不查 KB，
+                    # 避免"有人吗""在吗""在不在"等通过 CJK 单字兜底误命中 KB。
+                    _GREETING_PATTERNS = (
+                        "有人吗", "在吗", "在不在", "在的", "你好", "您好",
+                        "嗨", "hi", "hello", "在呢", "在的亲", "亲在",
+                    )
+                    q_clean = query.strip()
+                    if q_clean.lower() in {p.lower() for p in _GREETING_PATTERNS} or \
+                       re.match(r'^[在有你嗨好亲himelo]+[吗呢啊哦呀吧]*$', q_clean):
+                        return result
+
                     # 分词
-                    words = [w.strip() for w in jieba.cut_for_search(query.strip()) if len(w.strip()) >= 2]
+                    words = [w.strip() for w in jieba.cut_for_search(q_clean) if len(w.strip()) >= 2]
+                    is_cjk_fallback = False
                     if not words:
                         # jieba 切不出 ≥2 字词（如纯数字口语"4米送2米吧""送不送"），
                         # 退回 CJK 单字匹配，避免这类短口语完全召回不到 KB。
                         # 仅取汉字并去重，排除数字/标点（数字"2"会误命中"24小时"等）。
-                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', query)})
+                        words = list({c for c in re.findall(r'[\u4e00-\u9fff]', q_clean)})
+                        is_cjk_fallback = True
 
-                # OR 逻辑：任一关键词命中即返回（更符合"按关键词模糊匹配"的心智）
-                # 旧版用 AND，导致带寒暄词的消息（如"老板 支持7天无理由吗"含"老板"）根本无法命中。
-                # 对每个词单独查 + 用 score（命中词数）排序，命中词越多越靠前。
-                scored_results: Dict[int, Dict[str, Any]] = {}
-
+                # BM25 评分（含 IDF 逆文档频率降权）：
+                # 朴素计数（命中词数/标题加权）在 KB 规模化后会出问题——"面料""质量"
+                # "问题"等通用词出现在大量条目中，纯计数无法区分"主题命中"与"偶然共现"。
+                # BM25 用 IDF 给高频词自动降权（词出现在越多文档中权重越低），用 TF 与
+                # 文档长度归一化防止长正文刷分，标题命中仍加权（×2）。这样既保留标题优先，
+                # 又让"裁剪质量"稳定命中主题条目，不被正文恰好共现的退换货政策抢走。
+                candidates: Dict[int, CustomerServiceKnowledge] = {}
+                term_doc_ids: Dict[str, set] = {}
                 for word in words:
                     stmt_word = (
                         select(CustomerServiceKnowledge)
@@ -445,27 +462,66 @@ class KnowledgeService:
                         .order_by(CustomerServiceKnowledge.created_at.desc())
                     )
                     for cs in session.scalars(stmt_word):
-                        entry = scored_results.setdefault(
-                            cs.id,
-                            {"obj": cs, "score": 0},
-                        )
-                        entry["score"] += 1
+                        candidates[cs.id] = cs
+                        term_doc_ids.setdefault(word, set()).add(cs.id)
 
-                # 按 score DESC 排序（命中词越多越靠前），再按 id 倒序兜底
-                sorted_hits = sorted(
-                    scored_results.values(),
-                    key=lambda x: (x["score"], x["obj"].id),
-                    reverse=True,
-                )
-                # minimum_score 过滤掉只命中 1 个词（甚至 0 词但进了 dict 的）的噪音条目，
-                # 避免"商品""使用"等通用词把无关 KB 拉进来。
-                sorted_hits = [h for h in sorted_hits if h["score"] >= minimum_score]
-                # 降级兜底：若 score≥N 无结果（如用户问"可以裁剪吗"只命中"裁剪"一个关键词，
-                # score=1 < 默认的 2），放宽到 score≥1 重试，避免精准单关键词匹配被误杀。
-                if not sorted_hits and minimum_score > 1:
-                    _all = sorted(scored_results.values(), key=lambda x: (x["score"], x["obj"].id), reverse=True)
-                    sorted_hits = [h for h in _all if h["score"] >= 1]
-                result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:limit]]
+                if candidates:
+                    # 统计语料规模 N 与平均文档长度，用于 BM25 的 IDF 与长度归一化
+                    all_cs = session.scalars(
+                        select(CustomerServiceKnowledge).where(
+                            and_(
+                                CustomerServiceKnowledge.shop_id == db_shop_id,
+                                CustomerServiceKnowledge.enabled == True,
+                            )
+                        )
+                    ).all()
+                    N = len(all_cs) or 1
+                    avgdl = (sum(len(k.title or "") + len(k.content or "") for k in all_cs) or 1) / N
+
+                    k1, b = 1.5, 0.75
+                    scored_results: Dict[int, Dict[str, Any]] = {}
+                    for doc_id, cs in candidates.items():
+                        title = cs.title or ""
+                        content = cs.content or ""
+                        dl = len(title) + len(content)
+                        bm25 = 0.0
+                        for word in words:
+                            doc_ids = term_doc_ids.get(word)
+                            if not doc_ids or doc_id not in doc_ids:
+                                continue
+                            tf_title = title.count(word)
+                            tf_content = content.count(word)
+                            tf = tf_title * 2 + tf_content  # 标题命中加权
+                            n_t = len(doc_ids)  # 含该词的文档数（IDF 分母）
+                            # IDF：词出现在越多文档中越不具区分度，自动降权；
+                            # +1 平滑避免 n_t > N/2 时出现负 IDF
+                            idf = math.log(1 + (N - n_t + 0.5) / (n_t + 0.5))
+                            bm25 += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl)))
+                        if bm25 > 0:
+                            scored_results[doc_id] = {"obj": cs, "score": bm25}
+
+                    sorted_hits = sorted(
+                        scored_results.values(),
+                        key=lambda x: (x["score"], x["obj"].id),
+                        reverse=True,
+                    )
+                    # 阈值：BM25 分越高越相关。通用词（高文档频率）IDF 低，
+                    # 单通用词匹配的 BM25 分自然低于阈值被过滤；罕见词（如"裁剪""赠送"）
+                    # 单匹配也能过关。CJK 单字兜底模式（is_cjk_fallback）下通用单字更多，门槛提高。
+                    _BM25_FLOOR = 0.12
+                    _BM25_FLOOR_CJK = 0.35
+                    floor = _BM25_FLOOR_CJK if is_cjk_fallback else _BM25_FLOOR
+                    passed = [h for h in sorted_hits if h["score"] >= floor]
+                    # 降级兜底：若 threshold 无结果（如精准单关键词且 IDF 偏低），
+                    # 放宽到极低阈值重试，避免"可以帮忙裁剪吗"这类被误杀。
+                    if not passed:
+                        passed = [h for h in sorted_hits if h["score"] >= 0.03]
+                    sorted_hits = passed
+                    # 注入上限：客服知识最多返回 top 3 条，防止 KB 规模化后噪音过多
+                    _CS_KB_INJECT_CAP = 3
+                    result["customer_service_knowledge"] = [it["obj"] for it in sorted_hits[:min(limit, _CS_KB_INJECT_CAP)]]
+                else:
+                    result["customer_service_knowledge"] = []
 
                 # 产品知识也按类似 OR 逻辑
                 scored_products: Dict[int, Dict[str, Any]] = {}
