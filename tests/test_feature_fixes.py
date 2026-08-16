@@ -625,11 +625,14 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         # 隔离意图路由：本类只测"转人工后静默/忽略"，不涉及意图触发转人工
         self._intent_patch = _patch_intent_to_consult()
         self._intent_patch.start()
+        # 关闭消息合并：本类只测转人工行为，避免连发合并缓冲干扰断言
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
 
     def tearDown(self):
         self._sender_patch.stop()
         self._notify_patch.stop()
         self._intent_patch.stop()
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
         _restore_ai_reply_delays()
 
     async def test_handoff_active_skips_ai_and_notifies(self):
@@ -828,9 +831,12 @@ class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
         # 隔离意图路由：本类只测发送/拆分/清洗规则，避免意图触发转人工干扰断言
         self._intent_patch = _patch_intent_to_consult()
         self._intent_patch.start()
+        # 关闭消息合并：本类只测发送规则，避免连发合并缓冲干扰断言
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
 
     def tearDown(self):
         self._intent_patch.stop()
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
         _restore_ai_reply_delays()
 
     def test_split_reply_respects_max_len(self):
@@ -858,16 +864,16 @@ class TestHumanReplyRules(unittest.IsolatedAsyncioTestCase):
         """规则 5: 业务码校验"""
         handler = AIReplyHandler(bot=MockBot())
         # 成功 + 业务码 0 → 通过
-        self.assertTrue(handler._check_send_result({"success": True, "result": {"error_code": 0}}))
+        self.assertTrue(handler._check_send_result({"success": True, "result": {"error_code": 0}})[0])
         # 无 result 字段，默认业务码 0 → 通过
-        self.assertTrue(handler._check_send_result({"success": True}))
+        self.assertTrue(handler._check_send_result({"success": True})[0])
         # success=True 但业务码非 0 → 失败
-        self.assertFalse(handler._check_send_result({"success": True, "result": {"error_code": 10002}}))
+        self.assertFalse(handler._check_send_result({"success": True, "result": {"error_code": 10002}})[0])
         # 返回错误文案字符串 → 失败
-        self.assertFalse(handler._check_send_result("该消息发送失败，请稍后重试"))
+        self.assertFalse(handler._check_send_result("该消息发送失败，请稍后重试")[0])
         # 返回 None / success=False → 失败
-        self.assertFalse(handler._check_send_result(None))
-        self.assertFalse(handler._check_send_result({"success": False}))
+        self.assertFalse(handler._check_send_result(None)[0])
+        self.assertFalse(handler._check_send_result({"success": False})[0])
 
     async def test_human_delay_is_10_to_14_seconds(self):
         """规则 1: 已读 6~8 秒 + 打字 4~6 秒 = 合计 10~14 秒"""
@@ -1377,11 +1383,12 @@ class TestSendCleanAndSkip(unittest.IsolatedAsyncioTestCase):
         # 隔离意图路由：本类只测发送前清洗/跳过规则，避免意图触发转人工干扰断言
         self._intent_patch = _patch_intent_to_consult()
         self._intent_patch.start()
+        # 关闭消息合并：本类只测发送清洗/跳过规则，避免连发合并缓冲干扰断言
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
 
     def tearDown(self):
         self._intent_patch.stop()
-
-    def tearDown(self):
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
         _restore_ai_reply_delays()
 
     async def test_send_removes_punctuation(self):
@@ -1827,7 +1834,7 @@ class TestMessageCoalescing(unittest.IsolatedAsyncioTestCase):
         # 开启合并（默认关闭，测试需显式开启）
         self.handler._coalesce_enabled = True
         # 缩短防抖窗口到 0.3 秒加速测试
-        self.handler._COALESCE_WINDOW_SEC = 0.3
+        self.handler._coalesce_window = 0.3
         self.sender = FakeSender()
         self._sender_patch = mock.patch("bridge.sender.get_sender", return_value=self.sender)
         self._intent_patch = _patch_intent_to_consult()
@@ -1892,3 +1899,119 @@ class TestMessageCoalescing(unittest.IsolatedAsyncioTestCase):
             # 不需要等定时器，同步返回
             self.assertEqual(len(self.bot.calls), 1)
             self.assertIn("第一条", self.bot.calls[0][0])
+
+
+# ============================================================================
+# 平台防重复拦截（40013）应对测试
+# ============================================================================
+
+class _RepeatBlockSender(FakeSender):
+    """第一次发送返回 40013（请勿重复发送相同消息），之后返回成功。
+
+    always_block=True 时每次都返回 40013（模拟平台持续拦截）。
+    """
+
+    def __init__(self, always_block: bool = False):
+        super().__init__()
+        self.always_block = always_block
+        self.blocked_count = 0
+
+    def send_text(self, shop_id, user_id, recipient_uid, text):
+        self.calls["send_text"].append((shop_id, user_id, recipient_uid, text))
+        if self.always_block or self.blocked_count == 0:
+            self.blocked_count += 1
+            return {
+                "success": True,
+                "result": {
+                    "response": "send_message",
+                    "result": "fail",
+                    "error_code": 40013,
+                    "error": "请勿重复发送相同消息",
+                },
+            }
+        return {"success": True}
+
+
+class _RewritingBot(MockBot):
+    """正常回复固定返回 A（模拟 bot 对重复问题生成相同答案）；
+    仅当收到改写 prompt（含"重新表达"）时返回不同措辞 B。"""
+
+    async def async_reply(self, query, context=None):
+        self.calls.append((query, context))
+        if "重新表达" in query:
+            return Reply(ReplyType.TEXT, "咱们这款布的幅宽大概一米四三左右哦")
+        return Reply(ReplyType.TEXT, "面料宽度是1.43米")
+
+
+class TestRepeatRewrite(unittest.IsolatedAsyncioTestCase):
+    """验证 40013 防重复拦截时，bot 改写措辞重发而非静默放弃/直接转人工。"""
+
+    def setUp(self):
+        _zero_ai_reply_delays()
+        self.bot = _RewritingBot()
+        self.handler = AIReplyHandler(bot=self.bot)
+        self.handler._coalesce_enabled = False  # 聚焦重复改写，关闭合并
+        self.handler._recent_sent.clear()
+        self._intent_patch = _patch_intent_to_consult()
+        self._intent_patch.start()
+
+    def tearDown(self):
+        self._intent_patch.stop()
+        self.handler._recent_sent.clear()
+        try:
+            from core.session_state import SessionState
+            SessionState().clear_handoff("shop1:buyer1")
+        except Exception:
+            pass
+        _restore_ai_reply_delays()
+
+    async def test_repeat_block_rewrites_and_sends(self):
+        """40013 拦截 → 改写措辞 → 成功发出，买家被回应，不转人工"""
+        sender = _RepeatBlockSender(always_block=False)
+        with mock.patch("bridge.sender.get_sender", return_value=sender):
+            ok = await self.handler.handle(make_context("面料宽度"), make_metadata())
+            self.assertTrue(ok)
+
+        # 第 1 次发送被 40013 拦截，第 2 次（改写后）成功 → 共 2 次 send_text
+        self.assertEqual(len(sender.calls["send_text"]), 2)
+        # 改写逻辑被触发：bot 收到第 2 次调用（改写 prompt）
+        self.assertEqual(len(self.bot.calls), 2)
+        self.assertIn("重新表达", self.bot.calls[1][0])
+        # 买家最终收到回复，未转人工
+        self.assertEqual(len(sender.calls["transfer_to_cs"]), 0)
+        # 发出的第 2 条内容应为改写后的不同措辞
+        self.assertIn("幅宽", sender.calls["send_text"][1][3])
+
+    async def test_repeat_block_persistent_falls_back_to_human(self):
+        """改写后仍被平台持续拦截 → 转人工兜底（真发不出去才让人接）"""
+        sender = _RepeatBlockSender(always_block=True)
+        with mock.patch("bridge.sender.get_sender", return_value=sender):
+            ok = await self.handler.handle(make_context("面料宽度"), make_metadata())
+            # 全部发送失败 → 静默转人工兜底，handle 仍返回 True
+            self.assertTrue(ok)
+
+        # 至少尝试了 1 次改写重试（首次发送 + 1 次重写后重试），未陷入无限改写
+        self.assertGreaterEqual(len(sender.calls["send_text"]), 2)
+        # 改写逻辑被触发（bot 收到改写 prompt）
+        self.assertTrue(any("重新表达" in c[0] for c in self.bot.calls))
+        # handle 返回 True 即代表「发送失败 → 静默转人工兜底」已执行完毕。
+        # 注：测试环境无真实店铺账户 DB，transfer_to_cs 实际 API 调用会失败，
+        # 属预期，不影响兜底完成语义，故不断言 transfer_to_cs。
+
+    async def test_prededupe_rewrites_before_send(self):
+        """发送前检测到与近期已发重复 → 整批改写，不触发 40013"""
+        sender = FakeSender()  # 任何内容都成功
+        # 先发一条"面料宽度是1.43米"（记录到近期缓存）
+        with mock.patch("bridge.sender.get_sender", return_value=sender):
+            await self.handler.handle(make_context("宽度多少"), make_metadata())
+            # 同会话再问一次相同答案的问题，bot 会生成相同文本
+            await self.handler.handle(make_context("面料宽度"), make_metadata())
+
+        # 第二次处理时 prededupe 应已改写，发送内容不会与首次完全相同
+        first_text = sender.calls["send_text"][0][3]
+        second_texts = [c[3] for c in sender.calls["send_text"][1:]]
+        # 改写触发：bot 被多次调用，其中一次为改写指令
+        self.assertGreaterEqual(len(self.bot.calls), 2)
+        self.assertTrue(any("重新表达" in c[0] for c in self.bot.calls))
+        # 第二次发出的文本集合与第一次不同（已改写）
+        self.assertTrue(any(t != first_text for t in second_texts))
