@@ -6,6 +6,7 @@ import random
 import asyncio
 import datetime
 import time
+from collections import deque
 from typing import Dict, Any, Optional, List
 from bridge.context import Context, ContextType
 from .base import BaseHandler
@@ -87,6 +88,16 @@ class AIReplyHandler(BaseHandler):
         self._coalesce_read_starts: Dict[str, float] = {}
         # 合并开关（默认关闭；生产环境通过 ai_reply.enable_coalesce=true 开启）
         self._coalesce_enabled = bool(get_config("ai_reply.enable_coalesce", False))
+
+        # 会话内已发消息缓存：用于发送前/发送后「防重复改写」。
+        # 拼多多平台对短时间内发给同一买家的「相同消息」会返回 40013 拦截
+        # （error=请勿重复发送相同消息）。买家重复提问时 bot 会生成雷同答案被拦，
+        # 故缓存近期已发文本，命中重复则换措辞重写，既回复客户又绕开平台风控。
+        self._recent_sent: Dict[str, deque] = {}      # session_key -> deque[(ts, text)]
+        self._recent_sent_ttl = float(get_config("ai_reply.repeat_cache_ttl_sec", 300))  # 5 分钟
+        self._recent_sent_max = int(get_config("ai_reply.repeat_cache_max", 12))         # 每条会话保留条数
+        # 40013 重复拦截后改写重试上限（避免无限改写死循环）
+        self._repeat_rewrite_max = int(get_config("ai_reply.repeat_rewrite_max", 1))
 
     def _get_buyer_lock(self, key: str) -> asyncio.Lock:
         """获取（或创建）同一买家串行锁。单事件循环内安全。"""
@@ -317,26 +328,53 @@ class AIReplyHandler(BaseHandler):
             already_read = float(metadata.pop("_coalesce_read_elapsed", 0.0) or 0.0)
             await self._simulate_human_delay(from_uid, already_elapsed_read=already_read)
 
-            # 5. 逐条发送，遵守分条间隔与业务码校验（规则 4、5）
+            # 5. 发送前：检测与近期已发消息重复（平台 40013 防刷），命中则先改写，减少失败往返
+            session_key = f"{metadata.get('shop_id')}:{metadata.get('from_uid')}"
+            messages = await self._prededupe(messages, session_key, context)
+
+            # 6. 逐条发送，遵守分条间隔与业务码校验（规则 4、5）
+            #    平台 40013「请勿重复发送相同消息」拦截时，换措辞改写重试（最多 _repeat_rewrite_max 次），
+            #    不静默放弃、也不直接转人工——买家需要被回应，改写后仍失败才转人工兜底。
             self.logger.info(f"分条发送：共 {len(messages)} 条")
             sent_count = 0
-            for i, msg in enumerate(messages):
+            i = 0
+            n = len(messages)
+            rewrite_attempts = 0
+            while i < n:
+                msg = messages[i]
                 # 需求二：清洗后为空的分条跳过，不发送（与业务码失败区分，避免误停后续分条）
                 if not self._clean_text(msg).strip():
                     self.logger.warning(f"分条 {i + 1} 清洗后为空，跳过该条: {msg!r}")
+                    i += 1
                     continue
-                success = await self._send_reply(context, msg, metadata)
+                success, err_code, err_msg = await self._send_reply(context, msg, metadata)
                 if success:
                     sent_count += 1
-                    self.logger.debug(f"分条 {i + 1}/{len(messages)} 发送成功: {msg[:30]}...")
-                else:
-                    # 规则 5: 发送结果业务码非 0（或请求失败）→ 记录日志并停止后续发送
-                    self.logger.error(f"分条 {i + 1} 发送失败，停止后续发送: {msg[:30]}...")
+                    self._record_sent(session_key, msg)
+                    self.logger.debug(f"分条 {i + 1}/{n} 发送成功: {msg[:30]}...")
+                    i += 1
+                    # 规则 4: 拆分后的多条消息间隔 3~6 秒
+                    if i < n:
+                        await asyncio.sleep(random.uniform(self.split_interval_min, self.split_interval_max))
+                    continue
+                # 发送失败
+                is_repeat_block = (err_code == 40013 and (not err_msg or "重复" in str(err_msg)))
+                if is_repeat_block and rewrite_attempts < self._repeat_rewrite_max:
+                    rewrite_attempts += 1
+                    self.logger.warning(
+                        f"分条 {i + 1} 被平台防重复拦截（40013），改写措辞重试（第 {rewrite_attempts} 次）"
+                    )
+                    remaining = messages[i:]
+                    rewritten = await self._rewrite_messages(remaining, context)
+                    if rewritten and rewritten != remaining:
+                        # 用改写后的内容替换剩余分条，从当前位置重新发送（不前进 i）
+                        messages = messages[:i] + rewritten
+                        n = len(messages)
+                        continue
+                    self.logger.error("改写失败或内容未变，停止发送后续分条")
                     break
-
-                # 规则 4: 拆分后的多条消息间隔 3~6 秒
-                if i < len(messages) - 1:
-                    await asyncio.sleep(random.uniform(self.split_interval_min, self.split_interval_max))
+                self.logger.error(f"分条 {i + 1} 发送失败（error_code={err_code}），停止后续发送: {msg[:30]}...")
+                break
 
             if sent_count == 0:
                 self.logger.warning("AI回复全部发送失败，使用备用回复")
@@ -967,12 +1005,12 @@ class AIReplyHandler(BaseHandler):
                 return False
             result = await asyncio.to_thread(sender.send_text, shop_id, user_id, from_uid, reply)
 
-            # 规则 5: 校验发送结果与业务码，失败记录日志并返回 False（停止后续发送）
-            ok = self._check_send_result(result)
+            # 规则 5: 校验发送结果与业务码
+            ok, error_code, error_msg = self._check_send_result(result)
             if ok:
                 # 规则 2: 记录本次发送时间，用于同一买家回复间隔控制
                 self.uid_tracker.record_send(from_uid)
-            return ok
+            return (ok, error_code, error_msg)
 
         except Exception as e:
             self.logger.error(
@@ -980,22 +1018,101 @@ class AIReplyHandler(BaseHandler):
             )
             return False
 
-    def _check_send_result(self, result) -> bool:
-        """规则 5: 校验发送结果，业务码非 0 视为失败"""
+    def _check_send_result(self, result):
+        """规则 5: 校验发送结果，业务码非 0 视为失败。
+
+        返回 (ok, error_code, error_msg)：
+        - ok: 是否发送成功
+        - error_code: 平台业务码（成功为 0；无结果时为 -1）
+        - error_msg: 平台返回的错误描述（成功为 None）
+        """
         if not result:
-            return False
+            return (False, -1, "empty_result")
         if isinstance(result, str):
             # send_text 在业务错误（如 error_code=10002）时返回错误文案字符串
             self.logger.error(f"发送失败（业务错误）: {result}")
-            return False
+            return (False, -1, result)
         if result.get("success"):
-            error_code = result.get("result", {}).get("error_code", 0)
+            inner = result.get("result", {}) or {}
+            error_code = inner.get("error_code", 0)
+            error_msg = inner.get("error")
             if error_code:
-                self.logger.error(f"发送业务码非 0: error_code={error_code}, result={result}")
-                return False
-            return True
+                self.logger.error(f"发送业务码非 0: error_code={error_code}, error={error_msg}, result={result}")
+                return (False, error_code, error_msg)
+            return (True, 0, None)
         self.logger.error(f"发送请求失败: {result}")
+        return (False, -1, "request_failed")
+
+    # ===== 平台防重复拦截（40013）应对 =====
+    # 拼多多对「同一客服账号短时间内发给同一买家的相同消息」返回 40013
+    # （error=请勿重复发送相同消息）。买家重复提问时 bot 会生成雷同答案被拦。
+    # 处理原则：买家需要被回应，不能静默放弃、也不能无意义转人工占用人力。
+    # 做法：检测重复 → 换措辞重写（保持事实不变）→ 重发；改写后仍失败才转人工兜底。
+
+    def _record_sent(self, session_key: str, text: str) -> None:
+        """记录本会话已成功发送的文本，供后续重复检测"""
+        cleaned = self._clean_text(text).strip()
+        if not cleaned:
+            return
+        buf = self._recent_sent.get(session_key)
+        if buf is None:
+            buf = deque(maxlen=self._recent_sent_max)
+            self._recent_sent[session_key] = buf
+        buf.append((time.time(), cleaned))
+
+    def _is_recent_duplicate(self, session_key: str, text: str) -> bool:
+        """判断 text 是否与本会话近期已发消息字面重复（平台 40013 的判定核心）"""
+        cleaned = self._clean_text(text).strip()
+        if not cleaned:
+            return False
+        buf = self._recent_sent.get(session_key)
+        if not buf:
+            return False
+        now = time.time()
+        for ts, prev in buf:
+            if now - ts > self._recent_sent_ttl:
+                continue
+            if prev == cleaned:
+                return True
         return False
+
+    async def _rewrite_messages(self, messages: List[str], context: Context) -> List[str]:
+        """把待发送消息用不同措辞重写（保持关键事实不变），用于绕过平台重复拦截。
+
+        复用 bot.async_reply 的底层 LLM 通道，prompt 要求只换说法、不改事实、不调工具。
+        """
+        joined = "\n".join(m for m in messages if m.strip())
+        if not joined.strip():
+            return messages
+        prompt = (
+            "请把下面这几句客服回复用不同的措辞、不同的语序重新表达一遍，"
+            "必须保持原有意思和所有关键事实（如尺寸、价格、政策）完全不变，"
+            "只是换种自然的说法，不要新增或删减任何信息，不要调用任何工具。"
+            "逐句输出，每句一行。\n\n"
+            f"{joined}"
+        )
+        try:
+            if not (self.bot and hasattr(self.bot, "async_reply")):
+                return messages
+            res = await self.bot.async_reply(prompt, context)
+            content = getattr(res, "content", str(res)) or ""
+            rewritten = [m.strip() for m in content.split("\n") if m.strip()]
+            if not rewritten:
+                return messages
+            out = []
+            for r in rewritten:
+                out.extend(self._split_reply(r))
+            return out if out else messages
+        except Exception as e:
+            self.logger.error(f"防重复改写失败: {e}")
+            return messages
+
+    async def _prededupe(self, messages: List[str], session_key: str, context: Context) -> List[str]:
+        """发送前：若任一待发消息与近期已发重复，整批改写后返回（减少一次失败往返）"""
+        if not any(self._is_recent_duplicate(session_key, m) for m in messages):
+            return messages
+        self.logger.warning(f"检测到待发消息与近期已发重复，发送前改写: session={session_key}")
+        return await self._rewrite_messages(messages, context)
 
     async def _handle_fallback(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """AI 回复失败时的兜底处理。
