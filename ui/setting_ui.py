@@ -2,9 +2,9 @@
 
 from PyQt6.QtCore import Qt, QTime
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QWidget,
-                            QFormLayout, QMessageBox, QStackedWidget)
+                            QMessageBox, QStackedWidget)
 from PyQt6.QtGui import QFont
-from qfluentwidgets import (CardWidget, SubtitleLabel, CaptionLabel, StrongBodyLabel,
+from qfluentwidgets import (CardWidget, SubtitleLabel, CaptionLabel, StrongBodyLabel, BodyLabel,
                            PrimaryPushButton, PushButton,
                            LineEdit, ScrollArea, FluentIcon as FIF,
                            InfoBar, InfoBarPosition, TextEdit, PasswordLineEdit,
@@ -43,9 +43,31 @@ def _switch():
     return w
 
 
-def _add_row(form: QFormLayout, label: str, widget):
-    """向表单添加一行，并返回控件。"""
-    form.addRow(label, widget)
+def _add_row(layout: QVBoxLayout, label: str, widget):
+    """向纵向布局添加一行：左侧/上方中文标签 + 右侧/下方控件。
+
+    使用 QFormLayout 时标签会被固定宽度的控件挤出，因此改用手动
+    水平布局，确保标签始终可见。
+    """
+    row = QHBoxLayout()
+    row.setSpacing(12)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+    lbl = BodyLabel(label)
+    lbl.setFixedWidth(180)
+    lbl.setWordWrap(True)
+    row.addWidget(lbl)
+
+    # 让文本类输入框随窗口拉伸，数字/开关保持固定宽度
+    if isinstance(widget, (LineEdit, PasswordLineEdit, TextEdit)):
+        widget.setMinimumWidth(240)
+        row.addWidget(widget, 1)
+    else:
+        row.addWidget(widget, 0, Qt.AlignmentFlag.AlignLeft)
+
+    row.addStretch(1)
+    layout.addLayout(row)
     return widget
 
 
@@ -78,11 +100,8 @@ class BasicConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.start_hour = _int_spin(0, 23, 1)
         _add_row(form, "开始时间（小时）:", self.start_hour)
@@ -164,11 +183,8 @@ class LLMConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.api_base_edit = LineEdit()
         self.api_base_edit.setPlaceholderText("https://ark.cn-beijing.volces.com/api/v3")
@@ -224,11 +240,8 @@ class AIReplyConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         # 已读延迟
         self.read_min = _double_spin(0, 60, 1, 0.5)
@@ -346,11 +359,8 @@ class NotificationConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.webhook_edit = LineEdit()
         self.webhook_edit.setPlaceholderText("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...")
@@ -402,11 +412,8 @@ class IntentConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.enabled = _switch()
         _add_row(form, "启用意图分类:", self.enabled)
@@ -481,11 +488,8 @@ class PromptConfigCard(CardWidget):
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
-        form = QFormLayout()
+        form = QVBoxLayout()
         form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.instructions_edit = TextEdit()
         self.instructions_edit.setPlaceholderText("输入行为指令，每行一条")
