@@ -4,7 +4,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath
 from PyQt6.QtCore import Qt
 from utils.logger_loguru import get_logger
-from utils.safe_image_fetch import fetch_image
+from ui.logo_helper import load_logo
 
 
 class LogoLoaderThread(QThread):
@@ -16,39 +16,10 @@ class LogoLoaderThread(QThread):
         self.url = url
 
     def run(self):
-        try:
-            image_data = fetch_image(self.url)
-
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_data)
-
-            if pixmap.isNull():
-                raise ValueError("Loaded data is not a valid image.")
-
-            # 创建圆形pixmap
-            size = 60
-            circular_pixmap = QPixmap(size, size)
-            circular_pixmap.fill(Qt.GlobalColor.transparent)
-
-            painter = QPainter(circular_pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-            path = QPainterPath()
-            path.addEllipse(0, 0, size, size)
-
-            painter.setClipPath(path)
-
-            # 缩放并绘制原始图片
-            scaled_pixmap = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap(0, 0, scaled_pixmap)
-            painter.end()
-
-            self.logo_loaded.emit(circular_pixmap)
-        except Exception as e:
-            get_logger().error(
-                f"Failed to load logo: error_type={type(e).__name__}"
-            )
-            self.logo_loaded.emit(QPixmap())
+        # load_logo always returns a non-null pixmap (neutral placeholder on any
+        # failure) and logs the real cause at DEBUG, so the UI never shows
+        # "加载失败" and the app never emits a WARNING for a missing logo.
+        self.logo_loaded.emit(load_logo(self.url))
 
 
 class AutoReplyThread(QThread):
