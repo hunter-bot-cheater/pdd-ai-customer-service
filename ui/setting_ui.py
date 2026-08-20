@@ -71,6 +71,29 @@ def _add_row(layout: QVBoxLayout, label: str, widget):
     return widget
 
 
+def _add_time_row(layout: QVBoxLayout, label: str, hour_spin, minute_spin):
+    """添加一行"标签 + 小时 : 分钟"的营业时间控件，SpinBox 启用循环。"""
+    row = QHBoxLayout()
+    row.setSpacing(12)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+    lbl = BodyLabel(label)
+    lbl.setFixedWidth(180)
+    lbl.setWordWrap(True)
+    row.addWidget(lbl)
+
+    hour_spin.setWrapping(True)
+    minute_spin.setWrapping(True)
+
+    row.addWidget(hour_spin, 0, Qt.AlignmentFlag.AlignLeft)
+    row.addWidget(BodyLabel(":"), 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addWidget(minute_spin, 0, Qt.AlignmentFlag.AlignLeft)
+    row.addStretch(1)
+    layout.addLayout(row)
+    return hour_spin, minute_spin
+
+
 def _join_lines(value) -> str:
     """把列表/字符串规整为换行分隔的多行文本（用于 TextEdit 显示）。"""
     if isinstance(value, list):
@@ -81,11 +104,11 @@ def _join_lines(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 配置卡片：基础设置（营业时间 / 数据库路径 / 转人工有效时长）
+# 配置卡片：基础设置（营业时间 / 数据库路径）
 # ---------------------------------------------------------------------------
 
 class BasicConfigCard(CardWidget):
-    """基础设置卡片：营业时间、数据库路径、转人工有效时长"""
+    """基础设置卡片：营业时间、数据库路径"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -104,27 +127,22 @@ class BasicConfigCard(CardWidget):
         form.setSpacing(12)
 
         self.start_hour = _int_spin(0, 23, 1)
-        _add_row(form, "开始时间（小时）:", self.start_hour)
         self.start_minute = _int_spin(0, 59, 1)
-        _add_row(form, "开始时间（分钟）:", self.start_minute)
+        _add_time_row(form, "开始时间", self.start_hour, self.start_minute)
 
         self.end_hour = _int_spin(0, 23, 1)
-        _add_row(form, "结束时间（小时）:", self.end_hour)
         self.end_minute = _int_spin(0, 59, 1)
-        _add_row(form, "结束时间（分钟）:", self.end_minute)
+        _add_time_row(form, "结束时间", self.end_hour, self.end_minute)
 
         self.db_path_edit = LineEdit()
         self.db_path_edit.setPlaceholderText("./temp/channel_shop.db")
         _add_row(form, "数据库路径:", self.db_path_edit)
 
-        self.handoff_valid_hours = _double_spin(0.1, 8760, 1, 0.5)
-        _add_row(form, "转人工有效时长(小时):", self.handoff_valid_hours)
-
         layout.addLayout(form)
 
         description_label = CaptionLabel(
             "设置 AI 客服的工作时间与数据文件位置。\n"
-            "非工作时间系统不会自动回复；转人工有效时长到期后会话恢复由 AI 处理。"
+            "非工作时间系统不会自动回复。"
         )
         description_label.setStyleSheet("color: #666; padding: 8px 0;")
         layout.addWidget(description_label)
@@ -138,9 +156,6 @@ class BasicConfigCard(CardWidget):
                 "end": _fmt(self.end_hour.value(), self.end_minute.value()),
             },
             "db_path": (self.db_path_edit.text().strip() or "./temp/channel_shop.db"),
-            "handoff": {
-                "valid_hours": round(self.handoff_valid_hours.value(), 1),
-            },
         }
 
     def setConfig(self, data: dict):
@@ -155,12 +170,6 @@ class BasicConfigCard(CardWidget):
             self.end_minute.setValue(end.minute())
 
         self.db_path_edit.setText(data.get("db_path", "./temp/channel_shop.db") or "")
-
-        hv = data.get("handoff", {}) or {}
-        try:
-            self.handoff_valid_hours.setValue(float(hv.get("valid_hours", 4)))
-        except (TypeError, ValueError):
-            self.handoff_valid_hours.setValue(4)
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +353,7 @@ class AIReplyConfigCard(CardWidget):
 # ---------------------------------------------------------------------------
 
 class NotificationConfigCard(CardWidget):
-    """通知设置卡片：企业微信 Webhook 与冷却时间"""
+    """通知设置卡片：企业微信 Webhook、通知冷却、转人工有效时长"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -369,11 +378,15 @@ class NotificationConfigCard(CardWidget):
         self.cooldown = _int_spin(0, 86400, 10)
         _add_row(form, "转人工通知冷却时间（秒）:", self.cooldown)
 
+        self.handoff_valid_hours = _double_spin(0.1, 8760, 1, 0.5)
+        _add_row(form, "转人工有效时长（小时）:", self.handoff_valid_hours)
+
         layout.addLayout(form)
 
         description_label = CaptionLabel(
             "转人工/紧急通知会推送到企业微信群机器人。\n"
-            "留空则不发送群消息（仍会转接，但不发通知）。冷却时间避免同一会话反复刷屏。"
+            "留空则不发送群消息（仍会转接，但不发通知）。冷却时间避免同一会话反复刷屏；\n"
+            "转人工有效时长到期后会话恢复由 AI 处理。"
         )
         description_label.setStyleSheet("color: #666; padding: 8px 0;")
         layout.addWidget(description_label)
@@ -382,6 +395,9 @@ class NotificationConfigCard(CardWidget):
         return {
             "wechat_webhook": self.webhook_edit.text().strip(),
             "handoff_cooldown_seconds": int(self.cooldown.value()),
+            "handoff": {
+                "valid_hours": round(self.handoff_valid_hours.value(), 1),
+            },
         }
 
     def setConfig(self, data: dict):
@@ -390,6 +406,12 @@ class NotificationConfigCard(CardWidget):
             self.cooldown.setValue(int(data.get("handoff_cooldown_seconds", 300)))
         except (TypeError, ValueError):
             self.cooldown.setValue(300)
+
+        hv = data.get("handoff", {}) or {}
+        try:
+            self.handoff_valid_hours.setValue(float(hv.get("valid_hours", 4)))
+        except (TypeError, ValueError):
+            self.handoff_valid_hours.setValue(4)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +675,6 @@ class SettingUI(QFrame):
                         "end": config.get("business_hours.end", "23:59"),
                     },
                     "db_path": config.get("db_path", "./temp/channel_shop.db"),
-                    "handoff": {"valid_hours": config.get("handoff.valid_hours", 4)},
                 },
                 "llm": {
                     "api_base": config.get("llm.api_base", "https://ark.cn-beijing.volces.com/api/v3"),
@@ -679,6 +700,7 @@ class SettingUI(QFrame):
                 "notification": {
                     "wechat_webhook": config.get("notification.wechat_webhook", ""),
                     "handoff_cooldown_seconds": config.get("notification.handoff_cooldown_seconds", 300),
+                    "handoff": {"valid_hours": config.get("handoff.valid_hours", 4)},
                 },
                 "intent": {
                     "enabled": config.get("intent.enabled", True),
@@ -768,10 +790,13 @@ class SettingUI(QFrame):
             new_config = {
                 "business_hours": self._merge_section("business_hours", parts["basic"]["business_hours"]),
                 "db_path": parts["basic"]["db_path"],
-                "handoff": self._merge_section("handoff", parts["basic"]["handoff"]),
+                "handoff": self._merge_section("handoff", parts["notification"]["handoff"]),
                 "llm": self._merge_section("llm", parts["llm"]),
                 "ai_reply": self._merge_section("ai_reply", parts["ai_reply"]),
-                "notification": self._merge_section("notification", parts["notification"]),
+                "notification": self._merge_section("notification", {
+                    "wechat_webhook": parts["notification"]["wechat_webhook"],
+                    "handoff_cooldown_seconds": parts["notification"]["handoff_cooldown_seconds"],
+                }),
                 "intent": self._merge_section("intent", parts["intent"]),
                 "prompt": self._merge_section("prompt", parts["prompt"]),
             }
