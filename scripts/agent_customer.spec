@@ -33,8 +33,24 @@ except (OSError, KeyError, TypeError):
 # ================================
 # collect_all 收集 playwright/driver/ 下的 node 与 JS，否则打包后启动浏览器会
 # 因驱动缺失而失败。配合 pdd_login 的 channel="chrome"，用户无需安装 Playwright 浏览器。
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 _pw_datas, _pw_binaries, _pw_hidden = collect_all("playwright")
+_llm_hidden = [
+    "litellm",
+    "litellm.main",
+    "litellm.llms",
+]
+for _provider_package in (
+    "litellm.llms.openai",
+    "litellm.llms.deepseek",
+    "litellm.llms.volcengine",
+    "litellm.llms.moonshot",
+    "litellm.llms.zai",
+    "litellm.llms.openai_like",
+    "litellm.llms.dashscope",
+    "litellm.llms.custom_httpx",
+):
+    _llm_hidden.extend(collect_submodules(_provider_package))
 
 # node.exe 不会进入 binaries，但会出现在 datas（目标 playwright/driver），这里显式补进 binaries
 # 以便在 EXE 元信息（VirusTotal/安全软件）层面可见，行为与 datas 等价，属防御性冗余。
@@ -74,6 +90,14 @@ a = Analysis(
         "openai",
         "openai._models",
         "openai._client",
+        "litellm",
+        "litellm.main",
+        "litellm.litellm_core_utils",
+        "litellm.llms.openai",
+        "litellm.llms.deepseek",
+        "litellm.llms.volcengine",
+        "litellm.llms.moonshot",
+        "litellm.llms.zai",
         "tiktoken",
         "tiktoken_ext",
         "tiktoken_ext.openai_public",
@@ -198,7 +222,7 @@ a = Analysis(
         # === httpx (for openai) ===
         "httpx",
         "httpcore",
-    ] + _pw_hidden,
+    ] + _pw_hidden + _llm_hidden,
     hookspath=[],
     hooksconfig={},
     keys=block_cipher,

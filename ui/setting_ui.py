@@ -6,11 +6,21 @@ from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QWidget,
 from PyQt6.QtGui import QFont
 from qfluentwidgets import (CardWidget, SubtitleLabel, CaptionLabel, StrongBodyLabel, BodyLabel,
                            PrimaryPushButton, PushButton,
-                           LineEdit, ScrollArea, FluentIcon as FIF,
+                           LineEdit, ComboBox, ScrollArea, FluentIcon as FIF,
                            InfoBar, InfoBarPosition, TextEdit, PasswordLineEdit,
                            SwitchButton, SpinBox, DoubleSpinBox, Pivot)
 from utils.logger_loguru import get_logger
 from config import config, config_base
+from utils.llm_provider import (
+    CapabilityState,
+    ProfileValidationError,
+    build_llm_profile,
+    capability_confirmation_for,
+    provider_choices,
+    provider_spec,
+    resolve_tool_capability,
+    requires_tool_trust_confirmation,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -173,17 +183,30 @@ class BasicConfigCard(CardWidget):
 
 
 # ---------------------------------------------------------------------------
-# 配置卡片：LLM 模型配置
+# 配置卡片：LLM 模型配置（基于 LiteLLM 的供应商选择）
 # ---------------------------------------------------------------------------
 
 class LLMConfigCard(CardWidget):
-    """LLM配置卡片"""
+    """Provider-aware LLM profile editor。"""
+
+    DEFAULT_MODELS = {
+        "deepseek": "deepseek-chat",
+        "volcengine": "doubao-seed-1-6-flash-250828",
+        "openai_compatible": "",
+        "kimi": "moonshot-v1-8k",
+        "zhipu": "glm-4-flash",
+        "qwen": "qwen-plus",
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setupUI()
 
     def setupUI(self):
+        self._profile_meta = {
+            "capability_confirmation": "",
+            "tool_trust_confirmation": "",
+        }
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(16)
@@ -195,38 +218,185 @@ class LLMConfigCard(CardWidget):
         form = QVBoxLayout()
         form.setSpacing(12)
 
-        self.api_base_edit = LineEdit()
-        self.api_base_edit.setPlaceholderText("https://ark.cn-beijing.volces.com/api/v3")
-        _add_row(form, "API 地址:", self.api_base_edit)
+        # 模型供应商
+        self.provider_combo = ComboBox()
+        self.provider_combo.setAccessibleName("LLM provider")
+        self._provider_values = []
+        for provider_value, label in provider_choices():
+            self.provider_combo.addItem(label)
+            self._provider_values.append(provider_value)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        _add_row(form, "模型供应商:", self.provider_combo)
 
+        # API Base URL
+        self.api_base_edit = LineEdit()
+        self.api_base_edit.setAccessibleName("LLM Base URL")
+        self.api_base_edit.textChanged.connect(self._sync_endpoint_trust_from_base)
+        _add_row(form, "API Base URL:", self.api_base_edit)
+
+        # 端点信任
+        self.endpoint_trust_combo = ComboBox()
+        self.endpoint_trust_combo.setAccessibleName("LLM endpoint trust mode")
+        self._endpoint_trust_values = ["default", "explicit", "local"]
+        self.endpoint_trust_combo.addItems(
+            ["供应商默认/远程 HTTPS", "自定义远程 HTTPS", "明确允许本地或私有端点"]
+        )
+        self.endpoint_trust_combo.currentIndexChanged.connect(
+            self._sync_endpoint_trust_from_mode
+        )
+        _add_row(form, "端点信任:", self.endpoint_trust_combo)
+
+        # API Key
         self.api_key_edit = PasswordLineEdit()
+        self.api_key_edit.setAccessibleName("LLM API Key")
         self.api_key_edit.setPlaceholderText("输入您的 API Key")
         _add_row(form, "API 密钥:", self.api_key_edit)
 
+        # 模型名称
         self.model_name_edit = LineEdit()
-        self.model_name_edit.setPlaceholderText("输入模型名称，如：doubao-seed-1-6-flash-250828")
+        self.model_name_edit.setAccessibleName("LLM model name")
         _add_row(form, "模型名称:", self.model_name_edit)
 
         layout.addLayout(form)
 
+        action_row = QHBoxLayout()
+        self.reset_provider_default_btn = PushButton("恢复供应商默认")
+        self.reset_provider_default_btn.clicked.connect(self.reset_to_provider_default)
+        action_row.addWidget(self.reset_provider_default_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+        self.status_label = CaptionLabel("")
+        self.status_label.setAccessibleName("LLM validation status")
+        self.status_label.setStyleSheet("color: #666; padding: 4px 0;")
+        layout.addWidget(self.status_label)
+
         description_label = CaptionLabel(
             "配置 LLM 模型的连接参数。\n"
-            "支持 OpenAI 兼容的 API 接口，包括豆包、通义千问等模型。"
+            "供应商通过 LiteLLM 直接路由；OpenAI-compatible 可填写任意兼容模型和 Base URL。\n"
+            "端点信任：填写自定义 Base URL 时必须使用“自定义远程 HTTPS”；"
+            "只有 Base URL 留空时才能选择“供应商默认”。"
         )
         description_label.setStyleSheet("color: #666; padding: 8px 0;")
         layout.addWidget(description_label)
 
     def getConfig(self) -> dict:
+        provider = self._provider_values[self.provider_combo.currentIndex()]
         return {
-            "api_base": self.api_base_edit.text().strip() or "https://ark.cn-beijing.volces.com/api/v3",
+            "provider": provider,
+            "api_base": self.api_base_edit.text().strip(),
+            "endpoint_trust_mode": self._endpoint_trust_values[
+                self.endpoint_trust_combo.currentIndex()
+            ],
             "api_key": self.api_key_edit.text().strip(),
-            "model_name": self.model_name_edit.text().strip()
+            "model_name": self.model_name_edit.text().strip(),
+            "tool_policy": "enabled",
+            **self._profile_meta,
         }
 
     def setConfig(self, data: dict):
-        self.api_base_edit.setText(data.get("api_base", "https://ark.cn-beijing.volces.com/api/v3"))
+        provider = str(data.get("provider", "openai_compatible"))
+        if provider in self._provider_values:
+            self.provider_combo.setCurrentIndex(self._provider_values.index(provider))
+        self.api_base_edit.setText(data.get("api_base", ""))
+        trust_mode = str(data.get("endpoint_trust_mode", "default"))
+        if trust_mode in self._endpoint_trust_values:
+            self.endpoint_trust_combo.setCurrentIndex(
+                self._endpoint_trust_values.index(trust_mode)
+            )
+        # 安全策略：填写自定义 Base URL 时强制用 explicit，避免 UI 显示与保存后不一致
+        self._sync_endpoint_trust_from_base()
         self.api_key_edit.setText(data.get("api_key", ""))
         self.model_name_edit.setText(data.get("model_name", ""))
+        for key in self._profile_meta:
+            if key in data:
+                self._profile_meta[key] = data[key]
+        self._on_provider_changed(self.provider_combo.currentIndex())
+
+    def _on_provider_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self._provider_values):
+            return
+        spec = provider_spec(self._provider_values[index])
+        self.api_base_edit.setPlaceholderText(
+            spec.default_api_base or "https://your-openai-compatible-host/v1"
+        )
+        self.model_name_edit.setPlaceholderText(
+            self.DEFAULT_MODELS.get(spec.provider.value) or "输入任意兼容模型名称"
+        )
+        if spec.requires_api_base:
+            self.status_label.setText("OpenAI-compatible 必须填写 Base URL")
+        elif spec.default_api_base:
+            self.status_label.setText(f"默认端点：{spec.default_api_base}（可填写自定义覆盖）")
+        else:
+            self.status_label.setText("")
+
+    def _sync_endpoint_trust_from_base(self, _text: str = "") -> None:
+        """安全策略：填写自定义 Base URL 后不能用“供应商默认”信任模式。"""
+        if self.endpoint_trust_combo.count() == 0:
+            return
+        base = self.api_base_edit.text().strip()
+        current_idx = self.endpoint_trust_combo.currentIndex()
+        if base and current_idx == 0:
+            self.endpoint_trust_combo.setCurrentIndex(1)
+            self.status_label.setText(
+                "已填写自定义 Base URL，端点信任已自动切换为“自定义远程 HTTPS”。"
+            )
+
+    def _sync_endpoint_trust_from_mode(self, index: int) -> None:
+        """安全策略：选择“供应商默认”时必须清空自定义 Base URL。"""
+        if index != 0:
+            return
+        base = self.api_base_edit.text().strip()
+        if base:
+            self.endpoint_trust_combo.setCurrentIndex(1)
+            self.status_label.setText(
+                "使用自定义 Base URL 时，端点信任只能设为“自定义远程 HTTPS”。"
+                "如需“供应商默认”，请先清空 Base URL。"
+            )
+
+    def reset_to_provider_default(self) -> None:
+        """Explicitly reset endpoint/model guidance without changing the key."""
+        provider = self._provider_values[self.provider_combo.currentIndex()]
+        spec = provider_spec(provider)
+        self.api_base_edit.setText(spec.default_api_base)
+        self.model_name_edit.setText(self.DEFAULT_MODELS.get(provider, ""))
+
+
+def inspect_llm_draft(config_data: dict) -> dict:
+    """Headless validation state used by the UI and its policy tests."""
+    try:
+        profile = build_llm_profile(
+            config_data,
+            require_confirmation=False,
+        )
+    except ProfileValidationError as exc:
+        state = "unsupported" if exc.code == "unsupported_tool_capability" else "invalid"
+        return {
+            "state": state,
+            "error": exc,
+            "profile": None,
+            "fingerprint": "",
+            "requires_confirmation": False,
+            "requires_tool_trust": False,
+        }
+
+    decision = resolve_tool_capability(profile)
+    fingerprint = capability_confirmation_for(profile)
+    capability_confirmed = config_data.get("capability_confirmation") == fingerprint
+    tool_trust_required = requires_tool_trust_confirmation(profile)
+    tool_trust_confirmed = config_data.get("tool_trust_confirmation") == fingerprint
+    requires_confirmation = (
+        decision.state is CapabilityState.UNKNOWN and not capability_confirmed
+    ) or (tool_trust_required and not tool_trust_confirmed)
+    return {
+        "state": decision.state.value,
+        "error": None,
+        "profile": profile,
+        "decision": decision,
+        "fingerprint": fingerprint,
+        "requires_confirmation": requires_confirmation,
+        "requires_tool_trust": tool_trust_required and not tool_trust_confirmed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +770,11 @@ class SettingUI(QFrame):
         self.cards["intent"] = IntentConfigCard()
         self.cards["prompt"] = PromptConfigCard()
 
+        # 保留别名，方便 LiteLLM 验证逻辑直接引用
+        self.llm_config_card = self.cards["llm"]
+        self.prompt_config_card = self.cards["prompt"]
+        self.business_hours_card = self.cards["basic"]
+
         for key in self.PAGE_KEYS:
             scroll = ScrollArea()
             scroll.setWidgetResizable(True)
@@ -677,9 +852,14 @@ class SettingUI(QFrame):
                     "db_path": config.get("db_path", "./temp/channel_shop.db"),
                 },
                 "llm": {
-                    "api_base": config.get("llm.api_base", "https://ark.cn-beijing.volces.com/api/v3"),
+                    "provider": config.get("llm.provider", "openai_compatible"),
+                    "api_base": config.get("llm.api_base", ""),
                     "api_key": config.get("llm.api_key", ""),
                     "model_name": config.get("llm.model_name", ""),
+                    "endpoint_trust_mode": config.get("llm.endpoint_trust_mode", "default"),
+                    "tool_policy": config.get("llm.tool_policy", "enabled"),
+                    "capability_confirmation": config.get("llm.capability_confirmation", ""),
+                    "tool_trust_confirmation": config.get("llm.tool_trust_confirmation", ""),
                 },
                 "ai_reply": {
                     "read_seconds_min": config.get("ai_reply.read_seconds_min", 6),
@@ -724,7 +904,8 @@ class SettingUI(QFrame):
             self.logger.info("配置加载成功")
         except Exception as e:
             self.logger.error(f"加载配置失败: error_type={type(e).__name__}")
-            QMessageBox.warning(self, "加载失败", f"加载配置失败：{str(e)}")
+            safe_message = getattr(e, "safe_message", f"加载配置失败：{str(e)}")
+            QMessageBox.warning(self, "加载失败", safe_message)
 
     # ---- 收集与校验：UI -> dict ------------------------------------------
 
@@ -767,11 +948,72 @@ class SettingUI(QFrame):
 
         return None
 
+    def _confirm_llm_profile(self, llm_config: dict, validation: dict) -> bool:
+        if not validation["requires_confirmation"]:
+            return True
+        decision = validation.get("decision")
+        provider_name = decision.provider.value if decision else llm_config.get("provider", "")
+        model_name = llm_config.get("model_name", "")
+        message = (
+            f"{provider_name} / {model_name} 的工具调用能力或端点信任尚未验证。\n"
+            "只有确认当前供应商、模型、Base URL 和工具策略后，才会启用并保存。\n"
+            "取消将保留当前有效配置，编辑内容只作为未确认草稿。"
+        )
+        reply = QMessageBox.question(
+            self,
+            "确认模型能力与端点信任",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.llm_config_card.status_label.setText("未确认：当前草稿不会启用")
+            return False
+        fingerprint = validation["fingerprint"]
+        llm_config["capability_confirmation"] = fingerprint
+        if validation["requires_tool_trust"]:
+            llm_config["tool_trust_confirmation"] = fingerprint
+        return True
+
+    def _validate_llm_for_save(self, llm_config: dict) -> dict | None:
+        validation = inspect_llm_draft(llm_config)
+        if validation["state"] in {"invalid", "unsupported"}:
+            error = validation["error"]
+            self.llm_config_card.status_label.setText(error.safe_message)
+            QMessageBox.warning(self, "LLM 配置错误", error.safe_message)
+            return None
+        if not self._confirm_llm_profile(llm_config, validation):
+            return None
+        try:
+            profile = build_llm_profile(llm_config)
+        except ProfileValidationError as exc:
+            self.llm_config_card.status_label.setText(exc.safe_message)
+            QMessageBox.warning(self, "LLM 配置错误", exc.safe_message)
+            return None
+        llm_config.update(
+            {
+                "provider": profile.provider.value,
+                "endpoint_trust_mode": profile.endpoint_trust_mode.value,
+                "tool_policy": profile.tool_policy.value,
+                "capability_confirmation": profile.capability_confirmation,
+                "tool_trust_confirmation": profile.tool_trust_confirmation,
+            }
+        )
+        self.llm_config_card.status_label.setText(
+            f"已验证：{profile.provider.value} / {profile.model_name}"
+        )
+        return llm_config
+
     # ---- 保存：UI -> config -> 磁盘 --------------------------------------
 
     def onSaveConfig(self):
         try:
             parts = self._collect()
+
+            # 校验 LLM profile（含供应商/端点/工具能力确认）
+            parts["llm"] = self._validate_llm_for_save(parts["llm"])
+            if parts["llm"] is None:
+                return
 
             # 必填项检查
             if not parts["llm"].get("api_key"):
@@ -806,7 +1048,7 @@ class SettingUI(QFrame):
 
             InfoBar.success(
                 title="保存成功",
-                content="配置已写入 config.json",
+                content="配置已保存；正在运行的账号将在下次停止并重新启动后使用新模型。",
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP,
@@ -824,7 +1066,8 @@ class SettingUI(QFrame):
 
         except Exception as e:
             self.logger.error(f"保存配置失败: error_type={type(e).__name__}")
-            QMessageBox.critical(self, "保存失败", f"保存配置时发生错误：{str(e)}")
+            safe_message = getattr(e, "safe_message", f"保存配置时发生错误：{str(e)}")
+            QMessageBox.critical(self, "保存失败", safe_message)
 
     def onResetConfig(self):
         reply = QMessageBox.question(
@@ -852,4 +1095,5 @@ class SettingUI(QFrame):
                 )
             except Exception as e:
                 self.logger.error(f"重置配置失败: error_type={type(e).__name__}")
-                QMessageBox.critical(self, "重置失败", f"重置配置失败：{str(e)}")
+                safe_message = getattr(e, "safe_message", f"重置配置失败：{str(e)}")
+                QMessageBox.critical(self, "重置失败", safe_message)

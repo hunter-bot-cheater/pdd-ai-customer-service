@@ -95,6 +95,7 @@ class CustomerAgent(Bot):
 
         # 子组件（延迟初始化）
         self._llm_client: Optional[LLMClient] = None
+        self._active_profile = None
         self._message_builder: Optional[MessageBuilder] = None
         self._tool_executor: Optional[ToolExecutor] = None
         self._session_manager: Optional[SessionManager] = None
@@ -127,11 +128,13 @@ class CustomerAgent(Bot):
             if not self._config.validate():
                 return False
 
+            # Snapshot the complete validated profile.  A later settings save
+            # must not mutate this account's in-flight client.
+            self._active_profile = self._config.profile
+
             # 3. 初始化 LLM 客户端
             self._llm_client = LLMClient(
-                api_key=self._config.api_key,
-                api_base=self._config.api_base,
-                model_name=self._config.model_name,
+                profile=self._active_profile,
                 temperature=self._config.temperature,
             )
             await self._llm_client.initialize()
@@ -185,6 +188,7 @@ class CustomerAgent(Bot):
             self._session_manager = None
             self._message_builder = None
             self._tool_executor = None
+            self._active_profile = None
             self._tools = []
             self._conversation_locks.clear()
             self._is_initialized = False
@@ -535,6 +539,7 @@ class CustomerAgent(Bot):
                         {"role": "user", "content": summary_prompt},
                     ],
                     tool_choice="none",
+                    use_tools=False,
                 )
                 return response.content or "[摘要生成失败]"
             except Exception as e:

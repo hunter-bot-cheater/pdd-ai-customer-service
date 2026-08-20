@@ -17,11 +17,18 @@ from contextlib import contextmanager
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from utils.runtime_path import get_config_path
 from utils.secret_store import protect_secret, unprotect_secret
+from utils.llm_provider import (
+    EndpointTrustMode,
+    LLMProvider,
+    ToolPolicy,
+    build_llm_profile,
+    migrate_llm_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class ModelType(str, Enum):
+class _LegacyModelType(str, Enum):
     """模型类型枚举"""
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
@@ -29,12 +36,33 @@ class ModelType(str, Enum):
     KIMI = "kimi"
     CLAUDE = "claude"
 
+# Backwards-compatible name retained for callers that imported the old enum;
+# the typed LLM profile uses the newer explicit ``LLMProvider`` enum below.
+ModelType = _LegacyModelType
+
+
 class LLMConfig(BaseModel):
     """LLM 配置模型"""
     model_config = ConfigDict(arbitrary_types_allowed=True)
+    provider: LLMProvider = Field(
+        default=LLMProvider.OPENAI_COMPATIBLE,
+        description="模型供应商身份",
+    )
     model_name: str = Field(default="", description="模型名称")
     api_key: str = Field(default="", description="API密钥")
     api_base: str = Field(default="", description="API地址")
+
+
+    endpoint_trust_mode: EndpointTrustMode = Field(
+        default=EndpointTrustMode.DEFAULT,
+        description="端点信任模式",
+    )
+    tool_policy: ToolPolicy = Field(
+        default=ToolPolicy.ENABLED,
+        description="工具调用策略",
+    )
+    capability_confirmation: str = Field(default="", description="能力确认指纹")
+    tool_trust_confirmation: str = Field(default="", description="工具端点信任指纹")
 
 
 class BusinessHoursConfig(BaseModel):
@@ -114,9 +142,14 @@ config_base = {
         "coalesce_window_sec": 6
     },
     "llm": {
+        "provider": LLMProvider.OPENAI_COMPATIBLE.value,
         "model_name": "",
         "api_key": "",
-        "api_base": ""
+        "api_base": "",
+        "endpoint_trust_mode": EndpointTrustMode.DEFAULT.value,
+        "tool_policy": ToolPolicy.ENABLED.value,
+        "capability_confirmation": "",
+        "tool_trust_confirmation": "",
     },
     "intent": {
         "enabled": True,
@@ -184,6 +217,7 @@ class Config:
         self.config_path = Path(config_path) if config_path else get_config_path()
         self.last_error: Optional[str] = None
         self._needs_secret_migration = False
+        self._needs_schema_migration = False
         self.auto_create = auto_create
 
         # 线程安全锁
@@ -206,7 +240,8 @@ class Config:
                 raw_config_data = json.load(f)
 
             self._needs_secret_migration = self._has_plaintext_secrets(raw_config_data)
-            config_data = self._restore_secrets(raw_config_data)
+            migrated_config, self._needs_schema_migration = migrate_llm_config(raw_config_data)
+            config_data = self._restore_secrets(migrated_config)
 
             # 验证配置格式
             validated_config = ConfigModel(**config_data)
@@ -237,11 +272,14 @@ class Config:
             try:
                 self._config = self._load_config()
                 self.last_error = None
-                if os.name == "nt" and self._needs_secret_migration:
-                    # Migrate legacy plaintext API keys on the next successful
-                    # load; this is an atomic rewrite and preserves all fields.
-                    self.save()
-                    self._needs_secret_migration = False
+                if (os.name == "nt" and self._needs_secret_migration) or self._needs_schema_migration:
+                    # Persist legacy migration only after complete typed
+                    # validation.  ``save`` replaces the file atomically.
+                    if self.save():
+                        self._needs_secret_migration = False
+                        self._needs_schema_migration = False
+                    else:
+                        logger.error("configuration migration could not be persisted")
                 return self._config
             except ConfigFileNotFoundError:
                 if self.auto_create:
@@ -329,6 +367,9 @@ class Config:
             if self._config is None:
                 self._config = copy.deepcopy(config_base)
 
+            original_config = copy.deepcopy(self._config)
+            original_validated = copy.deepcopy(self._validated_config)
+
             # 解析嵌套键
             keys = key.split('.')
             current = self._config
@@ -345,9 +386,13 @@ class Config:
             # 重新验证配置
             try:
                 self._validated_config = ConfigModel(**self._config)
-                if save:
-                    self.save()
+                if save and not self.save():
+                    raise ConfigError("配置持久化失败，已保留原有有效配置")
             except Exception as e:
+                self._config = original_config
+                self._validated_config = original_validated
+                if isinstance(e, ConfigError):
+                    raise
                 raise ConfigValidationError(f"设置配置项失败: {e}")
 
             return value
@@ -367,16 +412,24 @@ class Config:
             if self._config is None:
                 self._config = copy.deepcopy(config_base)
 
+            original_config = copy.deepcopy(self._config)
+            original_validated = copy.deepcopy(self._validated_config)
+
             # 深度合并配置
             merged_config = self._deep_merge(self._config, config_dict)
+            merged_config, _ = migrate_llm_config(merged_config)
 
             try:
                 self._validated_config = ConfigModel(**merged_config)
                 self._config = merged_config
-                if save:
-                    self.save()
+                if save and not self.save():
+                    raise ConfigError("配置持久化失败，已保留原有有效配置")
                 return self._config
             except Exception as e:
+                self._config = original_config
+                self._validated_config = original_validated
+                if isinstance(e, ConfigError):
+                    raise
                 raise ConfigValidationError(f"批量更新配置失败: {e}")
 
     def save(self) -> bool:
@@ -471,7 +524,8 @@ class Config:
         original_validated = copy.deepcopy(self._validated_config)
         try:
             yield self
-            self.save()
+            if not self.save():
+                raise ConfigError("配置持久化失败，已回滚原有有效配置")
         except Exception:
             # 回滚到原始配置
             if original_config is not None:
@@ -515,4 +569,17 @@ def update_config(config_dict: Dict[str, Any], save: bool = False) -> Dict[str, 
 def get_validated_config() -> ConfigModel:
     """全局便捷函数：获取验证后的配置模型"""
     return config.get_model()
+
+
+def get_active_llm_profile(
+    *,
+    require_confirmation: bool = True,
+    require_api_key: bool = True,
+):
+    """Return an immutable, fully validated snapshot for one runtime owner."""
+    return build_llm_profile(
+        get_validated_config().llm.model_dump(),
+        require_confirmation=require_confirmation,
+        require_api_key=require_api_key,
+    )
 
