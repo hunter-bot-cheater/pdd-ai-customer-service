@@ -35,11 +35,12 @@ except (OSError, KeyError, TypeError):
 # 因驱动缺失而失败。配合 pdd_login 的 channel="chrome"，用户无需安装 Playwright 浏览器。
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 _pw_datas, _pw_binaries, _pw_hidden = collect_all("playwright")
-_llm_hidden = [
-    "litellm",
-    "litellm.main",
-    "litellm.llms",
-]
+
+# litellm 的运行时数据文件（model_prices_and_context_window_backup.json 等）
+# 不会被 hiddenimports 收集，但 acompletion 会按需读取它们；不显式打包会导致
+# 打包后运行报 FileNotFoundError: .../_internal/litellm/model_prices_and_...json，
+# 进而意图分类等所有 LLM 调用失败并兜底转人工。用 collect_all 一次性带上代码与数据。
+_llm_datas, _llm_binaries, _llm_hidden = collect_all("litellm")
 for _provider_package in (
     "litellm.llms.openai",
     "litellm.llms.deepseek",
@@ -65,15 +66,14 @@ _pw_binaries = list(_pw_binaries) + _pw_node
 a = Analysis(
     [str(PROJECT_ROOT / "app.py")],
     pathex=[str(PROJECT_ROOT)],
-    binaries=_pw_binaries,
+    binaries=_pw_binaries + _llm_binaries,
     datas=[
         # 图标文件
         (str(PROJECT_ROOT / "icon" / "icon.ico"), "icon"),
         (str(PROJECT_ROOT / "icon" / "Customer-Agent-qr.png"), "icon"),
-        # 注：config.json 不打进 exe。首次运行 Config(auto_create=True) 会在
-        # %LOCALAPPDATA%\Agent-Customer\config.json 自动生成默认配置（含 webhook 段
-        # 注释模板、ai_reply.max_sentences 等），用户再在 UI 里填 webhook/prompt 等。
-    ] + _pw_datas,
+        # litellm 运行时数据文件（价格表/上下文窗口 json 等），缺失会导致打包后
+        # 调用 LLM 抛 FileNotFoundError 而误转人工。
+    ] + _pw_datas + _llm_datas,
     hiddenimports=[
         # === PyQt6 & Fluent Widgets ===
         "PyQt6",

@@ -165,7 +165,7 @@ def create_installer_script(dist_path):
 ; 需要 NSIS (https://nsis.sourceforge.io/)
 
 !define APP_NAME "Agent-Customer"
-!define APP_VERSION "1.1.0"
+!define APP_VERSION "2.0.0"
 !define APP_PUBLISHER "Agent-Customer Team"
 !define APP_URL "https://github.com/your-repo/Agent-Customer"
 !define APP_EXE "AgentCustomer.exe"
