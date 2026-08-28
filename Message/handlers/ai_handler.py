@@ -298,15 +298,18 @@ class AIReplyHandler(BaseHandler):
                 return True  # 拦截后续处理
 
             # ===== 0. 转人工状态检测：规则 8，转人工后 AI 完全忽略该会话后续消息 =====
+            # 转人工静默期内：不回复、不打字、也不发任何企业微信通知（含"转人工后
+            # 买家新消息"通知），仅保持静默。handoff.valid_hours 到期后会话自动恢复。
             shop_id = metadata.get('shop_id')
             from_uid = metadata.get('from_uid')
             if shop_id and from_uid:
                 session_key = f"{shop_id}:{from_uid}"
                 if SessionState().is_handoff(session_key):
-                    self.logger.info(f"会话已转人工，AI 忽略该会话后续消息: session_key={session_key}")
-                    # 规则 9: 转人工后新消息仍通知人工客服（带冷却防刷屏）
-                    await self._notify_handoff_new_message(context, metadata, session_key)
-                    return True  # 直接返回，不等待、不回复
+                    self.logger.info(
+                        f"会话已转人工（静默期内），AI 忽略该会话后续消息且不通知: "
+                        f"session_key={session_key}"
+                    )
+                    return True  # 直接返回，不等待、不回复、不发企业微信
 
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)
@@ -368,6 +371,14 @@ class AIReplyHandler(BaseHandler):
             rewrite_attempts = 0
             while i < n:
                 msg = messages[i]
+                # 发送前再次确认：人工客服在生成/延迟/分条间隔期间介入，立即放弃本次回复，
+                # 避免"程序已准备发送、人已先回"的竞态下仍把 AI 回复发出去。
+                if SessionState().is_handoff(session_key):
+                    self.logger.info(
+                        f"发送前检测到人工客服介入，放弃本次待发送回复"
+                        f"（共 {n} 条，已发 {sent_count}）: session_key={session_key}"
+                    )
+                    break
                 # 需求二：清洗后为空的分条跳过，不发送（与业务码失败区分，避免误停后续分条）
                 if not self._clean_text(msg).strip():
                     self.logger.warning(f"分条 {i + 1} 清洗后为空，跳过该条: {msg!r}")
