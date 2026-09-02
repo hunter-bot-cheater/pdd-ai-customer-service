@@ -154,7 +154,14 @@ class MessageHandlerMixin:
                 self.logger.info(f"系统提示: {context.content}")
 
             elif context.type == ContextType.MALL_CS:
-                self.logger.debug(f"收到客服消息: {context.content}")
+                # 诊断：把客服侧的 from_uid / 昵称 / is_aut 一并打出，便于区分真人子账号与机器人
+                _fk = context.kwargs
+                _fuid = getattr(_fk, "from_uid", None) or ""
+                _fnick = getattr(_fk, "nickname", None) or ""
+                _faut = getattr(_fk, "is_aut", None)
+                self.logger.info(
+                    f"收到客服消息: from_uid={_fuid} nickname={_fnick} is_aut={_faut} content={context.content}"
+                )
                 # 人工客服（非本程序账号）主动回复买家 → 静默转人工：
                 # 标记该买家会话在 config.handoff.valid_hours 时长内 AI 完全静默、
                 # 不回复、也不发任何企业微信通知；过期后自动恢复自动回复。
@@ -189,6 +196,9 @@ class MessageHandlerMixin:
         kwargs = context.kwargs
         from_uid = getattr(kwargs, "from_uid", None) or ""
         to_uid = getattr(kwargs, "to_uid", None) or ""
+        is_aut = getattr(kwargs, "is_aut", None)
+        cs_uid = getattr(kwargs, "cs_uid", None) or ""
+        template_name = getattr(kwargs, "template_name", None) or ""
 
         # 过滤本账号（主账号 / 子账号）自身发出的消息，避免误标转人工
         own_uids = {
@@ -200,9 +210,29 @@ class MessageHandlerMixin:
             for u in (get_config("transfer.main_account_user_ids", []) or [])
         }
         own_uids.add(f"cs_{shop_id}_{user_id}")
+        self.logger.debug(
+            f"人工介入判定: from_uid={from_uid} to_uid={to_uid} is_aut={is_aut} "
+            f"cs_uid={cs_uid} template_name={template_name} own_uids={sorted(own_uids)}"
+        )
         if from_uid and from_uid in own_uids:
             self.logger.debug(
                 f"收到本账号发出的客服消息（from_uid={from_uid}），忽略，不标记转人工"
+            )
+            return
+
+        # 区分「真人客服子账号」与「店铺机器人(店小蜜/平台自动回复)」：
+        # 依据真实报文（2026-09-02 抓取两条 mall_cs 消息对比）：
+        #   - 真人子账号发言：from.cs_uid 存在（子账号唯一标识，如 YAEOB4MY...），
+        #     且 message 无 template_name。
+        #   - 店铺机器人发言：from 无 cs_uid（只有 csid/mall_id/role/uid），
+        #     且 message.template_name == "mall_robot_text_msg"（含 robot 字样）。
+        # 结论：有 cs_uid => 真人，应标记转人工让 AI 静默；无 cs_uid 或
+        # 模板名为 robot => 机器人，AI 继续自动回复，不静默。
+        is_robot = (not cs_uid) or ("robot" in template_name.lower())
+        if is_robot:
+            self.logger.info(
+                f"收到店铺机器人/店小蜜消息（cs_uid={cs_uid!r} template_name={template_name!r}），"
+                f"不标记转人工，AI 继续自动回复"
             )
             return
 
@@ -270,6 +300,9 @@ class MessageHandlerMixin:
             to_user=str(pdd_message.to_user or ""),
             to_uid=str(pdd_message.to_uid or ""),
             nickname=str(pdd_message.nickname or ""),
+            is_aut=pdd_message.is_aut,
+            cs_uid=pdd_message.cs_uid,
+            template_name=pdd_message.template_name,
             timestamp=pdd_message.timestamp,
             user_msg_type=pdd_message.user_msg_type,
             shop_id=str(shop_id),

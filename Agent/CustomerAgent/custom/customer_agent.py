@@ -298,7 +298,7 @@ class CustomerAgent(Bot):
 
         关键判断：LLM 生成的 3 句如果每句 25+ 字，会被 _split_reply 按 max_message_len
         切碎成 6+ 条消息。所以不能用"句数"判断，要用"切分后的消息条数"判断。
-        兜底硬切到上限 max_sentences 条（按字符硬切，可能从词中间断，但保证不超限）。
+        兜底：重试 3 次后仍超，按"句子合并"处理（绝不从词中间硬切断，保证语义完整）。
         """
         max_sentences = int(get_config("ai_reply.max_sentences", 4))
         max_message_len = int(get_config("ai_reply.max_message_len", 25))
@@ -334,11 +334,11 @@ class CustomerAgent(Bot):
                     "role": "user",
                     "content": (
                         f"【硬性要求 - 必须遵守】你刚才的回复会被切成 {cur_msg_count} 条消息 "
-                        f"（{cur_sent_count} 句话，每句太长被切碎），"
-                        f"超过了上限 {max_sentences} 条。这是不允许的。\n"
+                        f"（{cur_sent_count} 句话），超过了上限 {max_sentences} 条。这是不允许的。\n"
                         f"请重写并严格控制：\n"
-                        f"  1. 每条消息 ≤ {max_message_len} 字（短句，不要超长）\n"
-                        f"  2. 总消息条数 ≤ {max_sentences} 条\n"
+                        f"  1. 总句子数 ≤ {max_sentences} 句（按句号/问号/感叹号/分号/换行计）\n"
+                        f"  2. 每条消息 ≤ {max_message_len} 字（短句，不要超长）\n"
+                        f"  3. 总消息条数 ≤ {max_sentences} 条\n"
                         f"方法：合并重复表述，保留核心信息（政策要点、订单号、金额、规格等）。\n"
                         f"【语气要求 - 同等重要】精简后整体语气要亲切自然，像朋友聊天：\n"
                         f"  - 不要变成冷冰冰的条款罗列或电报文\n"
@@ -368,24 +368,18 @@ class CustomerAgent(Bot):
                 )
                 return content
 
-        # 兜底：重试 3 次后仍超，按 max_message_len 字符硬切，截前 max_sentences 条。
-        # 硬切可能从词中间断，但保证不超过上限（用户硬性要求）。
+        # 兜底：重试 3 次后仍超，按"句子合并"处理，绝不从词中间硬切断（保证语义完整）。
+        # 按句末标点拆分后，若句子数 > max_sentences，把第 max_sentences 句之后的内容
+        # 直接并入第 max_sentences 句（各句自带句末标点，拼接后语义连贯、不会断词）。
         final_msg_count = _estimate_message_count(content)
-        if final_msg_count > max_sentences:
+        sents = _split_by_sentence(content)
+        if final_msg_count > max_sentences and len(sents) > max_sentences:
             logger.warning(
-                f"回复精简重试 3 次后仍超 {final_msg_count} 条（上限 {max_sentences}），"
-                f"按字符硬切到上限兜底"
+                f"回复精简重试 3 次后仍超 {final_msg_count} 条（{len(sents)} 句，"
+                f"上限 {max_sentences}），改用句子合并兜底（不截断语义）"
             )
-            all_chunks: List[str] = []
-            for sent in _split_by_sentence(content):
-                if not sent:
-                    continue
-                if len(sent) <= max_message_len:
-                    all_chunks.append(sent)
-                else:
-                    for i in range(0, len(sent), max_message_len):
-                        all_chunks.append(sent[i:i + max_message_len])
-            return "".join(all_chunks[:max_sentences])
+            merged = sents[: max_sentences - 1] + ["".join(sents[max_sentences - 1:])]
+            return "".join(merged)
         return content
 
     async def _run_agent_loop(

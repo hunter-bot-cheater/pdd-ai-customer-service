@@ -781,6 +781,16 @@ class AIReplyHandler(BaseHandler):
         if not all([shop_id, user_id, from_uid]):
             return False
 
+        # 转人工前检查：若会话已处于转人工状态，不再重复标记/通知，避免真人介入后
+        # 竞态路径（如发送前检测到 handoff 进入 fallback）再次发送企业微信通知。
+        session_key = f"{shop_id}:{from_uid}"
+        if SessionState().is_handoff(session_key):
+            self.logger.info(
+                f"会话已处于转人工状态，跳过重复转接/通知: "
+                f"session_key={session_key}, reason={reason}"
+            )
+            return True
+
         from Agent.CustomerAgent.tools.move_conversation import (
             transfer_conversation,
             TransferConversationParams,
