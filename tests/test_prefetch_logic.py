@@ -13,7 +13,7 @@ import logging
 import os
 import unittest
 
-PROJ = "D:/ai客服/Customer-Agent-main"
+PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJ not in sys.path:
     sys.path.insert(0, PROJ)
 
