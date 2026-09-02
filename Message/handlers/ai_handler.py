@@ -298,18 +298,17 @@ class AIReplyHandler(BaseHandler):
                 return True  # 拦截后续处理
 
             # ===== 0. 转人工状态检测：规则 8，转人工后 AI 完全忽略该会话后续消息 =====
-            # 转人工静默期内：不回复、不打字、也不发任何企业微信通知（含"转人工后
-            # 买家新消息"通知），仅保持静默。handoff.valid_hours 到期后会话自动恢复。
             shop_id = metadata.get('shop_id')
             from_uid = metadata.get('from_uid')
             if shop_id and from_uid:
                 session_key = f"{shop_id}:{from_uid}"
                 if SessionState().is_handoff(session_key):
                     self.logger.info(
-                        f"会话已转人工（静默期内），AI 忽略该会话后续消息且不通知: "
-                        f"session_key={session_key}"
+                        f"会话已转人工，AI 忽略该会话后续消息: session_key={session_key}"
                     )
-                    return True  # 直接返回，不等待、不回复、不发企业微信
+                    # 规则 9: 转人工后新消息仍通知人工客服（带冷却防刷屏）
+                    await self._notify_handoff_new_message(context, metadata, session_key)
+                    return True  # 直接返回，不等待、不回复
 
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)

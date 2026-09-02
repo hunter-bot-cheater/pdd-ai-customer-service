@@ -614,6 +614,8 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         # 加速测试：关闭真人模拟时序等待（规则 1/2/4）
         _zero_ai_reply_delays()
         _set_inside_business_hours()
+        # 关闭消息合并：必须在构造 handler 之前设置，否则 _coalesce_enabled 会按旧值缓存
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -625,8 +627,6 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         # 隔离意图路由：本类只测"转人工后静默/忽略"，不涉及意图触发转人工
         self._intent_patch = _patch_intent_to_consult()
         self._intent_patch.start()
-        # 关闭消息合并：本类只测转人工行为，避免连发合并缓冲干扰断言
-        _app_config.set("ai_reply.enable_coalesce", False, save=False)
 
     def tearDown(self):
         self._sender_patch.stop()
@@ -1068,6 +1068,8 @@ class TestBusinessHours(unittest.IsolatedAsyncioTestCase):
         notify_tracker.clear("shop1:buyer1")
         _zero_ai_reply_delays()
         self._orig_bh = get_config("business_hours", {})
+        # 关闭消息合并：必须在构造 handler 之前设置，否则 _coalesce_enabled 会按旧值缓存
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -1089,6 +1091,7 @@ class TestBusinessHours(unittest.IsolatedAsyncioTestCase):
         self._bridge_sender_patch.stop()
         self._notify_patch.stop()
         self._intent_patch.stop()
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
         _restore_ai_reply_delays()
 
     def _set_business_window(self, start, end):
@@ -1732,6 +1735,8 @@ class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
         notify_tracker.clear("shop1:buyer1")
         _zero_ai_reply_delays()
         _set_inside_business_hours()
+        # 关闭消息合并：必须在构造 handler 之前设置，否则 _coalesce_enabled 会按旧值缓存
+        _app_config.set("ai_reply.enable_coalesce", False, save=False)
         self.bot = MockBot()
         self.handler = AIReplyHandler(bot=self.bot)
         self.sender = FakeSender()
@@ -1753,6 +1758,7 @@ class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
         self._notify_patch.stop()
         _app_config.set("transfer.main_account_user_ids", self._orig_main, save=False)
         _app_config.set("transfer.sub_account_uids", self._orig_sub, save=False)
+        _app_config.set("ai_reply.enable_coalesce", True, save=False)
         _restore_ai_reply_delays()
 
     async def _route(self, message, intent, confidence=0.9):
