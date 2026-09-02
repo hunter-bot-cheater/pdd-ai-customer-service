@@ -10,7 +10,7 @@
 import os
 import sys
 
-PROJ = "D:/ai客服/Customer-Agent-main"
+PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 os.chdir(PROJ)
 
