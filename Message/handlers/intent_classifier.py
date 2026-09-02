@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional
 
 from utils.logger_loguru import get_logger
 from config import get_config
+from utils.llm_provider import build_llm_profile
 
 logger = get_logger("IntentClassifier")
 
@@ -67,7 +68,17 @@ class IntentClassifier:
         self.api_base = get_config("llm.api_base", "")
         self.threshold = float(cfg.get("threshold", 0.6))
         self.cache_ttl = float(cfg.get("cache_ttl_seconds", cfg.get("cache_ttl", 600)))
-        self.timeout = float(cfg.get("timeout_seconds", cfg.get("timeout", 0.8)))
+        # LiteLLM transport 每次调用新建 httpx.AsyncClient，首次请求需完成
+        # DNS/TLS/连接建立，耗时明显高于旧版 requests。过短的超时会让正常
+        # 的问候/咨询消息被误判为 unknown（下游保守转人工）。这里取配置值
+        # 但强制不低于 10 秒，避免合并 LiteLLM 后频繁超时转人工。
+        configured_timeout = float(cfg.get("timeout_seconds", cfg.get("timeout", 15.0)))
+        self.timeout = max(configured_timeout, 10.0)
+        if self.timeout != configured_timeout:
+            logger.debug(
+                f"意图分类配置 timeout 过小（{configured_timeout}s），"
+                f"已提升到 {self.timeout}s 以避免 LiteLLM 首次调用超时"
+            )
         self.max_tokens = int(cfg.get("max_tokens", 32))
         # 路由阶段注入的分类上下文轮数（最近 N 条消息）；由调用方取历史时控制，
         # 这里仅记录默认值以便 debug。设为 0 表示不使用上下文（仅当前句）。
@@ -80,12 +91,22 @@ class IntentClassifier:
     def _ensure_client(self):
         if self._client is None:
             from Agent.CustomerAgent.custom.llm_client import LLMClient
-            self._client = LLMClient(
-                api_key=self.api_key,
-                api_base=self.api_base,
-                model_name=self.model_name,
-                temperature=0.0,
+
+            # 上游 LiteLLM 合并后，LLMClient 构造函数要求显式传入 provider
+            # 或已校验的 profile，不再接受裸的 api_key/api_base/model_name。
+            # 这里复用与主回复链路一致的 build_llm_profile 生成快照再传入，
+            # 否则构造即抛 "requires an explicit provider or validated profile"，
+            # 导致意图分类永远失败并兜底为 unknown（被下游判为转人工）。
+            profile = build_llm_profile(
+                {
+                    "provider": get_config("llm.provider", "zhipu"),
+                    "model_name": self.model_name,
+                    "api_key": self.api_key,
+                    "api_base": self.api_base,
+                    "endpoint_trust_mode": get_config("llm.endpoint_trust_mode", "default"),
+                }
             )
+            self._client = LLMClient(profile=profile, temperature=0.0)
         return self._client
 
     # ===== 缓存 =====
@@ -132,15 +153,24 @@ class IntentClassifier:
         cached = self._get_cache(key)
         if cached is not None:
             return cached
+        start_ts = time.time()
         try:
             result = await asyncio.wait_for(
                 self._call_llm(text, after_sale_hint, history), timeout=self.timeout
             )
         except asyncio.TimeoutError:
-            logger.warning("意图分类超时，保守返回 unknown（下游判为转人工），本次不缓存以便重试")
+            elapsed = time.time() - start_ts
+            logger.warning(
+                f"意图分类超时（limit={self.timeout:.1f}s, elapsed={elapsed:.2f}s），"
+                f"保守返回 unknown（下游判为转人工），本次不缓存以便重试"
+            )
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0}
         except Exception as e:  # pragma: no cover
-            logger.warning(f"意图分类异常，保守返回 unknown（下游判为转人工），本次不缓存: {e}")
+            elapsed = time.time() - start_ts
+            logger.warning(
+                f"意图分类异常（elapsed={elapsed:.2f}s），保守返回 unknown（下游判为转人工），"
+                f"本次不缓存: {type(e).__name__}: {e}"
+            )
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0}
         self._set_cache(key, result)
         return result

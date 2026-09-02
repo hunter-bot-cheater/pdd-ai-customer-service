@@ -4,6 +4,7 @@
 from bridge.context import  ContextType
 from Message.message import ChatMessage
 from enum import IntEnum
+import json
 from typing import Any, Dict, Optional
 from utils.logger_loguru import get_logger
 
@@ -50,6 +51,12 @@ class BaseMessageHandler:
             "to_role": self.data.get("to",{}).get("role"),
             "to_uid": self.data.get("to",{}).get("uid"),
             "timestamp": self.data.get("time"),
+            "is_aut": self.data.get("is_aut"),
+            # 区分真人客服子账号与店铺机器人（店小蜜）的关键字段：
+            # 真人子账号发言时 from.cs_uid 存在（子账号唯一标识），机器人消息无此字段。
+            "cs_uid": self.data.get("from",{}).get("cs_uid"),
+            # 机器人模板消息标识，如 mall_robot_text_msg；真人普通消息无此字段。
+            "template_name": self.data.get("template_name"),
         }
 
         
@@ -165,12 +172,21 @@ class PDDChatMessage(ChatMessage):
         self.from_uid = basic_info.get("from_uid")
         self.to_user = basic_info.get("to_role")
         self.to_uid = basic_info.get("to_uid")
-        
+        self.is_aut = basic_info.get("is_aut")
+        # 区分真人子账号与机器人
+        self.cs_uid = basic_info.get("cs_uid")
+        self.template_name = basic_info.get("template_name")
+
         # 检查是否非用户消息
         if self.from_user == "mall_cs":
             self.user_msg_type = ContextType.MALL_CS
             self.content = self.msg.get("message",{}).get("content")
-            
+            # === 诊断：打印客服侧原始报文，确认 from.uid / nickname / is_aut，
+            #     用于区分真人客服子账号与店铺机器人(店小蜜)。纯日志，不改业务逻辑。 ===
+            self.logger.info(
+                "=== 客服侧(MALL_CS)原始消息 JSON(用于区分人/机器人) ===\n"
+                + json.dumps(self.msg, ensure_ascii=False, indent=2)
+            )
             return
         # 处理消息
         self._process_message()

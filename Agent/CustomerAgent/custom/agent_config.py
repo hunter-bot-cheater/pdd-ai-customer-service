@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from config import get_config
 from utils.logger_loguru import get_logger
+from utils.llm_provider import LLMProfile, build_llm_profile
 
 logger = get_logger("AgentConfig")
 
@@ -38,9 +39,24 @@ class AgentConfig:
     temperature: float = DEFAULT_TEMPERATURE
 
     # LLM 配置
+    provider: str = field(
+        default_factory=lambda: get_config("llm.provider", "openai_compatible")
+    )
     model_name: str = field(default_factory=lambda: get_config("llm.model_name", "gpt-3.5-turbo"))
     api_key: str = field(default_factory=lambda: get_config("llm.api_key", ""))
     api_base: str = field(default_factory=lambda: get_config("llm.api_base", ""))
+    endpoint_trust_mode: str = field(
+        default_factory=lambda: get_config("llm.endpoint_trust_mode", "default")
+    )
+    tool_policy: str = field(
+        default_factory=lambda: get_config("llm.tool_policy", "enabled")
+    )
+    capability_confirmation: str = field(
+        default_factory=lambda: get_config("llm.capability_confirmation", "")
+    )
+    tool_trust_confirmation: str = field(
+        default_factory=lambda: get_config("llm.tool_trust_confirmation", "")
+    )
 
     # Prompt 配置（仅 instructions 可配置，description 和 additional_context 由代码硬编码）
     instructions: List[str] = field(default_factory=lambda: get_config("prompt.instructions", []))
@@ -54,7 +70,28 @@ class AgentConfig:
 
     def validate(self) -> bool:
         """验证配置有效性"""
-        if not self.api_key:
-            logger.error("LLM API 密钥未配置")
+        try:
+            self.profile
+            return True
+        except Exception as exc:
+            logger.error(
+                "LLM profile validation failed; "
+                f"error_type={type(exc).__name__}"
+            )
             return False
-        return True
+
+    @property
+    def profile(self) -> LLMProfile:
+        """Build an immutable validated snapshot for this agent instance."""
+        return build_llm_profile(
+            {
+                "provider": self.provider,
+                "model_name": self.model_name,
+                "api_key": self.api_key,
+                "api_base": self.api_base,
+                "endpoint_trust_mode": self.endpoint_trust_mode,
+                "tool_policy": self.tool_policy,
+                "capability_confirmation": self.capability_confirmation,
+                "tool_trust_confirmation": self.tool_trust_confirmation,
+            }
+        )

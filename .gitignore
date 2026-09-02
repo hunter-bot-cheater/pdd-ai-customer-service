@@ -18,10 +18,12 @@ build
 user_data/
 *.db
 *.db
+
+docs
 config.json
 temp/
 .claude/
-
+Agent-Customer 使用说明 .pdf
 # Backup directories
 backup/
 *.backup

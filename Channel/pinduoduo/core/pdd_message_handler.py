@@ -7,6 +7,8 @@ import json
 
 from bridge.context import ChannelType, Context, ContextType
 from Channel.pinduoduo.pdd_message import PDDChatMessage
+from config import get_config
+from core.session_state import SessionState
 from database import db_manager
 from utils.config_updater import update_config_with_uid
 from utils.logger_loguru import get_logger
@@ -152,7 +154,18 @@ class MessageHandlerMixin:
                 self.logger.info(f"系统提示: {context.content}")
 
             elif context.type == ContextType.MALL_CS:
-                self.logger.debug(f"收到客服消息: {context.content}")
+                # 诊断：把客服侧的 from_uid / 昵称 / is_aut 一并打出，便于区分真人子账号与机器人
+                _fk = context.kwargs
+                _fuid = getattr(_fk, "from_uid", None) or ""
+                _fnick = getattr(_fk, "nickname", None) or ""
+                _faut = getattr(_fk, "is_aut", None)
+                self.logger.info(
+                    f"收到客服消息: from_uid={_fuid} nickname={_fnick} is_aut={_faut} content={context.content}"
+                )
+                # 人工客服（非本程序账号）主动回复买家 → 静默转人工：
+                # 标记该买家会话在 config.handoff.valid_hours 时长内 AI 完全静默、
+                # 不回复、也不发任何企业微信通知；过期后自动恢复自动回复。
+                self._handle_human_agent_reply(context, shop_id, user_id)
 
             elif context.type == ContextType.SYSTEM_BIZ:
                 self.logger.info(f"系统业务消息: {context.content}")
@@ -166,6 +179,76 @@ class MessageHandlerMixin:
 
         except Exception as e:
             self.logger.error(f"立即处理消息失败: {e}")
+
+    def _handle_human_agent_reply(
+        self, context: Context, shop_id: str, user_id: str
+    ) -> None:
+        """检测人工客服（非本程序账号）主动回复买家，静默标记该会话转人工。
+
+        平台会把人工客服发出的消息以 MALL_CS 角色推回程序；本程序自己通过
+        SendMessage 发出的回复也可能以相同角色回灌（from_uid 为本账号
+        cs_{shop_id}_{user_id}）。必须过滤掉本账号自身的消息，否则 AI 会被自己的
+        回复误判为"人工介入"而停手。
+
+        命中后调用 SessionState.mark_handoff：在 config.handoff.valid_hours 时长内，
+        该买家会话 AI 完全静默、不回复，也不发任何企业微信通知；到期后自动恢复。
+        """
+        kwargs = context.kwargs
+        from_uid = getattr(kwargs, "from_uid", None) or ""
+        to_uid = getattr(kwargs, "to_uid", None) or ""
+        is_aut = getattr(kwargs, "is_aut", None)
+        cs_uid = getattr(kwargs, "cs_uid", None) or ""
+        template_name = getattr(kwargs, "template_name", None) or ""
+
+        # 过滤本账号（主账号 / 子账号）自身发出的消息，避免误标转人工
+        own_uids = {
+            str(u)
+            for u in (get_config("transfer.sub_account_uids", []) or [])
+        }
+        own_uids |= {
+            str(u)
+            for u in (get_config("transfer.main_account_user_ids", []) or [])
+        }
+        own_uids.add(f"cs_{shop_id}_{user_id}")
+        self.logger.debug(
+            f"人工介入判定: from_uid={from_uid} to_uid={to_uid} is_aut={is_aut} "
+            f"cs_uid={cs_uid} template_name={template_name} own_uids={sorted(own_uids)}"
+        )
+        if from_uid and from_uid in own_uids:
+            self.logger.debug(
+                f"收到本账号发出的客服消息（from_uid={from_uid}），忽略，不标记转人工"
+            )
+            return
+
+        # 区分「真人客服子账号」与「店铺机器人(店小蜜/平台自动回复)」：
+        # 依据真实报文（2026-09-02 抓取两条 mall_cs 消息对比）：
+        #   - 真人子账号发言：from.cs_uid 存在（子账号唯一标识，如 YAEOB4MY...），
+        #     且 message 无 template_name。
+        #   - 店铺机器人发言：from 无 cs_uid（只有 csid/mall_id/role/uid），
+        #     且 message.template_name == "mall_robot_text_msg"（含 robot 字样）。
+        # 结论：有 cs_uid => 真人，应标记转人工让 AI 静默；无 cs_uid 或
+        # 模板名为 robot => 机器人，AI 继续自动回复，不静默。
+        is_robot = (not cs_uid) or ("robot" in template_name.lower())
+        if is_robot:
+            self.logger.info(
+                f"收到店铺机器人/店小蜜消息（cs_uid={cs_uid!r} template_name={template_name!r}），"
+                f"不标记转人工，AI 继续自动回复"
+            )
+            return
+
+        if not to_uid:
+            self.logger.debug("无法识别买家 UID，跳过人工介入静默标记")
+            return
+
+        session_key = f"{shop_id}:{to_uid}"
+        try:
+            SessionState().mark_handoff(session_key)
+            self.logger.info(
+                f"检测到人工客服主动回复，会话静默转人工（不再回复且不通知）: "
+                f"session_key={session_key}"
+            )
+        except Exception as e:
+            self.logger.error(f"人工介入静默标记失败（不影响主流程）: {e}")
 
     def _capture_auth_uid(self, context: Context) -> None:
         """认证成功后捕获完整 UID 并写入 config.json
@@ -217,6 +300,9 @@ class MessageHandlerMixin:
             to_user=str(pdd_message.to_user or ""),
             to_uid=str(pdd_message.to_uid or ""),
             nickname=str(pdd_message.nickname or ""),
+            is_aut=pdd_message.is_aut,
+            cs_uid=pdd_message.cs_uid,
+            template_name=pdd_message.template_name,
             timestamp=pdd_message.timestamp,
             user_msg_type=pdd_message.user_msg_type,
             shop_id=str(shop_id),
