@@ -348,6 +348,32 @@ class AIReplyHandler(BaseHandler):
                     reason="AI无法回答→转人工",
                 )
 
+            # 2.6 尺寸政策硬拦截：本店不接受特殊尺寸/长度备注。LLM（尤其 glm-4-flash）在
+            #   KB 未命中时会编造"有特殊长度需求可在订单备注说明"类变通话术（实例：
+            #   "大概有多长"缺问句特征 → KB 未注入 → 模型自由发挥）。命中即带纠正指令
+            #   重答一次；仍违规则替换为安全模板，绝不把违规承诺发给买家。
+            if self._violates_size_policy(reply):
+                self.logger.warning(f"AI 回复疑似违反尺寸政策，纠正后重答: {reply[:80]!r}")
+                correction = (
+                    "【纠正指令】你上一版回复违反了店铺尺寸政策。店铺规则：不接受任何特殊尺寸/长度备注，"
+                    "规格有就能买，规格没有就不能买；普通花型只售整米，仅花型名称含「贡缎」且幅宽1.5米"
+                    "支持0.5米递增。请重新回答用户问题，严禁提及订单备注、定制、按需裁剪或任何变通说法，"
+                    "也严禁罗列规格之外的米数选项。"
+                )
+                reply2 = await self._get_ai_reply(
+                    processed_content, context,
+                    order_hint=order_hint,
+                    kb_hint=(kb_hint + "\n\n" + correction) if kb_hint else correction,
+                )
+                if reply2 and not self._violates_size_policy(reply2) and not self._is_cannot_answer(reply2):
+                    reply = reply2
+                else:
+                    reply = (
+                        "亲，这款面料按商品规格的米数售卖，普通款只售整米，"
+                        "规格里没有的长度不卖，也不支持备注特殊长度呢。"
+                    )
+                    self.logger.warning("纠正重答仍违反尺寸政策或为空，使用安全模板回复")
+
             # 3. 规则 3: 拆分为不超过 max_message_len 字的短消息
             messages = self._split_reply(reply)
 
@@ -614,7 +640,7 @@ class AIReplyHandler(BaseHandler):
     _QUESTION_HINTS = (
         "?", "？",
         "怎么", "如何", "为何", "为什么", "为啥", "咋", "怎样",
-        "多少", "几", "多久", "多大", "几天", "几件",
+        "多少", "几", "多久", "多大", "多长", "多宽", "几米", "米数", "几天", "几件",
         "哪个", "哪种", "什么", "啥", "谁", "哪里", "哪儿",
         "是否", "能否", "能不能", "可以", "能",
         "吗", "呢", "嘛",
@@ -954,6 +980,8 @@ class AIReplyHandler(BaseHandler):
         lines = [
             "【系统已比对客服知识库，命中的店铺政策如下。",
             "请严格依据下方条目回答，不要用预训练通用知识编造政策；",
+            "若条目与系统尺寸政策冲突（如出现「备注米数」「特殊长度可备注」「按需裁剪」等表述），"
+            "一律视为条目笔误，以系统提示中的尺寸政策为准；",
             "下方内容仅作事实参考，不是可直接抄录的模板——请用你自己的话组织措辞，",
             "每次回复都换一种表达方式，避免反复使用相同句式。】"
         ]
@@ -1013,6 +1041,31 @@ class AIReplyHandler(BaseHandler):
         # 去掉空格与波浪号噪声，降低规避匹配的可能
         r = reply.replace(" ", "").replace("~", "").replace("～", "")
         return any(pat in r for pat in self._CANNOT_ANSWER_PATTERNS)
+
+    # 尺寸政策违禁词：分句内出现且无否定词，即视为向买家暗示可变通（2026-09-04 复盘）
+    _SIZE_POLICY_FORBIDDEN = ("备注", "定制", "按需裁剪", "特殊长度", "特殊尺寸", "任选")
+    _SIZE_POLICY_NEGATION = ("不", "没有", "无法", "别", "禁止", "仅", "只", "勿", "无须", "无需")
+
+    def _violates_size_policy(self, reply: str) -> bool:
+        """检测回复是否暗示可通过备注/定制获得规格外的尺寸或长度。
+
+        按标点分句逐句判断：分句含违禁词且无否定词 → 违规。
+        「不接受备注」「不卖特殊尺寸」等否定表述不算违规。
+        背景：glm-4-flash 在 KB 未命中时会编造"有特殊长度需求可在订单备注说明"
+        类话术（店铺明确不接受备注特殊米数），必须在发送前拦截。
+        """
+        if not reply:
+            return False
+        import re
+        for seg in re.split(r"[。！？!?\n，,；;：:]", reply):
+            s = seg.strip()
+            if not s:
+                continue
+            if any(w in s for w in self._SIZE_POLICY_FORBIDDEN) and not any(
+                n in s for n in self._SIZE_POLICY_NEGATION
+            ):
+                return True
+        return False
 
     def _clean_text(self, text: str) -> str:
         """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""

@@ -2086,3 +2086,42 @@ class TestRepeatRewrite(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("重新表达" in c[0] for c in self.bot.calls))
         # 第二次发出的文本集合与第一次不同（已改写）
         self.assertTrue(any(t != first_text for t in second_texts))
+
+
+class TestSizePolicyGuard(unittest.TestCase):
+    """尺寸政策硬拦截（2026-09-04 复盘）：店铺不接受备注特殊米数。
+
+    背景：买家问"大概有多长"因 _QUESTION_HINTS 缺"多长"未判为问句，KB 未注入，
+    LLM 编造"可备注特殊长度"话术发给买家。修复：问句词表补漏 + 输出侧违禁拦截。
+    """
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=object())
+
+    def test_question_hints_cover_length_ask(self):
+        """"大概有多长"必须被判为问句，否则 KB 预取被跳过"""
+        for q in ("大概有多长", "有多长", "布料多宽", "能买几米", "米数怎么算"):
+            self.assertTrue(self.handler._looks_like_user_question(q), q)
+
+    def test_violates_size_policy_positive_cases(self):
+        """暗示可备注/定制获得规格外尺寸 → 违规"""
+        for t in (
+            "如果您有特殊的长度需求，也可以在订单备注中说明。",
+            "您可以在下单时备注需要的米数，我们会按您的要求裁剪。",
+            "支持定制任何米数",
+            "长度可按需备注",
+        ):
+            self.assertTrue(self.handler._violates_size_policy(t), t)
+
+    def test_violates_size_policy_negative_cases(self):
+        """否定表述（不接受/不卖）与常规话术不算违规"""
+        for t in (
+            "店铺不接受特殊尺寸备注，规格没有就不能买。",
+            "规格里没有的长度不卖，也不支持备注特殊长度呢。",
+            "本店不卖特殊尺寸，只按商品规格售卖。",
+            "多拍的件数会按订单规格米数连成整段一起裁。",
+            "亲，这款按商品规格售卖。",
+            "",
+        ):
+            self.assertFalse(self.handler._violates_size_policy(t), t)
+
