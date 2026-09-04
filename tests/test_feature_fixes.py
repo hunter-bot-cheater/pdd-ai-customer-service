@@ -645,22 +645,20 @@ class TestAIHandlerHandoff(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.calls, [])
         # 不再重复触发转人工 API
         self.assertEqual(self.sender.calls["transfer_to_cs"], [])
-        # 规则 9: 新消息仍通知人工客服，原因标注"转人工后买家新消息"
-        self.assertEqual(len(self.capture.messages), 1)
-        self.assertIn("转人工后买家新消息", self.capture.messages[0])
-        self.assertIn("在吗，请问发货了吗", self.capture.messages[0])
+        # 转人工仅首次通知；后续买家新消息静默，不再发任何企业微信通知
+        self.assertEqual(self.capture.messages, [])
 
     async def test_handoff_new_message_notify_cooldown(self):
-        """规则 9: 同会话冷却期内再次来消息，不重复通知（防刷屏）"""
+        """转人工后买家连续发多条消息，全程静默不通知（防刷屏）"""
         SessionState().mark_handoff("shop1:buyer1")
         context = make_context("在吗")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
-        self.assertEqual(len(self.capture.messages), 1)
-        # 冷却期内（5 分钟内）第二条消息 → 不再通知
+        self.assertEqual(self.capture.messages, [])
+        # 再来多条消息，依然零通知
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
-        self.assertEqual(len(self.capture.messages), 1)
+        self.assertEqual(self.capture.messages, [])
 
     async def test_handoff_expired_ai_replies_normally(self):
         # 已过期（标记 0.1 秒）
@@ -1211,12 +1209,6 @@ class TestNotifyTracker(unittest.TestCase):
         tracker.update_notify("shop1:buyer1")
         tracker.clear("shop1:buyer1")
         self.assertTrue(tracker.should_notify("shop1:buyer1"))
-
-    def test_module_singleton_shared_between_modules(self):
-        """规则 9: notify_tracker 是模块级单例，move_conversation 与 ai_handler 共用"""
-        from Message.handlers.ai_handler import notify_tracker as ai_notify_tracker
-        self.assertIsInstance(notify_tracker, NotifyTracker)
-        self.assertIs(ai_notify_tracker, notify_tracker)
 
 
 # ============================================================================

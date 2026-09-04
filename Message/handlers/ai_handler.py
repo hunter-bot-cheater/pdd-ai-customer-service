@@ -14,7 +14,6 @@ from .preprocessor import MessagePreprocessor
 from Agent.bot import Bot
 from config import get_config
 from core.session_state import SessionState
-from core.notify_tracker import notify_tracker
 from core.uid_send_tracker import UIDSendTracker
 
 
@@ -304,10 +303,9 @@ class AIReplyHandler(BaseHandler):
                 session_key = f"{shop_id}:{from_uid}"
                 if SessionState().is_handoff(session_key):
                     self.logger.info(
-                        f"会话已转人工，AI 忽略该会话后续消息: session_key={session_key}"
+                        f"会话已转人工，AI 忽略该会话后续消息（静默，不回复不再通知）: session_key={session_key}"
                     )
-                    # 规则 9: 转人工后新消息仍通知人工客服（带冷却防刷屏）
-                    await self._notify_handoff_new_message(context, metadata, session_key)
+                    # 转人工仅首次通知；后续买家新消息静默忽略，不重复发企业微信通知
                     return True  # 直接返回，不等待、不回复
 
             # 1. 预处理消息
@@ -356,9 +354,10 @@ class AIReplyHandler(BaseHandler):
                 self.logger.warning(f"AI 回复疑似违反尺寸政策，纠正后重答: {reply[:80]!r}")
                 correction = (
                     "【纠正指令】你上一版回复违反了店铺尺寸政策。店铺规则：不接受任何特殊尺寸/长度备注，"
-                    "规格有就能买，规格没有就不能买；普通花型只售整米，仅花型名称含「贡缎」且幅宽1.5米"
-                    "支持0.5米递增。请重新回答用户问题，严禁提及订单备注、定制、按需裁剪或任何变通说法，"
-                    "也严禁罗列规格之外的米数选项。"
+                    "规格有就能买，规格没有就不能买。判断标准看当前咨询的商品：花型名称含「贡缎」且"
+                    "幅宽1.5米的商品支持0.5米递增（1.5米、2.5米、3.5米等规格里有的都能买）；"
+                    "普通花型只售整米。请重新回答用户问题，严禁提及订单备注、定制、按需裁剪或任何变通说法，"
+                    "也严禁罗列规格之外的米数选项，就事论事，不要附带与当前商品无关的话术。"
                 )
                 reply2 = await self._get_ai_reply(
                     processed_content, context,
@@ -369,8 +368,8 @@ class AIReplyHandler(BaseHandler):
                     reply = reply2
                 else:
                     reply = (
-                        "亲，这款面料按商品规格的米数售卖，普通款只售整米，"
-                        "规格里没有的长度不卖，也不支持备注特殊长度呢。"
+                        "亲，这款面料按商品规格的米数售卖，规格里有的长度都可以下单，"
+                        "不支持备注特殊长度呢。"
                     )
                     self.logger.warning("纠正重答仍违反尺寸政策或为空，使用安全模板回复")
 
@@ -450,28 +449,6 @@ class AIReplyHandler(BaseHandler):
                 f"AI回复处理失败: error_type={type(e).__name__}"
             )
             return await self._handle_fallback(context, metadata)
-
-    async def _notify_handoff_new_message(self, context: Context, metadata: Dict[str, Any], session_key: str) -> None:
-        """规则 9: 转人工后买家新消息仍通知人工客服（同会话 5 分钟冷却防刷屏）"""
-        try:
-            if not notify_tracker.should_notify(session_key):
-                self.logger.debug(f"会话通知处于冷却期内，跳过通知: session_key={session_key}")
-                return
-
-            # 延迟导入，避免与 Message 包产生循环依赖
-            from Message.handlers.notify import build_handoff_message, send_wechat_notification_sync
-            shop_name = metadata.get('shop_name') or getattr(context.kwargs, 'shop_name', '') or ""
-            message = build_handoff_message(
-                shop_name=shop_name,
-                buyer_uid=metadata.get('from_uid') or "",
-                reason="转人工后买家新消息",
-                last_message=context.content or "",
-            )
-            await asyncio.to_thread(send_wechat_notification_sync, message)
-            notify_tracker.update_notify(session_key)
-            self.logger.info(f"已通知人工客服买家新消息: session_key={session_key}")
-        except Exception as e:
-            self.logger.error(f"发送转人工后新消息通知失败: {e}")
 
     def _split_reply(self, reply: str) -> List[str]:
         """规则 3: 将回复拆分为不超过 max_message_len 字的短消息
