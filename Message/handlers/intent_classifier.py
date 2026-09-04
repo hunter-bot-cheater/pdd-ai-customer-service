@@ -71,9 +71,10 @@ class IntentClassifier:
         # LiteLLM transport 每次调用新建 httpx.AsyncClient，首次请求需完成
         # DNS/TLS/连接建立，耗时明显高于旧版 requests。过短的超时会让正常
         # 的问候/咨询消息被误判为 unknown（下游保守转人工）。这里取配置值
-        # 但强制不低于 10 秒，避免合并 LiteLLM 后频繁超时转人工。
+        # 但强制不低于 12 秒：实测首次（冷启动）调用耗时约 10~11 秒，10 秒
+        # 下限会被踩穿导致首条消息必超时转人工，提到 12 秒可覆盖冷启动。
         configured_timeout = float(cfg.get("timeout_seconds", cfg.get("timeout", 15.0)))
-        self.timeout = max(configured_timeout, 10.0)
+        self.timeout = max(configured_timeout, 12.0)
         if self.timeout != configured_timeout:
             logger.debug(
                 f"意图分类配置 timeout 过小（{configured_timeout}s），"
