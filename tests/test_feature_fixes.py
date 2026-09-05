@@ -2395,3 +2395,47 @@ class TestIntegerMeterPlan(unittest.TestCase):
             compute_integer_meter_plan(100),
             [(3, 32), (2, 2)],
         )
+
+
+class TestGarmentUsageSufficiencyQuery(unittest.TestCase):
+    """成衣用量"够不够"类咨询直接转人工（2026-09-05 第二轮复盘）。
+
+    用户截图反馈"做3套小孩的衣服够吗"未识别——用量词表缺"够吗"，兜底
+    没覆盖"数量+儿童+衣服"无"给"字组合。修复后必须命中。
+    """
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=object())
+
+    def test_sufficiency_query_triggers_transfer(self):
+        """'够吗/够不够/够用/够做'类用量询问应被识别"""
+        for q in (
+            "做3套小孩的衣服够吗",
+            "做3套小孩的衣服够不够",
+            "5米够做几件衣服",
+            "9米够做3件小孩衣服吗",
+            "3套小孩的衣服够用吗",
+            "做L码的小孩衣服够不够",
+            "10米够做几套小孩的衣服",
+            "5米够做一件小孩的衣服吗",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_quantity_kid_garment_triggers(self):
+        """数字+儿童+衣服组合无'给'字也应命中（如'做3套小孩的衣服'）"""
+        for q in (
+            "做3套小孩的衣服",
+            "做5件孩子的衣服用多少米",
+            "买2套宝宝的衣服",
+            "做一条小孩裤子要多少米",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_qty_but_no_kid_garment_does_not_trigger(self):
+        """纯数量+米数问句（非儿童/非成衣）不应误伤"""
+        for q in (
+            "我要3米布",
+            "买5米怎么拍",
+            "4米可以拍吗",
+        ):
+            self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)
