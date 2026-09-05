@@ -350,28 +350,32 @@ class AIReplyHandler(BaseHandler):
             #   KB 未命中时会编造"有特殊长度需求可在订单备注说明"类变通话术（实例：
             #   "大概有多长"缺问句特征 → KB 未注入 → 模型自由发挥）。命中即带纠正指令
             #   重答一次；仍违规则替换为安全模板，绝不把违规承诺发给买家。
-            if self._violates_size_policy(reply):
-                self.logger.warning(f"AI 回复疑似违反尺寸政策，纠正后重答: {reply[:80]!r}")
+            if self._violates_size_policy(reply) or self._is_wrong_size_refusal(processed_content, reply):
+                if self._is_wrong_size_refusal(processed_content, reply):
+                    self.logger.warning(f"AI 回复错误拒绝整米长度，纠正后重答: {reply[:80]!r}")
+                else:
+                    self.logger.warning(f"AI 回复疑似违反尺寸政策，纠正后重答: {reply[:80]!r}")
                 correction = (
                     "【纠正指令】你上一版回复违反了店铺尺寸政策。店铺规则：不接受任何特殊尺寸/长度备注，"
-                    "规格有就能买，规格没有就不能买。判断标准看当前咨询的商品：花型名称含「贡缎」且"
-                    "幅宽1.5米的商品支持0.5米递增（1.5米、2.5米、3.5米等规格里有的都能买）；"
-                    "普通花型只售整米。请重新回答用户问题，严禁提及订单备注、定制、按需裁剪或任何变通说法，"
-                    "也严禁罗列规格之外的米数选项，就事论事，不要附带与当前商品无关的话术。"
+                    "规格有就能买，规格库里无法组合出来的长度就不能买。判断标准看当前咨询的商品："
+                    "花型名称含「贡缎」且幅宽1.5米的商品支持0.5米递增（1.5米、2.5米、3.5米等规格里有的都能买）；"
+                    "普通花型只售整米，但整米可以通过多拍组合实现（如4米拍2个2米、5米拍2米+3米、6米拍2个3米），"
+                    "不要对整米需求说'不支持''面料长度固定'。请重新回答用户问题，严禁提及订单备注、定制、"
+                    "按需裁剪或任何变通说法，也严禁错误拒绝可实现的整米长度，就事论事。"
                 )
                 reply2 = await self._get_ai_reply(
                     processed_content, context,
                     order_hint=order_hint,
                     kb_hint=(kb_hint + "\n\n" + correction) if kb_hint else correction,
                 )
-                if reply2 and not self._violates_size_policy(reply2) and not self._is_cannot_answer(reply2):
+                if reply2 and not self._violates_size_policy(reply2) and not self._is_wrong_size_refusal(processed_content, reply2) and not self._is_cannot_answer(reply2):
                     reply = reply2
                 else:
                     reply = (
-                        "亲，这款面料按商品规格的米数售卖，规格里有的长度都可以下单，"
-                        "不支持备注特殊长度呢。"
+                        "亲，这款面料按商品规格售卖，整米可以拍多个组合（如4米拍2个2米），"
+                        "小数米或特殊长度不支持备注呢。"
                     )
-                    self.logger.warning("纠正重答仍违反尺寸政策或为空，使用安全模板回复")
+                    self.logger.warning("纠正重答仍违反尺寸政策/错误拒售或为空，使用安全模板回复")
 
             # 3. 规则 3: 拆分为不超过 max_message_len 字的短消息
             messages = self._split_reply(reply)
@@ -1023,6 +1027,14 @@ class AIReplyHandler(BaseHandler):
     _SIZE_POLICY_FORBIDDEN = ("备注", "定制", "按需裁剪", "特殊长度", "特殊尺寸", "任选")
     _SIZE_POLICY_NEGATION = ("不", "没有", "无法", "别", "禁止", "仅", "只", "勿", "无须", "无需")
 
+    # 错误拒售话术：买家询问整米长度时，模型不能说出这些推脱/拒绝表述（2026-09-05 复盘）
+    _WRONG_REFUSAL_PATTERNS = (
+        "面料长度固定",
+        "不能修改",
+        "不支持按您要求",
+        "不支持这个长度",
+    )
+
     def _violates_size_policy(self, reply: str) -> bool:
         """检测回复是否暗示可通过备注/定制获得规格外的尺寸或长度。
 
@@ -1043,6 +1055,22 @@ class AIReplyHandler(BaseHandler):
             ):
                 return True
         return False
+
+    def _is_wrong_size_refusal(self, user_text: str, reply: str) -> bool:
+        """检测模型是否错误拒绝可实现的整米长度。
+
+        买家询问整米长度（如4米、5米、6米）时，正确答复应是"拍X个Y米组合"；
+        若模型回复"面料长度固定""不能修改""不支持按您要求...裁剪"等推脱话术，
+        视为错误拒售，需触发纠正。
+        """
+        if not user_text or not reply:
+            return False
+        import re
+
+        if not re.search(r"(?:[1-9]\d*|[一二两三四五六七八九十]+)\s*米", user_text):
+            return False
+        r = reply.replace(" ", "").replace("~", "").replace("～", "")
+        return any(pat in r for pat in self._WRONG_REFUSAL_PATTERNS)
 
     def _clean_text(self, text: str) -> str:
         """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""

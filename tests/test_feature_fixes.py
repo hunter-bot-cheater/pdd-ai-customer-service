@@ -2117,3 +2117,27 @@ class TestSizePolicyGuard(unittest.TestCase):
         ):
             self.assertFalse(self.handler._violates_size_policy(t), t)
 
+    def test_integer_meter_combination_is_allowed(self):
+        """整米长度可以通过多拍组合实现，不算违规（2026-09-05 复盘）"""
+        for user, reply in (
+            ("要四米咋办", "亲，您拍2个2米就可以，我们会连成4米一整段。"),
+            ("五米怎么买", "您拍2米和3米各一件，我们连成5米一起裁。"),
+            ("六米呢", "拍2个3米或3个2米都行。"),
+        ):
+            self.assertFalse(self.handler._violates_size_policy(reply), reply)
+            self.assertFalse(self.handler._is_wrong_size_refusal(user, reply), reply)
+
+    def test_wrong_refusal_of_integer_meter_is_caught(self):
+        """对整米需求错误地说'不支持''面料长度固定''不能修改'等应被拦截"""
+        for user, reply in (
+            ("要四米咋办", "亲很抱歉我们这边不支持按您要求的四米长度裁剪"),
+            ("五米怎么买", "我们的面料长度是固定的不能修改"),
+            ("六米呢", "不支持这个长度呢"),
+        ):
+            self.assertTrue(self.handler._is_wrong_size_refusal(user, reply), reply)
+
+    def test_non_meter_user_text_does_not_trigger_wrong_refusal(self):
+        """用户没问米数时，普通否定话术不应被误判为错误拒售"""
+        self.assertFalse(
+            self.handler._is_wrong_size_refusal("这个有货吗", "不支持这个长度呢")
+        )
