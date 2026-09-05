@@ -771,6 +771,9 @@ class AIReplyHandler(BaseHandler):
             result = await classifier.classify(
                 processed_content, after_sale_hint=after_sale_hint, history=history
             )
+            # 2026-09-05 修复：买家发"谢谢""好的""👌"等纯寒暄被 LLM 误判为 other → 强制改 consult。
+            # 避免每句礼貌回应都被踢给真人（按 should_transfer 规则 other+置信度≥阈值会触发转人工）。
+            result = self._force_consult_if_pure_thanks(processed_content, result)
         except Exception as e:
             self.logger.warning(f"意图分类异常，保守不转人工: {e}")
             return False
@@ -1031,6 +1034,69 @@ class AIReplyHandler(BaseHandler):
         # 去掉空格与波浪号噪声，降低规避匹配的可能
         r = reply.replace(" ", "").replace("~", "").replace("～", "")
         return any(pat in r for pat in self._CANNOT_ANSWER_PATTERNS)
+
+    # 纯感谢/确认短语白名单：买家说"谢谢""好的""👌"等纯礼貌回应时不应触发转人工。
+    # 背景：2026-09-05 复盘发现 LLM 把"谢谢"判为 other 且置信度 0.8，按 should_transfer
+    # 规则被转人工，导致正常对话被踢给真人客服。修复：识别纯感谢/确认短语并强制改 intent=consult。
+    _PURE_THANKS_ACK_PHRASES = (
+        "谢谢", "感谢", "谢啦", "谢了", "多谢", "tks", "thx", "3q", "thanks", "thank", "thankyou",
+        "好的", "好", "行", "可以", "没问题", "可以的", "好呀", "好的呢", "好的呀", "好嘞",
+        "嗯", "嗯嗯", "哦", "哦哦", "嗯哼", "嗯嗯嗯",
+        "ok", "okay", "okk", "👌", "👍", "🙏",
+        "收到", "了解", "明白了", "知道了", "懂了", "了解了解", "好的了解",
+        "再见", "拜拜", "bye", "👋", "下次见",
+        "辛苦了", "麻烦你了", "麻烦您了",
+    )
+    # 含售后词不算纯感谢（例："好的我退款""谢谢但要退货"必须按原始意图处理）
+    _PURE_THANKS_BLOCKERS = (
+        "退", "投诉", "差评", "骗", "假货", "质量差", "赔", "赔偿", "不满意", "过敏",
+        "破损", "漏发", "少发", "换货", "维修", "气", "烂", "骗人", "纠纷",
+    )
+
+    @classmethod
+    def _is_pure_thanks_or_ack(cls, text: str) -> bool:
+        """消息是否只含感谢/确认/礼貌等纯寒暄内容（不含售后词）。
+
+        用于意图分类后兜底：买家说"谢谢""好的""👌"等纯礼貌回应被 LLM 误判为 other
+        时强制改 consult，避免每句寒暄都踢给真人。
+        """
+        if not text:
+            return False
+        import re
+
+        t = text.strip().lower()
+        # 含售后词则不算纯感谢
+        if any(k in t for k in cls._PURE_THANKS_BLOCKERS):
+            return False
+        # 去掉常见标点/表情/空白，仅留汉字与字母数字
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff]", "", t)
+        if not cleaned:
+            # 纯表情/标点 → 视为纯寒暄（用户发个👍也应继续对话）
+            return True
+        # 全部由白名单短语拼接而成（允许重复 + 句末常见语气词 亲/哈/呀/呢/呗/啦/哦/了）
+        ack_re = re.compile(
+            r"^(?:"
+            r"谢谢|感谢|谢啦|谢了|多谢|tks|thx|3q|thanks|thank|thankyou|"
+            r"好的?|行|可以|没问题|好呀|好的呢|好的呀|好嘞|"
+            r"嗯+|嗯哼|哦+|ok|okay|okk|"
+            r"收到|了解|明白了?|知道了?|懂了|了解了解|好的了解|"
+            r"再见|拜拜|bye|下次见|"
+            r"辛苦了|麻烦你|麻烦您"
+            r")+(?:亲|哈|呀|呢|呗|啦|哦|了)*$"
+        )
+        return bool(ack_re.match(cleaned))
+
+    @classmethod
+    def _force_consult_if_pure_thanks(
+        cls, text: str, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """纯感谢/确认短语被 LLM 误判为 other → 强制改 consult，避免无谓转人工。"""
+        if not result:
+            return result or {"intent": "unknown", "confidence": 0.0}
+        intent = result.get("intent")
+        if intent == "other" and cls._is_pure_thanks_or_ack(text):
+            return {"intent": "consult", "confidence": 0.95}
+        return result
 
     # 成衣面料用量咨询：买家让估算做/买某件衣服需要多少米布。这类问题依赖版型/
     # 款式/体型，超出店铺客服能力，AI 不能估算，必须直接转人工（2026-09-05 复盘）。

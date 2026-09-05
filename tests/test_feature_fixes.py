@@ -2200,3 +2200,70 @@ class TestGarmentFabricUsageTransfer(unittest.TestCase):
             "我的订单发货了吗",
         ):
             self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)
+
+
+class TestPureThanksAckBypass(unittest.TestCase):
+    """纯感谢/确认短语不应触发转人工（2026-09-05 复盘）。
+
+    背景：买家发"谢谢"被 LLM 意图分类判为 other 置信度 0.8，按 should_transfer
+    规则直接转人工，导致正常对话被无谓踢给真人。修复：识别纯感谢/确认短语
+    强制改 intent=consult，并增加 should_transfer 兜底。
+    """
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=object())
+
+    def test_is_pure_thanks_positive(self):
+        """典型纯感谢/确认短语应被识别"""
+        for q in (
+            "谢谢", "谢谢亲", "感谢", "谢啦", "多谢",
+            "好的", "好", "行", "可以", "没问题", "好嘞",
+            "嗯", "嗯嗯", "哦", "嗯哼",
+            "ok", "okay", "OK", "👌", "👍", "🙏",
+            "收到", "了解", "明白了", "知道了", "懂了",
+            "再见", "拜拜", "👋", "bye",
+            "辛苦了", "麻烦你了",
+            "好的好的", "ok ok",
+        ):
+            self.assertTrue(AIReplyHandler._is_pure_thanks_or_ack(q), q)
+
+    def test_is_pure_thanks_negative_with_aftersale(self):
+        """含售后词的不能被识别为纯感谢"""
+        for q in (
+            "好的我要退款",
+            "谢谢但我想退货",
+            "好的，投诉你们",
+            "嗯，我要差评",
+            "感谢，问题没解决",
+        ):
+            self.assertFalse(AIReplyHandler._is_pure_thanks_or_ack(q), q)
+
+    def test_is_pure_thanks_negative_normal(self):
+        """普通问题不应被误判为纯感谢"""
+        for q in (
+            "这个有货吗", "4米怎么拍", "1.5米宽幅吗", "多少钱一米", "发货了吗",
+        ):
+            self.assertFalse(AIReplyHandler._is_pure_thanks_or_ack(q), q)
+
+    def test_force_consult_overrides_other(self):
+        """intent=other + 纯感谢 → 强制改 consult"""
+        for q in ("谢谢", "好的", "👌", "嗯嗯", "明白了", "ok"):
+            r = self.handler._force_consult_if_pure_thanks(
+                q, {"intent": "other", "confidence": 0.8}
+            )
+            self.assertEqual(r["intent"], "consult", q)
+            self.assertGreaterEqual(r["confidence"], 0.9, q)
+
+    def test_force_consult_keeps_aftersale_intent(self):
+        """含售后词的不会被强制改 consult，保持原始 intent"""
+        r = self.handler._force_consult_if_pure_thanks(
+            "好的我要退款", {"intent": "operation", "confidence": 0.9}
+        )
+        self.assertEqual(r["intent"], "operation")
+
+    def test_force_consult_keeps_unknown_intent(self):
+        """非 other 的 intent 不被改"""
+        r = self.handler._force_consult_if_pure_thanks(
+            "谢谢", {"intent": "operation", "confidence": 0.9}
+        )
+        self.assertEqual(r["intent"], "operation")
