@@ -2141,3 +2141,37 @@ class TestSizePolicyGuard(unittest.TestCase):
         self.assertFalse(
             self.handler._is_wrong_size_refusal("这个有货吗", "不支持这个长度呢")
         )
+
+
+class TestGarmentFabricUsageTransfer(unittest.TestCase):
+    """成衣面料用量咨询直接转人工（2026-09-05 复盘）。
+
+    买家让估算做某件衣服需要多少米布，依赖版型/款式/体型，AI 不能回答，必须转人工。
+    """
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=object())
+
+    def test_garment_usage_query_triggers_transfer(self):
+        """典型成衣用量咨询应被识别"""
+        for q in (
+            "做短袖要多少米布",
+            "做件衬衫要多少米",
+            "给小孩做衣服要多少米",
+            "做一套衣服要几米",
+            "做裙子需要多少布",
+            "请问158身高，95斤的身材要买多少尺寸，做件寸衫",
+            "给宝宝做件衣服用多少米",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_non_garment_meter_query_does_not_trigger(self):
+        """普通面料规格/购买咨询不应误伤"""
+        for q in (
+            "这款面料1.5米宽幅吗",
+            "4米怎么拍",
+            "5米可以拍吗",
+            "这个有货吗",
+            "你好",
+        ):
+            self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)

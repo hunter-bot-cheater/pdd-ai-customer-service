@@ -311,6 +311,15 @@ class AIReplyHandler(BaseHandler):
             # 1. 预处理消息
             processed_content = self.preprocessor.process(context.content, context.type)
 
+            # 1.4 成衣面料用量咨询直接转人工：做衣服/做短袖/给小孩做衣服要多少米布等
+            # 这类问题需要版型、款式、体型数据，AI 估算极易误导，命中即转人工。
+            if self._is_garment_fabric_usage_query(processed_content):
+                self.logger.info(f"命中成衣用量咨询，直接转人工: {processed_content[:60]}")
+                return await self._transfer_by_intent(
+                    context, metadata, processed_content or "",
+                    reason="成衣用量咨询→转人工",
+                )
+
             # 1.5 意图识别路由：基于语义判断是否需要转人工（替代旧版售后关键词硬匹配）
             # 售后咨询（consult）放行给 AI 自主回答；操作/投诉/负面情绪转人工+通知。
             if await self._maybe_transfer_by_intent(context, metadata, processed_content):
@@ -1023,6 +1032,19 @@ class AIReplyHandler(BaseHandler):
         r = reply.replace(" ", "").replace("~", "").replace("～", "")
         return any(pat in r for pat in self._CANNOT_ANSWER_PATTERNS)
 
+    # 成衣面料用量咨询：买家让估算做某件衣服需要多少米布。这类问题依赖版型、
+    # 款式、胖瘦，超出店铺客服能力，AI 不能估算，必须直接转人工（2026-09-05 复盘）。
+    _GARMENT_KEYWORDS = (
+        "衣服", "短袖", "衬衫", "寸衫", "衬衣", "裙子", "裤子", "外套", "风衣", "西装",
+        "套装", "连衣裙", "卫衣", "t恤", "马甲", "背心", "打底衫", "棉衣", "羽绒服",
+        "小孩衣服", "孩子衣服", "宝宝衣服",
+    )
+    _METER_USAGE_KEYWORDS = (
+        "多少米", "几米", "多少布", "几米布", "要多少布", "需要多少布", "多少布料",
+        "用多少米", "买多少米", "买多少布", "多少尺寸", "多大尺寸", "尺寸多少",
+    )
+    _MAKE_ACTION_KEYWORDS = ("做", "制作", "缝制", "裁剪", "给", "用")
+
     # 尺寸政策违禁词：分句内出现且无否定词，即视为向买家暗示可变通（2026-09-04 复盘）
     _SIZE_POLICY_FORBIDDEN = ("备注", "定制", "按需裁剪", "特殊长度", "特殊尺寸", "任选")
     _SIZE_POLICY_NEGATION = ("不", "没有", "无法", "别", "禁止", "仅", "只", "勿", "无须", "无需")
@@ -1071,6 +1093,28 @@ class AIReplyHandler(BaseHandler):
             return False
         r = reply.replace(" ", "").replace("~", "").replace("～", "")
         return any(pat in r for pat in self._WRONG_REFUSAL_PATTERNS)
+
+    def _is_garment_fabric_usage_query(self, text: str) -> bool:
+        """检测买家是否在问"做某件衣服需要多少米布"。
+
+        此类问题需要结合版型、款式、个人胖瘦，店铺客服无法仅凭文字估算，
+        必须直接转人工，避免 AI 瞎估导致买家误解（如"做一套衣服拍三米"）。
+        """
+        if not text:
+            return False
+        t = text.lower()
+        # 必须有衣服相关词
+        has_garment = any(k in t for k in self._GARMENT_KEYWORDS)
+        # 必须有米数/布料/尺寸用量询问
+        has_meter = any(k in t for k in self._METER_USAGE_KEYWORDS)
+        # 必须有制作/给...做/用 等动作词
+        has_action = any(k in t for k in self._MAKE_ACTION_KEYWORDS)
+        # 兜底："给小孩/孩子/宝宝 做/买 衣服" 也命中
+        has_for_child = (
+            any(k in t for k in ("给小孩", "给孩子", "给宝宝", "给闺女", "给儿子"))
+            and any(k in t for k in ("做", "买", "衣服"))
+        )
+        return (has_garment and has_meter and has_action) or has_for_child
 
     def _clean_text(self, text: str) -> str:
         """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""
