@@ -2146,15 +2146,19 @@ class TestSizePolicyGuard(unittest.TestCase):
 class TestGarmentFabricUsageTransfer(unittest.TestCase):
     """成衣面料用量咨询直接转人工（2026-09-05 复盘）。
 
-    买家让估算做某件衣服需要多少米布，依赖版型/款式/体型，AI 不能回答，必须转人工。
+    买家让估算做/买某件衣服需要多少米布，依赖版型/款式/体型，AI 不能回答，必须转人工。
+    第二轮复盘：用户报"做长袖要多少米布"识别不到，要求全面覆盖所有
+    "需要推荐买多少米布"的话术，不再要求必须同时含"做/缝制"等动作词。
     """
 
     def setUp(self):
         self.handler = AIReplyHandler(bot=object())
 
     def test_garment_usage_query_triggers_transfer(self):
-        """典型成衣用量咨询应被识别"""
+        """典型成衣用量咨询应被识别（含上装/下装/裙装/通用词）"""
         for q in (
+            # 用户原始反馈 case
+            "做长袖要多少米布",
             "做短袖要多少米布",
             "做件衬衫要多少米",
             "给小孩做衣服要多少米",
@@ -2162,16 +2166,37 @@ class TestGarmentFabricUsageTransfer(unittest.TestCase):
             "做裙子需要多少布",
             "请问158身高，95斤的身材要买多少尺寸，做件寸衫",
             "给宝宝做件衣服用多少米",
+            # 第二轮扩量
+            "做长袖需要多少布料",
+            "长袖要几米布",
+            "做条长裤要多少米",
+            "做件羽绒服需要多少布",
+            "半裙要多少米",
+            "推荐几米布做条裙子",
+            "我要做件长袖衬衫需要多少米布",
+            "这款布做一件卫衣要几米",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_for_child_garment_query_triggers(self):
+        """给小孩/孩子/宝宝 做/买 衣服 不强求用量词也算命中"""
+        for q in (
+            "给小孩做衣服",
+            "给孩子买衣服要多少布",
+            "给宝宝做件小衣服需要几米",
         ):
             self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
 
     def test_non_garment_meter_query_does_not_trigger(self):
-        """普通面料规格/购买咨询不应误伤"""
+        """普通面料规格/价格/订单咨询不应误伤"""
         for q in (
             "这款面料1.5米宽幅吗",
             "4米怎么拍",
             "5米可以拍吗",
             "这个有货吗",
             "你好",
+            "多少钱一米",
+            "这款布料啥成分",
+            "我的订单发货了吗",
         ):
             self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)
