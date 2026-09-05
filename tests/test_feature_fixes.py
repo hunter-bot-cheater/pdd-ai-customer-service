@@ -2431,11 +2431,25 @@ class TestGarmentUsageSufficiencyQuery(unittest.TestCase):
         ):
             self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
 
-    def test_qty_but_no_kid_garment_does_not_trigger(self):
-        """纯数量+米数问句（非儿童/非成衣）不应误伤"""
+    def test_quantity_any_age_garment_triggers(self):
+        """数量+衣服不限定对象（大人/老人/无对象）都应命中（2026-09-05 复盘）"""
+        for q in (
+            "做3套衣服够吗",
+            "做3件大人的衣服够吗",
+            "买2件大人的衣服需要多少米",
+            "做1套老人的衣服够不够",
+            "做3件大人的衬衫要多少布",
+            "做4条大人的裤子要多少米",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_qty_but_no_garment_does_not_trigger(self):
+        """纯数量+米数问句（无服装词）不应误伤，仍走多拍组合等正常逻辑"""
         for q in (
             "我要3米布",
             "买5米怎么拍",
             "4米可以拍吗",
+            "拍2件2米",
+            "来2米",
         ):
             self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)

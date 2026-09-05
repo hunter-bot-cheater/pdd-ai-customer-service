@@ -1194,9 +1194,9 @@ class AIReplyHandler(BaseHandler):
         1. 消息含服装款式词 AND 含面料/尺寸用量询问词（2026-09-05 复盘扩量）：
            例如"做长袖要多少米布""短袖需要多少布""推荐几米布""1.5米能做几件衣服"。
         2. 含"给小孩/孩子/宝宝 + 做/买 + 衣服"组合（例如"给小孩做衣服"）。
-        3. 数量+儿童+衣服组合（2026-09-05 复盘扩量）："做3套小孩的衣服够吗"
-           "买5件孩子的衣服用多少米"——也属于成衣用量。
-        4. "够不够"是否够用量："9米够做3件衣服吗"——也命中（用量词里含"够吗"）。
+        3. 数量/件套词 + 服装款式词（2026-09-05 复盘扩量）：不限定对象——
+           大人/老人/小孩/不提对象都算。例："做3套衣服够吗""买2件大人的衣服"
+           "做1套老人的衣服""做3件衬衫"——只要批量成衣问询，AI 无法估用量，转人工。
         """
         if not text:
             return False
@@ -1210,17 +1210,12 @@ class AIReplyHandler(BaseHandler):
             any(k in t for k in ("给小孩", "给孩子", "给宝宝", "给闺女", "给儿子"))
             and any(k in t for k in ("做", "买", "衣服"))
         )
-        # 兜底 B：数量词 + 儿童/孩子 + 衣服/衣（如"做3套小孩的衣服""5件孩子的衣服"）
-        has_qty_kid_garment = (
-            re.search(r"\d+\s*[套件条个]", t) is not None
-            and any(k in t for k in ("小孩", "孩子", "宝宝", "闺女", "儿子"))
-            and ("衣服" in t or "衣" in t)
+        # 兜底 B：数量/件套词 + 服装款式词（不限人群，如"做3套衣服""2件大人的衣服"）
+        has_qty_garment = (
+            re.search(r"(?:做|买|要|裁)?\s*\d+\s*[套件条个]", t) is not None
+            and has_garment
         )
-        return (
-            (has_garment and has_usage)
-            or has_for_child
-            or has_qty_kid_garment
-        )
+        return (has_garment and has_usage) or has_for_child or has_qty_garment
 
     def _clean_text(self, text: str) -> str:
         """移除句末标点（句号、逗号、问号、分号、感叹号），但保留小数点内的 '.'"""
