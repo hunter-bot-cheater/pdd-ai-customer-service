@@ -336,8 +336,15 @@ class AIReplyHandler(BaseHandler):
             #   故在调 LLM 之前主动按关键词查 KB，把结果作为「已知事实」注入。
             kb_hint = await self._prefetch_kb_if_needed(metadata, processed_content)
 
+            # 1.8 规格感知米数计算：买家问"X米能不能买/怎么拍"时，按商品规格程序化
+            #   计算拍法（或不可裁结论），硬性注入 prompt，LLM 只复述不自行计算。
+            meter_hint = await self._prefetch_meter_hint(metadata, processed_content, context)
+
             # 2. 调用AI生成回复（订单数据已由 1.6 预取注入；LLM 基于已知事实回复即可）
-            reply = await self._get_ai_reply(processed_content, context, order_hint=order_hint, kb_hint=kb_hint)
+            reply = await self._get_ai_reply(
+                processed_content, context,
+                order_hint=order_hint, kb_hint=kb_hint, meter_hint=meter_hint,
+            )
             if not reply:
                 self.logger.warning("AI回复生成失败，使用备用回复")
                 return await self._handle_fallback(context, metadata)
@@ -1019,7 +1026,113 @@ class AIReplyHandler(BaseHandler):
             lines.append("")
         return "\n".join(lines).strip()
 
-    async def _get_ai_reply(self, query: str, context: Context, order_hint: str = "", kb_hint: str = "") -> Optional[str]:
+    # ===== 规格感知米数计算（2026-09-05）=====
+    # 从产品知识 specifications 解析商品基础规格，程序化判断买家目标米数能否组合，
+    # 有解注入推荐拍法、无解注入"无法裁剪+最近可卖规格"，LLM 只复述不自行计算。
+
+    _CN_METER_MAP = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+    @classmethod
+    def _extract_target_meter(cls, text: str) -> Optional[float]:
+        """从买家消息提取目标米数（排除"宽1.5米/幅宽1.5米"这类幅宽表述）。"""
+        import re
+
+        if not text:
+            return None
+        tokens: List[float] = []
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*米", text):
+            prefix = text[max(0, m.start() - 2):m.start()]
+            if prefix.endswith("宽") or prefix.endswith("幅宽"):
+                continue
+            try:
+                tokens.append(float(m.group(1)))
+            except ValueError:
+                continue
+        for m in re.finditer(r"([一二两三四五六七八九十])\s*米", text):
+            prefix = text[max(0, m.start() - 2):m.start()]
+            if prefix.endswith("宽") or prefix.endswith("幅宽"):
+                continue
+            tokens.append(float(cls._CN_METER_MAP[m.group(1)]))
+        return tokens[-1] if tokens else None
+
+    @staticmethod
+    def _should_advise_meter(text: str, meter: Optional[float]) -> bool:
+        """消息像在问"买/拍/裁 X 米"才触发规格计算（避免"幅宽1.5米"纯陈述误触发）。"""
+        import re
+
+        if meter is None:
+            return False
+        return bool(re.search(r"买|拍|裁|卖|要|来|能|可以|支持|够|需要|做", text or ""))
+
+    async def _prefetch_meter_hint(self, metadata: Dict[str, Any], text: str, context: Context) -> str:
+        """米数购买/裁剪意图 → 按商品规格程序化计算拍法（或不可裁结论），注入 LLM。"""
+        from Message.handlers.meter_advisor import (
+            DEFAULT_SPECS,
+            build_meter_hint,
+            parse_meter_values,
+        )
+
+        meter = self._extract_target_meter(text)
+        if not self._should_advise_meter(text, meter):
+            return ""
+
+        shop_id = metadata.get("shop_id")
+        product_name, specs = "", None
+
+        def _load():
+            from bridge.context import make_conversation_key
+            from core.di_container import container
+            from database.knowledge_service import KnowledgeService
+
+            # 1) 会话历史最近商品卡片
+            goods_id = None
+            try:
+                session_id = make_conversation_key(context)
+                history = self.bot.get_session_history(session_id, limit=30) or []
+                for msg in reversed(history):
+                    m = re.search(r"商品ID[：:]\s*(\d+)", str((msg or {}).get("content", "")))
+                    if m:
+                        goods_id = int(m.group(1))
+                        break
+            except Exception as e:
+                self.logger.debug(f"读会话历史商品卡片失败: {e}")
+
+            ks = container.get(KnowledgeService)
+            sid = int(shop_id) if str(shop_id).isdigit() else shop_id
+            pk = ks.get_product_by_goods_id(sid, goods_id) if goods_id else None
+
+            # 2) 商品名 2-gram 模糊匹配
+            if pk is None:
+                best, best_score = None, 0
+                for cand in (ks.list_products_by_shop(sid) or []):
+                    name = cand.goods_name or ""
+                    score = sum(1 for i in range(len(name) - 1) if name[i:i + 2] in text)
+                    if score > best_score:
+                        best, best_score = cand, score
+                pk = best
+            return pk
+
+        try:
+            pk = await asyncio.to_thread(_load)
+        except Exception as e:
+            self.logger.warning(f"商品规格查询失败，按普通花型默认规格计算: {e}")
+            pk = None
+
+        if pk is not None:
+            product_name = pk.goods_name or ""
+            specs = parse_meter_values(getattr(pk, "specifications", None))
+        if not specs:
+            specs = DEFAULT_SPECS  # 无商品上下文 → 普通花型默认 1/2/3
+
+        hint = build_meter_hint(float(meter), specs, product_name)
+        self.logger.info(
+            f"规格米数计算: meter={meter}, product={product_name or '(默认普通花型)'}, "
+            f"hint={hint[:80]}..."
+        )
+        return hint
+
+    async def _get_ai_reply(self, query: str, context: Context, order_hint: str = "", kb_hint: str = "", meter_hint: str = "") -> Optional[str]:
         """获取AI回复
 
         Args:
@@ -1030,10 +1143,12 @@ class AIReplyHandler(BaseHandler):
             return None
 
         effective_query = query
-        # 优先合并 KB 预取结果（售后政策等），再合并订单数据；
-        # 二者皆为系统已查证的「已知事实」，LLM 直接据此回复即可。
+        # 优先合并 KB 预取结果（售后政策等），再合并订单数据与规格米数计算；
+        # 三者皆为系统已查证的「已知事实」，LLM 直接据此回复即可。
         if kb_hint:
             effective_query = f"{query}\n\n{kb_hint}"
+        if meter_hint:
+            effective_query = f"{effective_query}\n\n{meter_hint}"
         if order_hint:
             effective_query = f"{effective_query}\n\n{order_hint}"
 

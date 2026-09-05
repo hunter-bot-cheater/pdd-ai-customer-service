@@ -2717,3 +2717,102 @@ class TestGarmentUsageNewKeywordsAndLLMIntent(unittest.TestCase):
         cleaned = "X"  # 仅检查池存在
         self.assertIn(cleaned, [c for c in [cleaned]])  # trivial; 主断言在上面
 
+
+
+class TestMeterAdvisor(unittest.TestCase):
+    """规格感知米数计算（2026-09-05）。
+
+    从产品知识 specifications 解析商品规格，程序化判断任意米数能否组合：
+    能则给拍法、不能则给"无法裁剪+最接近可卖规格"。LLM 只复述不自行计算。
+    """
+
+    def test_parse_meter_values(self):
+        """解析 specifications：阿拉伯/中文数字、尺寸与套餐字段、去重排序"""
+        from Message.handlers.meter_advisor import parse_meter_values
+        import json
+        specs = json.dumps([
+            "颜色: 晴野碎芳 | 尺寸: 1米（绍兴柯桥源头工厂）",
+            "颜色: 晴野碎芳 | 尺寸: 1.5米（多拍连裁）",
+            "颜色: 晴野碎芳 | 尺寸: 2.5米（1.5-1.55大门幅）",
+            "颜色: 晴野碎芳 | 尺寸: 3米（适用于各种服装家纺制作）",
+            "颜色: 晴野碎芳 | 尺寸: 10米（多单可定制）",
+            "商品分类: 居家布艺 > 海绵垫/布料/面料",
+        ], ensure_ascii=False)
+        self.assertEqual(parse_meter_values(specs), [1.0, 1.5, 2.5, 3.0, 10.0])
+
+        cn = json.dumps([
+            "款式: 彩色枫叶 | 套餐: 一米",
+            "款式: 彩色枫叶 | 套餐: 二米",
+            "款式: 彩色枫叶 | 套餐: 三米",
+        ], ensure_ascii=False)
+        self.assertEqual(parse_meter_values(cn), [1.0, 2.0, 3.0])
+
+        # 括号里的门幅/宽幅说明不纳入规格（"一米（门幅1.43米）" 的 1.43 是幅宽）
+        width = json.dumps([
+            "颜色: X | 尺寸: 一米（门幅1.43米）",
+            "颜色: X | 尺寸: 二米",
+            "颜色: X | 尺寸: 三米（宽幅1.43米）",
+        ], ensure_ascii=False)
+        self.assertEqual(parse_meter_values(width), [1.0, 2.0, 3.0])
+
+    def test_compute_plan_normal_flower(self):
+        """普通花型 {1,2,3}"""
+        from Message.handlers.meter_advisor import compute_plan_for_specs
+        specs = [1.0, 2.0, 3.0]
+        self.assertEqual(compute_plan_for_specs(4, specs), [(2.0, 2)])
+        self.assertEqual(compute_plan_for_specs(7, specs), [(3.0, 1), (2.0, 2)])
+        # 0.3 米无法组合
+        self.assertIsNone(compute_plan_for_specs(0.3, specs))
+
+    def test_compute_plan_gongduan(self):
+        """贡缎规格 {1,1.5,2,2.5,3,10}"""
+        from Message.handlers.meter_advisor import compute_plan_for_specs
+        specs = [1.0, 1.5, 2.0, 2.5, 3.0, 10.0]
+        self.assertEqual(compute_plan_for_specs(4.5, specs), [(1.5, 3)])
+        self.assertEqual(compute_plan_for_specs(7.5, specs), [(2.5, 3)])
+        self.assertEqual(compute_plan_for_specs(5.5, specs), [(3.0, 1), (2.5, 1)])
+        # 17 米可用 10米 规格参与组合
+        plan = compute_plan_for_specs(17, specs)
+        self.assertIsNotNone(plan)
+        self.assertEqual(sum(s * n for s, n in plan), 17)
+        # 0.3 米无法组合
+        self.assertIsNone(compute_plan_for_specs(0.3, specs))
+
+    def test_nearest_sellable(self):
+        """无解时推荐最接近可卖规格"""
+        from Message.handlers.meter_advisor import nearest_sellable
+        self.assertEqual(nearest_sellable(0.3, [1.0, 2.0, 3.0]), 1.0)
+        self.assertEqual(nearest_sellable(0.3, [1.0, 1.5, 2.0, 2.5, 3.0]), 1.0)
+        # 4.5 米普通花型最近是 4 或 5（差 0.5，取小）
+        self.assertEqual(nearest_sellable(4.5, [1.0, 2.0, 3.0]), 4.0)
+
+    def test_extract_target_meter(self):
+        """目标米数提取：排除幅宽表述、支持中文数字"""
+        h = AIReplyHandler(bot=object())
+        self.assertEqual(h._extract_target_meter("4米怎么拍"), 4.0)
+        self.assertEqual(h._extract_target_meter("我想买7米布"), 7.0)
+        self.assertEqual(h._extract_target_meter("买五米"), 5.0)
+        # 幅宽表述被排除，取后面的目标米数
+        self.assertEqual(h._extract_target_meter("宽1.5米能裁4米吗"), 4.0)
+        self.assertEqual(h._extract_target_meter("幅宽1.5米"), 1.5 if False else None)
+        self.assertIsNone(h._extract_target_meter("你好"))
+
+    def test_should_advise_meter(self):
+        """无购买/裁剪动词的纯幅宽陈述不触发"""
+        h = AIReplyHandler(bot=object())
+        self.assertTrue(h._should_advise_meter("4米怎么拍", 4.0))
+        self.assertTrue(h._should_advise_meter("能裁2.5米吗", 2.5))
+        self.assertFalse(h._should_advise_meter("这个布料1.5米", 1.5))
+
+    def test_build_meter_hint(self):
+        """hint 生成：有解给拍法、无解给无法裁剪+最近规格"""
+        from Message.handlers.meter_advisor import build_meter_hint
+        hint = build_meter_hint(4.0, [1.0, 2.0, 3.0], "测试商品")
+        self.assertIn("系统已按商品规格计算", hint)
+        self.assertIn("2件2米", hint)
+        self.assertIn("严禁自行另算", hint)
+
+        hint2 = build_meter_hint(0.3, [1.0, 2.0, 3.0], "测试商品")
+        self.assertIn("无法组合", hint2)
+        self.assertIn("无法裁剪", hint2)
+        self.assertIn("1 米", hint2)
