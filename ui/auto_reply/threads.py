@@ -66,6 +66,11 @@ class AutoReplyThread(QThread):
                 )
             )
 
+            # 2026-09-05 修复：启动后立即后台预热意图分类客户端，避免首条买家消息
+            # 因 LiteLLM 冷启动 TLS/鉴权耗时 10~12s 撞超时上限被判 unknown 转人工。
+            # warmup 任务独立运行（fire-and-forget），不影响 start_account 与连接。
+            self.loop.create_task(self._warmup_intent_classifier())
+
             # 保持事件循环运行，直到显式停止
             self.loop.run_forever()
 
@@ -105,6 +110,21 @@ class AutoReplyThread(QThread):
                             asyncio.set_event_loop(None)
                     except RuntimeError:
                         pass
+
+    async def _warmup_intent_classifier(self):
+        """启动后立即预热意图分类客户端（2026-09-05 修复首次意图超时）。
+
+        LiteLLM 客户端首次调用需要建立 TLS/DNS/鉴权，耗时约 10~12s。
+        在用户消息到达前 fire-and-forget 一次最小分类调用，让网络层完成握手，
+        后续真实 classify 只需 1~3s。
+        """
+        try:
+            from Message.handlers.intent_classifier import get_intent_classifier
+            clf = get_intent_classifier()
+            if clf is not None and clf.enabled:
+                await clf.warmup(timeout=30.0)
+        except Exception as e:  # pragma: no cover
+            self.logger.warning(f"意图分类预热启动失败（不影响后续）: {type(e).__name__}: {e}")
 
     async def _shutdown_async(self):
         """在工作线程自己的事件循环中完成连接和任务清理。"""

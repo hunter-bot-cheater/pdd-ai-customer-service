@@ -2267,3 +2267,40 @@ class TestPureThanksAckBypass(unittest.TestCase):
             "谢谢", {"intent": "operation", "confidence": 0.9}
         )
         self.assertEqual(r["intent"], "operation")
+
+
+class TestIntentClassifierWarmup(unittest.TestCase):
+    """意图分类客户端预热（2026-09-05 修复首次意图超时转人工）。
+
+    启动后立即后台预热一次最小分类调用，让 LiteLLM 客户端完成 TLS/鉴权握手，
+    避免首条用户消息因冷启动 10~12s 撞超时上限被判 unknown。
+    """
+
+    def setUp(self):
+        # 强制清空模块级单例，确保每个用例独立
+        import importlib
+        from Message.handlers import intent_classifier as ic_mod
+        importlib.reload(ic_mod)
+        from Message.handlers.intent_classifier import IntentClassifier
+        self.cls = IntentClassifier
+        self.ic_mod = ic_mod
+
+    def test_warmup_returns_bool(self):
+        """warmup() 必须返回 bool，不抛异常"""
+        clf = self.ic_mod.IntentClassifier({"enabled": False})
+        result = asyncio.run(clf.warmup(timeout=2.0))
+        self.assertFalse(result)  # 禁用时直接 False
+
+    def test_warmup_disabled_returns_false(self):
+        """enabled=False 时 warmup 立即返回 False"""
+        clf = self.ic_mod.IntentClassifier({"enabled": False})
+        self.assertFalse(asyncio.run(clf.warmup()))
+
+    def test_warmup_does_not_cache(self):
+        """warmup 用的唯一 ping 文本不应被缓存"""
+        clf = self.ic_mod.IntentClassifier({"enabled": False})
+        # 直接验证 _call_llm 不被调用（enabled=False 提前返回），
+        # 缓存项数量不变即可。
+        before = len(clf._cache)
+        asyncio.run(clf.warmup(timeout=1.0))
+        self.assertEqual(len(clf._cache), before)

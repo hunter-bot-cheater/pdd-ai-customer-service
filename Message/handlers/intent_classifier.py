@@ -135,6 +135,40 @@ class IntentClassifier:
         self._cache[key] = (time.time() + self.cache_ttl, result)
 
     # ===== 对外接口 =====
+    async def warmup(self, timeout: float = 30.0) -> bool:
+        """预热意图分类客户端（避免首次用户消息冷启动耗时 5~12s 超时转人工）。
+
+        2026-09-05 复盘：app.py 启动后从未主动预热 LLM/分类客户端，
+        导致第一条用户消息触发意图分类时 LiteLLM 客户端要现场建立 TLS/DNS
+        连接 + 模型鉴权，耗时 10~12 秒，恰好踩到 12 秒超时上限被判 unknown
+        → 转人工。修复：在 AutoReplyThread 启动后立即 fire-and-forget 调用
+        一次最小 chat 完成握手，结果**不写入缓存**避免污染（用唯一文本 key）。
+
+        超时（默认 30s）保护：仅记 warn，不抛异常，不影响后续真实分类。
+        """
+        if not self.enabled:
+            return False
+        import uuid as _uuid
+
+        ping_text = f"__intent_warmup_{_uuid.uuid4().hex}__"
+        try:
+            # 先确保 client 实例 + initialize 完成（轻量）
+            client = self._ensure_client()
+            if getattr(client, "_client", None) is None:
+                await asyncio.wait_for(client.initialize(), timeout=5.0)
+            # 然后发一次最小请求，让 LiteLLM 完成网络握手。
+            # 用 60s 软上限（> 默认 timeout），万一网络不可达也不会拖太久。
+            await asyncio.wait_for(self._call_llm(ping_text, False, None), timeout=timeout)
+            logger.info("意图分类客户端预热完成")
+            return True
+        except asyncio.TimeoutError:
+            elapsed = timeout
+            logger.warning(f"意图分类预热超时（{elapsed:.1f}s），不影响后续，仅可能首次慢")
+            return False
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"意图分类预热异常（不影响后续）: {type(e).__name__}: {e}")
+            return False
+
     async def classify(
         self, text: str, after_sale_hint: bool = False, history: Optional[list] = None
     ) -> Dict[str, Any]:
