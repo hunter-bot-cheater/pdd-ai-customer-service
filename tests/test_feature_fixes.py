@@ -2420,10 +2420,10 @@ class TestZeroPointFiveMeterPlan(unittest.TestCase):
             2.5: [(2.5, 1)],
             3: [(3, 1)],
             3.5: [(2.5, 1), (1, 1)],  # 2.5+1 = 3.5
-            4.5: [(1.5, 3)],          # 同规格优先：3件1.5米
+            4.5: [(3, 1), (1.5, 1)],  # 2件混搭（2.5+2 或 3+1.5 均可，件数最少优先）
             5.5: [(3, 1), (2.5, 1)],  # 3+2.5 = 5.5 ✓ 用户原始 case
             6.5: [(2.5, 1), (2, 2)],  # 2.5+4 = 6.5（3件 2 种规格）
-            7.5: [(2.5, 3)],          # 全部同规格 7.5
+            7.5: [(2.5, 3)],          # 全部同规格 7.5（3件且件数最少）
         }
         # 0.5 米规格没有，跳过
         cases.pop(0.5)
@@ -2460,6 +2460,18 @@ class TestZeroPointFiveMeterPlan(unittest.TestCase):
         from Message.handlers.integer_meter import compute_0p5_meter_plan
         plan = compute_0p5_meter_plan(7.5)
         self.assertEqual(plan, [(2.5, 3)])
+
+    def test_4_and_6_hard_same_spec(self):
+        """4米必须 2件2米、6米必须 2件3米（用户硬性期望，同规格且件数最少）"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
+        self.assertEqual(compute_0p5_meter_plan(4), [(2, 2)])
+        self.assertEqual(compute_0p5_meter_plan(6), [(3, 2)])
+
+    def test_4p5_accepts_two_piece_mix(self):
+        """4.5米允许 2件混搭（2.5+2 或 3+1.5），不能是 3件1.5米（用户反馈）"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan, total_pieces
+        plan = compute_0p5_meter_plan(4.5)
+        self.assertEqual(total_pieces(plan), 2, f"4.5米应为 2 件方案: {plan}")
 
     def test_5p5_user_case(self):
         """5.5米 = 1件3米 + 1件2.5米（用户原始反馈）"""

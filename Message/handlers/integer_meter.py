@@ -97,8 +97,6 @@ def compute_0p5_meter_plan(meter: float) -> List[Tuple[float, int]]:
     Raises:
         ValueError: meter 不是正数或不是 0.5 的倍数。
     """
-    import math
-
     if not isinstance(meter, (int, float)) or meter <= 0:
         raise ValueError(f"meter 必须是正数，得到 {meter!r}")
 
@@ -110,15 +108,10 @@ def compute_0p5_meter_plan(meter: float) -> List[Tuple[float, int]]:
     specs_float = [3.0, 2.5, 2.0, 1.5, 1.0]
     specs_int = sorted([int(round(s * 2)) for s in specs_float], reverse=True)
 
-    # 同规格优先（仅当件数 ≤ ceil(X/3) + 1 才用，避免 7件1.5米 这种件数过多的同规格方案）
-    max_greedy_count = math.ceil(meter / 3)
-    for spec in specs_float:
-        if abs(meter / spec - round(meter / spec)) < 0.01:
-            n = int(round(meter / spec))
-            if n > 0 and n <= max_greedy_count + 1:
-                return [(spec, n)]
-
-    # DP：dp[i] = 最少件数；dp_kinds[i] = 同件数下的最少规格种类
+    # DP：件数最少优先；件数相同时规格种类最少（同规格）优先。
+    # 这样 4米→[(2,2)]（2件同规格胜 1件3米+1件1米）、7.5米→[(2.5,3)]（3件全同规格），
+    # 而 4.5米→[(3,1),(1.5,1)] 或 [(2.5,1),(2,1)]（2件混搭，件数最少胜 3件1.5米）。
+    # dp[i] = 最少件数；dp_kinds[i] = 同件数下的最少规格种类
     INF = float("inf")
     dp = [INF] * (N + 1)
     dp_kinds = [INF] * (N + 1)
