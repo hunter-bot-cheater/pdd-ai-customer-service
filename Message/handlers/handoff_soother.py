@@ -103,6 +103,8 @@ def classify_category(intent: str = "", reason: str = "") -> str:
         return "complaint"
     if intent == "negative_emotion":
         return "negative"
+    if intent == "garment_usage":
+        return "garment"
     if intent in ("other", "unknown"):
         return "uncertain"
     if "成衣用量" in reason or "衣服" in reason or "布料" in reason:

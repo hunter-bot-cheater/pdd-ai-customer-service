@@ -8,6 +8,8 @@
 - operation         ：明确要求售后操作（我要退货 / 立刻退款）→ 转人工
 - complaint         ：投诉 / 给差评 / 要求赔偿 → 转人工
 - negative_emotion  ：强烈不满 / 愤怒 / 催促（太慢了 / 气死我了）→ 转人工
+- garment_usage     ：成衣用量咨询（做衣服要多少布/做上衣需要多少布料）→ 转人工
+                       （2026-09-05 新增：AI 无版型/体型数据，估算极易误导）
 - other / unknown   ：其他 / 分类失败 → 保守转人工（识别不出意图即升级）
 
 设计约束（来自改造需求）：
@@ -33,9 +35,15 @@ INTENT_CONSULT = "consult"
 INTENT_OPERATION = "operation"
 INTENT_COMPLAINT = "complaint"
 INTENT_NEGATIVE_EMOTION = "negative_emotion"
+INTENT_GARMENT_USAGE = "garment_usage"  # 2026-09-05 新增
 INTENT_OTHER = "other"
 INTENT_UNKNOWN = "unknown"
-_TRANSFER_INTENTS = {INTENT_OPERATION, INTENT_COMPLAINT, INTENT_NEGATIVE_EMOTION}
+_TRANSFER_INTENTS = {
+    INTENT_OPERATION,
+    INTENT_COMPLAINT,
+    INTENT_NEGATIVE_EMOTION,
+    INTENT_GARMENT_USAGE,
+}
 
 DEFAULT_PROMPT = (
     "你是一个电商客服系统的消息意图分类器。只输出一个 JSON 对象，不要输出任何其它内容。\n"
@@ -44,6 +52,11 @@ DEFAULT_PROMPT = (
     '- "operation"：明确要求执行售后操作（例：我要退货、立刻给我退款、把东西退掉）\n'
     '- "complaint"：投诉、要给差评、要求赔偿（例：投诉你们、你们是骗子、给差评）\n'
     '- "negative_emotion"：表达强烈不满/愤怒/着急/催促，即便未明确要求操作也需升级（例：太慢了、气死我了、催一下）\n'
+    '- "garment_usage"：成衣/服装用量咨询——买家想知道「做某件衣服要多少米/多少布料」'
+    '（例：做上衣需要多少布料、做件短袖要几米布、做小孩衣服要多少米、给老人做衣服够不够）。'
+    '只要买家在问「做X件/套衣服需要多少布/多少米」这类用量问题，就判为 garment_usage，'
+    '即使含"做XX衣服"以外没见过的服装词（如上衣、罩衫、马甲等）也要识别。'
+    'AI 没有版型/款式/体型数据，估算极易误导，必须转人工。\n'
     '- "other"：其它\n'
     "输出格式：{\"intent\": \"上述之一\", \"confidence\": 0.0到1.0之间的数字}\n"
     "注意：如果消息包含售后相关词（如退货/退款），但只是在询问流程或政策，应判为 consult；"
@@ -260,7 +273,8 @@ class IntentClassifier:
                 conf = data.get("confidence", 0.0)
                 if intent in (
                     INTENT_CONSULT, INTENT_OPERATION, INTENT_COMPLAINT,
-                    INTENT_NEGATIVE_EMOTION, INTENT_OTHER, INTENT_UNKNOWN,
+                    INTENT_NEGATIVE_EMOTION, INTENT_GARMENT_USAGE,
+                    INTENT_OTHER, INTENT_UNKNOWN,
                 ):
                     return {"intent": intent, "confidence": float(conf or 0.0)}
         except Exception:  # pragma: no cover

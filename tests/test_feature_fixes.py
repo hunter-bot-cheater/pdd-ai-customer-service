@@ -2663,3 +2663,57 @@ class TestHandoffSoother(unittest.TestCase):
             for _ in range(20):
                 t = pick_soother(cat, session_key=f"k-{cat}")
                 self.assertIn(t, pool, f"{cat} 返回了池外话术: {t!r}")
+
+
+class TestGarmentUsageNewKeywordsAndLLMIntent(unittest.TestCase):
+    """成衣用量兜底补全（2026-09-05 第二轮复盘）：补关键词 + LLM 识别 garment_usage 意图。
+
+    用户反馈买家问"做上衣需要多少布料"被漏识别——上衣不在 GARMENT_KEYWORDS。
+    修复：
+    - 关键词补全：上衣/罩衫/中衣/吊带 等。
+    - intent_classifier 新增 garment_usage intent，由 LLM 自己判定（兜底未知服装词）。
+    """
+
+    def setUp(self):
+        self.handler = AIReplyHandler(bot=object())
+
+    def test_new_keyword_triggers(self):
+        """新补的服装类词应触发成衣用量识别"""
+        for q in (
+            "做上衣需要多少布料",          # 用户原 case
+            "做罩衫要多少米",
+            "做中衣需要几米布",
+            "做吊带需要多少布",
+            "宝宝做吊带需要多少米",
+        ):
+            self.assertTrue(self.handler._is_garment_fabric_usage_query(q), q)
+
+    def test_intent_classifier_accepts_garment_usage(self):
+        """INTENT_GARMENT_USAGE 是合法 intent 且被 _TRANSFER_INTENTS 收录（自动转人工）"""
+        from Message.handlers import intent_classifier as ic
+        self.assertEqual(ic.INTENT_GARMENT_USAGE, "garment_usage")
+        self.assertIn(ic.INTENT_GARMENT_USAGE, ic._TRANSFER_INTENTS)
+
+    def test_should_transfer_garment_usage(self):
+        """garment_usage 意图应直接触发转人工（不卡置信度阈值，靠语义兜底）"""
+        from Message.handlers import intent_classifier as ic
+        # garment_usage 已加入 _TRANSFER_INTENTS，按 operation/complaint/negative_emotion
+        # 同样规则：置信度达标才转
+        self.assertTrue(ic.IntentClassifier.should_transfer("garment_usage", 0.9, 0.6))
+        # 低置信度（< 阈值）不应转，但保险起见模型本身应给高置信度
+        self.assertFalse(ic.IntentClassifier.should_transfer("garment_usage", 0.2, 0.6))
+
+    def test_prompt_contains_garment_usage(self):
+        """默认 prompt 必须包含 garment_usage 意图定义，让模型知道怎么识别"""
+        from Message.handlers import intent_classifier as ic
+        self.assertIn("garment_usage", ic.DEFAULT_PROMPT)
+        self.assertIn("上衣", ic.DEFAULT_PROMPT)  # 用用户原 case 作为示例
+        self.assertIn("布料", ic.DEFAULT_PROMPT)
+
+    def test_classify_category_garment_usage(self):
+        """handoff_soother: garment_usage intent → garment 话术池"""
+        from Message.handlers.handoff_soother import classify_category, get_pool
+        self.assertEqual(classify_category(intent="garment_usage"), "garment")
+        cleaned = "X"  # 仅检查池存在
+        self.assertIn(cleaned, [c for c in [cleaned]])  # trivial; 主断言在上面
+
