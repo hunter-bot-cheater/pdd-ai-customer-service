@@ -2304,3 +2304,94 @@ class TestIntentClassifierWarmup(unittest.TestCase):
         before = len(clf._cache)
         asyncio.run(clf.warmup(timeout=1.0))
         self.assertEqual(len(clf._cache), before)
+
+
+class TestIntegerMeterPlan(unittest.TestCase):
+    """整数米数多拍组合算法（2026-09-05 复盘）。
+
+    买家问"7米能买吗""我想买10米布"等任意整数米数，AI 必须主动算出
+    1/2/3 组合方案告诉客户怎么拍，禁止"按规格售卖不能买"等拒答话术。
+    """
+
+    def test_basic_cases(self):
+        """覆盖 4~15 米的典型组合"""
+        from Message.handlers.integer_meter import compute_integer_meter_plan
+        cases = {
+            1: [(1, 1)],
+            2: [(2, 1)],
+            3: [(3, 1)],
+            4: [(2, 1), (1, 2)],
+            5: [(3, 1), (2, 1)],
+            6: [(3, 2)],
+            7: [(3, 1), (2, 2)],
+            8: [(3, 2), (2, 1)],
+            9: [(3, 3)],
+            10: [(3, 2), (2, 2)],
+            11: [(3, 3), (2, 1)],
+            12: [(3, 4)],
+            13: [(3, 3), (2, 2)],
+            14: [(3, 4), (2, 1)],
+            15: [(3, 5)],
+            16: [(3, 4), (2, 2)],
+            20: [(3, 6), (2, 1)],
+            25: [(3, 7), (2, 2)],
+            30: [(3, 10)],
+        }
+        for x, expected in cases.items():
+            with self.subTest(x=x):
+                self.assertEqual(compute_integer_meter_plan(x), expected)
+
+    def test_total_meter_matches(self):
+        """每个组合方案的总米数应等于输入 X"""
+        from Message.handlers.integer_meter import compute_integer_meter_plan, total_pieces
+        for x in range(1, 50):
+            plan = compute_integer_meter_plan(x)
+            self.assertEqual(sum(spec * n for spec, n in plan), x, f"X={x}")
+            self.assertGreater(total_pieces(plan), 0, f"X={x}")
+
+    def test_format_plan(self):
+        """组合方案格式化为中文"""
+        from Message.handlers.integer_meter import (
+            compute_integer_meter_plan,
+            format_integer_meter_plan,
+        )
+        self.assertEqual(
+            format_integer_meter_plan(compute_integer_meter_plan(7)),
+            "1件3米 + 2件2米",
+        )
+        self.assertEqual(
+            format_integer_meter_plan(compute_integer_meter_plan(4)),
+            "1件2米 + 2件1米",
+        )
+        self.assertEqual(
+            format_integer_meter_plan(compute_integer_meter_plan(12)),
+            "4件3米",
+        )
+        self.assertEqual(
+            format_integer_meter_plan(compute_integer_meter_plan(10)),
+            "2件3米 + 2件2米",
+        )
+
+    def test_invalid_input(self):
+        """非正整数应抛 ValueError"""
+        from Message.handlers.integer_meter import compute_integer_meter_plan
+        with self.assertRaises(ValueError):
+            compute_integer_meter_plan(0)
+        with self.assertRaises(ValueError):
+            compute_integer_meter_plan(-3)
+        with self.assertRaises(ValueError):
+            compute_integer_meter_plan("7")  # type: ignore[arg-type]
+
+    def test_min_pieces_for_large_meter(self):
+        """大数米数应优先用 3 米，件数最少"""
+        from Message.handlers.integer_meter import (
+            compute_integer_meter_plan,
+            total_pieces,
+        )
+        # 30米 = 10件3米，比 30件1米 少很多
+        self.assertEqual(total_pieces(compute_integer_meter_plan(30)), 10)
+        # 100米
+        self.assertEqual(
+            compute_integer_meter_plan(100),
+            [(3, 32), (2, 2)],
+        )
