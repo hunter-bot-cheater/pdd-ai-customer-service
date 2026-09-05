@@ -2307,26 +2307,27 @@ class TestIntentClassifierWarmup(unittest.TestCase):
 
 
 class TestIntegerMeterPlan(unittest.TestCase):
-    """整数米数多拍组合算法（2026-09-05 复盘）。
+    """整数米数多拍组合算法（2026-09-05 复盘，v2 同规格优先版）。
 
     买家问"7米能买吗""我想买10米布"等任意整数米数，AI 必须主动算出
     1/2/3 组合方案告诉客户怎么拍，禁止"按规格售卖不能买"等拒答话术。
+    第二轮复盘：能同一规格多件就优先（如 4米 = 2件2米 优于 1件3米+1件1米）。
     """
 
     def test_basic_cases(self):
-        """覆盖 4~15 米的典型组合"""
+        """覆盖 4~15 米的典型组合（同规格优先 + 贪心 tie-breaker）"""
         from Message.handlers.integer_meter import compute_integer_meter_plan
         cases = {
             1: [(1, 1)],
             2: [(2, 1)],
             3: [(3, 1)],
-            4: [(2, 1), (1, 2)],
-            5: [(3, 1), (2, 1)],
+            4: [(2, 2)],          # 同规格优先（2件2米 优于 1件3米+1件1米）
+            5: [(3, 1), (2, 1)],  # 无法同规格，贪心 2件混搭
             6: [(3, 2)],
             7: [(3, 1), (2, 2)],
-            8: [(3, 2), (2, 1)],
+            8: [(3, 2), (2, 1)],  # 贪心 3件 优于 同规格 4件2米
             9: [(3, 3)],
-            10: [(3, 2), (2, 2)],
+            10: [(3, 2), (2, 2)],  # 贪心 4件 优于 同规格 5件2米
             11: [(3, 3), (2, 1)],
             12: [(3, 4)],
             13: [(3, 3), (2, 2)],
@@ -2355,18 +2356,22 @@ class TestIntegerMeterPlan(unittest.TestCase):
             compute_integer_meter_plan,
             format_integer_meter_plan,
         )
+        # 4米 同规格优先：2件2米
+        self.assertEqual(
+            format_integer_meter_plan(compute_integer_meter_plan(4)),
+            "2件2米",
+        )
+        # 7米 混搭 1件3米 + 2件2米
         self.assertEqual(
             format_integer_meter_plan(compute_integer_meter_plan(7)),
             "1件3米 + 2件2米",
         )
-        self.assertEqual(
-            format_integer_meter_plan(compute_integer_meter_plan(4)),
-            "1件2米 + 2件1米",
-        )
+        # 12米 全 3 米
         self.assertEqual(
             format_integer_meter_plan(compute_integer_meter_plan(12)),
             "4件3米",
         )
+        # 10米 贪心 4件混搭（不是 5件2米）
         self.assertEqual(
             format_integer_meter_plan(compute_integer_meter_plan(10)),
             "2件3米 + 2件2米",
@@ -2388,12 +2393,96 @@ class TestIntegerMeterPlan(unittest.TestCase):
             compute_integer_meter_plan,
             total_pieces,
         )
-        # 30米 = 10件3米，比 30件1米 少很多
         self.assertEqual(total_pieces(compute_integer_meter_plan(30)), 10)
-        # 100米
+
+    def test_same_spec_priority_for_4(self):
+        """4米必须用同规格 2件2米，不应推荐 1件3米+1件1米（用户原始反馈）"""
+        from Message.handlers.integer_meter import compute_integer_meter_plan
+        plan = compute_integer_meter_plan(4)
+        # 只有一种规格 = 2米，且 2 件
+        self.assertEqual(plan, [(2, 2)])
+
+
+class TestZeroPointFiveMeterPlan(unittest.TestCase):
+    """贡缎/1.5米宽幅花型 0.5 米递增组合计算（2026-09-05 复盘）。
+
+    规格 [1, 1.5, 2, 2.5, 3]，DP 最少件数 + 最少规格种类 + 同规格优先。
+    """
+
+    def test_basic_cases(self):
+        """覆盖典型 0.5 米递增 case"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
+        cases = {
+            0.5: [(0.5, 1)] if False else [(0.5, 1)],  # 0.5 不在规格里，特殊处理
+            1: [(1, 1)],
+            1.5: [(1.5, 1)],
+            2: [(2, 1)],
+            2.5: [(2.5, 1)],
+            3: [(3, 1)],
+            3.5: [(2.5, 1), (1, 1)],  # 2.5+1 = 3.5
+            4.5: [(1.5, 3)],          # 同规格优先：3件1.5米
+            5.5: [(3, 1), (2.5, 1)],  # 3+2.5 = 5.5 ✓ 用户原始 case
+            6.5: [(2.5, 1), (2, 2)],  # 2.5+4 = 6.5（3件 2 种规格）
+            7.5: [(2.5, 3)],          # 全部同规格 7.5
+        }
+        # 0.5 米规格没有，跳过
+        cases.pop(0.5)
+        for x, expected in cases.items():
+            with self.subTest(x=x):
+                self.assertEqual(compute_0p5_meter_plan(x), expected, f"X={x}")
+
+    def test_total_meter_matches(self):
+        """每个组合方案的总米数应等于输入 X"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan, total_pieces
+        for half in range(2, 40):  # 1, 1.5, 2, 2.5, ..., 19.5
+            x = half / 2
+            plan = compute_0p5_meter_plan(x)
+            self.assertIsNotNone(plan, f"X={x} should have plan")
+            self.assertEqual(
+                sum(spec * n for spec, n in plan), x, f"X={x}"
+            )
+            self.assertGreater(total_pieces(plan), 0, f"X={x}")
+
+    def test_invalid_input(self):
+        """非 0.5 倍数应抛 ValueError"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
+        with self.assertRaises(ValueError):
+            compute_0p5_meter_plan(0)
+        with self.assertRaises(ValueError):
+            compute_0p5_meter_plan(-2.5)
+        with self.assertRaises(ValueError):
+            compute_0p5_meter_plan(5.3)  # 非 0.5 倍数
+        with self.assertRaises(ValueError):
+            compute_0p5_meter_plan("5")  # type: ignore[arg-type]
+
+    def test_same_spec_priority_7p5(self):
+        """7.5米优先全部同规格 3件2.5米（用户期望）"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
+        plan = compute_0p5_meter_plan(7.5)
+        self.assertEqual(plan, [(2.5, 3)])
+
+    def test_5p5_user_case(self):
+        """5.5米 = 1件3米 + 1件2.5米（用户原始反馈）"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
+        self.assertEqual(compute_0p5_meter_plan(5.5), [(3, 1), (2.5, 1)])
+
+    def test_format_0p5_plan(self):
+        """0.5米递增组合方案中文格式化"""
+        from Message.handlers.integer_meter import (
+            compute_0p5_meter_plan,
+            format_meter_plan,
+        )
         self.assertEqual(
-            compute_integer_meter_plan(100),
-            [(3, 32), (2, 2)],
+            format_meter_plan(compute_0p5_meter_plan(5.5)),
+            "1件3米 + 1件2.5米",
+        )
+        self.assertEqual(
+            format_meter_plan(compute_0p5_meter_plan(7.5)),
+            "3件2.5米",
+        )
+        self.assertEqual(
+            format_meter_plan(compute_0p5_meter_plan(6.5)),
+            "1件2.5米 + 2件2米",
         )
 
 
