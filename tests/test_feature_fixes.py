@@ -719,13 +719,21 @@ class TestCannotAnswerTransfers(unittest.IsolatedAsyncioTestCase):
         _restore_ai_reply_delays()
 
     async def test_cannot_answer_reply_forces_transfer(self):
-        """LLM 输出『我不太清楚』→ 强制静默转人工，不把推脱话发给买家。"""
+        """LLM 输出『我不太清楚』→ 强制转人工；推脱话不下发，改发一条核实类安抚话。"""
+        from Message.handlers.handoff_soother import get_pool
+
         self.bot.reply_text = "亲，这个我不太清楚呢"
         context = make_context("你们家这款面料成分是什么")
         ok = await self.handler.handle(context, make_metadata())
         self.assertTrue(ok)
-        # 没有把推脱话术发给买家
-        self.assertEqual(self.sender.calls["send_text"], [])
+        # 没把推脱话术发给买家，但系统补发了一条 unanswerable 池的核实话术
+        texts = [t[3] for t in self.sender.calls["send_text"]]
+        self.assertEqual(len(texts), 1, f"应恰好发送 1 条安抚话术: {texts}")
+        cleaned_soother = self.handler._clean_text(texts[0])
+        cleaned_pool = [self.handler._clean_text(p) for p in get_pool("unanswerable")]
+        self.assertIn(cleaned_soother, cleaned_pool,
+                      f"话术不属于 unanswerable 池: {texts[0]!r}")
+        self.assertNotIn("不太清楚", texts[0], "不能把 LLM 推脱话术发给买家")
         # 已转人工（调用了转接 API 或至少通知了人工）
         self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
         self.assertIn("AI无法回答→转人工", self.capture.messages[0])
@@ -1774,6 +1782,42 @@ class TestAIHandlerIntentRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.capture.messages), 1)
         self.assertIn("AI意图识别触发转人工", self.capture.messages[0])
 
+    async def test_transfer_sends_soother_before_handoff(self):
+        """转人工瞬间先给买家发一条'核实类'安抚话术（2026-09-05 新增）。
+
+        断言：operation 转人工时发送了 1 条文本话术；话术属于对应话术池；
+        不含'转接/转人工/人工客服'等会暴露 AI 的词。
+        """
+        from Message.handlers.handoff_soother import get_pool
+
+        ok = await self._route("我要退货", "operation")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1)
+        texts = [t[3] for t in self.sender.calls["send_text"]]
+        self.assertEqual(len(texts), 1, f"应恰好发送 1 条安抚话术: {texts}")
+        soother = texts[0]
+        # 发送前经 _clean_text 去标点，池内话术也需同样清洗后比对
+        cleaned_soother = self.handler._clean_text(soother)
+        cleaned_pool = [self.handler._clean_text(p) for p in get_pool("after_sale")]
+        self.assertIn(cleaned_soother, cleaned_pool,
+                      f"话术不属于 after_sale 池: {soother!r}")
+        for w in ("转接", "转人工", "人工客服", "联系人工"):
+            self.assertNotIn(w, soother, f"话术含暴露词 {w}: {soother!r}")
+
+    async def test_no_soother_when_already_handoff(self):
+        """会话已转人工时再次触发转人工 → 不再发送安抚话术/重复转接。"""
+        ok = await self._route("我要退货", "operation")
+        self.assertTrue(ok)
+        first_sends = len(self.sender.calls["send_text"])
+        self.assertEqual(first_sends, 1)
+        # 再次触发（会话已 handoff，应在 _transfer_by_intent 开头短路）
+        ok2 = await self._route("立刻给我退款", "complaint")
+        self.assertTrue(ok2)
+        self.assertEqual(len(self.sender.calls["send_text"]), first_sends,
+                         "已转人工会话不应再发安抚话术")
+        self.assertEqual(len(self.sender.calls["transfer_to_cs"]), 1,
+                         "已转人工会话不应重复转接")
+
     async def test_complaint_transfers(self):
         ok = await self._route("投诉你们", "complaint")
         self.assertTrue(ok)
@@ -2554,3 +2598,68 @@ class TestGarmentUsageSufficiencyQuery(unittest.TestCase):
             "来2米",
         ):
             self.assertFalse(self.handler._is_garment_fabric_usage_query(q), q)
+
+
+class TestHandoffSoother(unittest.TestCase):
+    """转人工安抚话术库（2026-09-05 新增）。
+
+    触发转人工的瞬间系统补发"核实/处理类"拖延话术，保 3 分钟回复率；
+    绝不用"正在为您转接"类话术（会暴露 AI）；同场景多变体随机不重复。
+    """
+
+    def test_classify_category_by_intent(self):
+        """意图分类映射到话术类别"""
+        from Message.handlers.handoff_soother import classify_category
+        self.assertEqual(classify_category(intent="operation"), "after_sale")
+        self.assertEqual(classify_category(intent="complaint"), "complaint")
+        self.assertEqual(classify_category(intent="negative_emotion"), "negative")
+        self.assertEqual(classify_category(intent="other"), "uncertain")
+        self.assertEqual(classify_category(intent="unknown"), "uncertain")
+
+    def test_classify_category_by_reason(self):
+        """成衣用量 / AI无法回答 通过 reason 映射"""
+        from Message.handlers.handoff_soother import classify_category
+        self.assertEqual(
+            classify_category(reason="成衣用量咨询→转人工"), "garment"
+        )
+        self.assertEqual(
+            classify_category(reason="AI无法回答→转人工"), "unanswerable"
+        )
+        # 未知 reason/intent → generic 兜底
+        self.assertEqual(classify_category(), "generic")
+        self.assertEqual(classify_category(reason="别的场景"), "generic")
+
+    def test_pools_non_empty_and_no_transfer_wording(self):
+        """每个话术池非空，且不含'转接/转人工/人工客服'等暴露词"""
+        from Message.handlers.handoff_soother import get_pool
+        forbidden = ("转接", "转人工", "人工客服", "联系人工", "为您安排人工", "机器")
+        for cat in (
+            "after_sale", "complaint", "negative", "uncertain",
+            "garment", "unanswerable", "generic",
+        ):
+            pool = get_pool(cat)
+            self.assertGreaterEqual(len(pool), 2, f"{cat} 话术池应 ≥2 条")
+            for text in pool:
+                for w in forbidden:
+                    self.assertNotIn(w, text, f"{cat}: {text!r} 含暴露词 {w}")
+
+    def test_pick_variation_avoids_consecutive_repeat(self):
+        """同一会话连续 pick 不应重复同一句（池 >1 时）"""
+        from Message.handlers.handoff_soother import pick_soother
+        last = None
+        for _ in range(30):
+            t = pick_soother("after_sale", session_key="shop1:buyer1")
+            self.assertNotEqual(t, last, "连续两次不应相同")
+            last = t
+
+    def test_pick_returns_pool_member(self):
+        """pick 结果必须属于对应池"""
+        from Message.handlers.handoff_soother import get_pool, pick_soother
+        for cat in (
+            "after_sale", "complaint", "negative", "uncertain",
+            "garment", "unanswerable", "generic",
+        ):
+            pool = get_pool(cat)
+            for _ in range(20):
+                t = pick_soother(cat, session_key=f"k-{cat}")
+                self.assertIn(t, pool, f"{cat} 返回了池外话术: {t!r}")

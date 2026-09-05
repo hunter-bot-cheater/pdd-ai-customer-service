@@ -783,14 +783,29 @@ class AIReplyHandler(BaseHandler):
         self.logger.info(f"意图分类结果: intent={intent}, confidence={confidence}")
 
         if ic_module.IntentClassifier.should_transfer(intent, confidence, classifier.threshold):
-            return await self._transfer_by_intent(context, metadata, processed_content)
+            return await self._transfer_by_intent(
+                context, metadata, processed_content, intent=intent
+            )
         return False
 
-    async def _transfer_by_intent(self, context: Context, metadata: Dict[str, Any], last_message: str, reason: str = "AI意图识别触发转人工") -> bool:
+    async def _transfer_by_intent(
+        self,
+        context: Context,
+        metadata: Dict[str, Any],
+        last_message: str,
+        reason: str = "AI意图识别触发转人工",
+        intent: str = "",
+    ) -> bool:
         """执行意图触发的转人工（语义层），保留营业时间/子账号静默规则。
 
         Args:
             reason: 转人工原因，进入企业微信通知文案（如"AI无法回答→转人工"）。
+            intent: 意图分类结果（operation/complaint/negative_emotion/other/unknown 等），
+                用于选择转人工前的安抚话术类型。
+
+        2026-09-05 新增：判定转人工的瞬间，先给买家发一句"核实/处理类"拖延话术
+        （像真人客服在亲自帮忙查），避免人工客服未及时接入导致"3 分钟回复率"下降。
+        绝不用"正在为您转接人工客服"类话术（会暴露 AI）。已转人工/非营业时间不发送。
         """
         shop_id = metadata.get('shop_id')
         user_id = metadata.get('user_id')
@@ -808,6 +823,21 @@ class AIReplyHandler(BaseHandler):
                 f"session_key={session_key}, reason={reason}"
             )
             return True
+
+        # 2026-09-05：转人工瞬间先发一句"核实/处理类"安抚话术（像真人），
+        # 保住三分钟回复率。失败不阻断转人工主流程。
+        try:
+            from Message.handlers.handoff_soother import (
+                classify_category,
+                pick_soother,
+            )
+
+            category = classify_category(intent=intent, reason=reason)
+            soother = pick_soother(category, session_key=session_key)
+            await self._send_reply(context, soother, metadata)
+            self.logger.info(f"已发送转人工安抚话术: category={category}, text={soother!r}")
+        except Exception as e:  # pragma: no cover
+            self.logger.warning(f"转人工安抚话术发送失败（不阻断转接）: {type(e).__name__}: {e}")
 
         from Agent.CustomerAgent.tools.move_conversation import (
             transfer_conversation,
@@ -1378,10 +1408,9 @@ class AIReplyHandler(BaseHandler):
     async def _handle_fallback(self, context: Context, metadata: Dict[str, Any]) -> bool:
         """AI 回复失败时的兜底处理。
 
-        不发送任何话术给买家（bot 扮演的就是真人客服，出现"客服正在为您处理"
-        等机器话术会暴露身份），直接静默转人工：
-        - 标记会话转人工，通知企业微信人工客服接手；
-        - 买家侧无任何机器回复，避免露馅。
+        2026-09-05 起：转人工瞬间由 _transfer_by_intent 自动补发一条"核实/处理类"
+        拖延话术（像真人客服在帮忙查），再静默转人工标记会话、通知企业微信人工客服
+        接手。买家不会看到"系统错误/请稍后再试"等露馅话术，也不会长时间无人应答。
         """
         try:
             # 记录备用处理日志（仅日志，不发送）
