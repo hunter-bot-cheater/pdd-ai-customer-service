@@ -2315,19 +2315,19 @@ class TestIntegerMeterPlan(unittest.TestCase):
     """
 
     def test_basic_cases(self):
-        """覆盖 4~15 米的典型组合（同规格优先 + 贪心 tie-breaker）"""
+        """覆盖 4~15 米的典型组合（同规格覆盖优先）"""
         from Message.handlers.integer_meter import compute_integer_meter_plan
         cases = {
             1: [(1, 1)],
             2: [(2, 1)],
             3: [(3, 1)],
-            4: [(2, 2)],          # 同规格优先（2件2米 优于 1件3米+1件1米）
-            5: [(3, 1), (2, 1)],  # 无法同规格，贪心 2件混搭
+            4: [(2, 2)],          # 同规格覆盖优先（2件2米）
+            5: [(3, 1), (2, 1)],  # 无规格整除，贪心 2件混搭
             6: [(3, 2)],
-            7: [(3, 1), (2, 2)],
-            8: [(3, 2), (2, 1)],  # 贪心 3件 优于 同规格 4件2米
+            7: [(3, 1), (2, 2)],  # 无规格整除，贪心 3件混搭（不用 7件1米）
+            8: [(2, 4)],          # 同规格覆盖优先（4件2米）
             9: [(3, 3)],
-            10: [(3, 2), (2, 2)],  # 贪心 4件 优于 同规格 5件2米
+            10: [(2, 5)],         # 同规格覆盖优先（5件2米）
             11: [(3, 3), (2, 1)],
             12: [(3, 4)],
             13: [(3, 3), (2, 2)],
@@ -2371,10 +2371,10 @@ class TestIntegerMeterPlan(unittest.TestCase):
             format_integer_meter_plan(compute_integer_meter_plan(12)),
             "4件3米",
         )
-        # 10米 贪心 4件混搭（不是 5件2米）
+        # 10米 同规格覆盖优先：5件2米
         self.assertEqual(
             format_integer_meter_plan(compute_integer_meter_plan(10)),
-            "2件3米 + 2件2米",
+            "5件2米",
         )
 
     def test_invalid_input(self):
@@ -2420,10 +2420,10 @@ class TestZeroPointFiveMeterPlan(unittest.TestCase):
             2.5: [(2.5, 1)],
             3: [(3, 1)],
             3.5: [(2.5, 1), (1, 1)],  # 2.5+1 = 3.5
-            4.5: [(3, 1), (1.5, 1)],  # 2件混搭（2.5+2 或 3+1.5 均可，件数最少优先）
+            4.5: [(1.5, 3)],          # 同规格覆盖优先：3件1.5米（2026-09-05 确认）
             5.5: [(3, 1), (2.5, 1)],  # 3+2.5 = 5.5 ✓ 用户原始 case
-            6.5: [(2.5, 1), (2, 2)],  # 2.5+4 = 6.5（3件 2 种规格）
-            7.5: [(2.5, 3)],          # 全部同规格 7.5（3件且件数最少）
+            6.5: [(2.5, 1), (2, 2)],  # 2.5+4 = 6.5（3件 2 种规格，无规格整除）
+            7.5: [(2.5, 3)],          # 全部同规格 7.5（3件2.5米）
         }
         # 0.5 米规格没有，跳过
         cases.pop(0.5)
@@ -2467,11 +2467,11 @@ class TestZeroPointFiveMeterPlan(unittest.TestCase):
         self.assertEqual(compute_0p5_meter_plan(4), [(2, 2)])
         self.assertEqual(compute_0p5_meter_plan(6), [(3, 2)])
 
-    def test_4p5_accepts_two_piece_mix(self):
-        """4.5米允许 2件混搭（2.5+2 或 3+1.5），不能是 3件1.5米（用户反馈）"""
-        from Message.handlers.integer_meter import compute_0p5_meter_plan, total_pieces
+    def test_4p5_same_spec_three_pieces(self):
+        """4.5米必须是 3件1.5米（同规格覆盖优先，用户 2026-09-05 确认）"""
+        from Message.handlers.integer_meter import compute_0p5_meter_plan
         plan = compute_0p5_meter_plan(4.5)
-        self.assertEqual(total_pieces(plan), 2, f"4.5米应为 2 件方案: {plan}")
+        self.assertEqual(plan, [(1.5, 3)], f"4.5米应为 3件1.5米: {plan}")
 
     def test_5p5_user_case(self):
         """5.5米 = 1件3米 + 1件2.5米（用户原始反馈）"""

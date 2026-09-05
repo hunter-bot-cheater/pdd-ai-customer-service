@@ -47,8 +47,10 @@ def _greedy_integer_plan(meter: int) -> List[Tuple[int, int]]:
 def compute_integer_meter_plan(meter: int) -> List[Tuple[int, int]]:
     """计算 X 米的整数米组合方案（普通花型，规格 [1, 2, 3]）。
 
-    策略：贪心最少件数 + 同规格优先（仅当同规格件数 ≤ greedy 件数才用同规格）。
-    这样 4米→[(2,2)]（同规格胜出），8米→[(3,2),(2,1)]（greedy 3 件胜同规格 4 件）。
+    策略：**同规格多件覆盖优先**（能全部用同一规格就优先，如 4米→2件2米、
+    6米→2件3米、8米→4件2米）；仅当件数比贪心最少件数多出太多（> 贪心件数+1）
+    时才退回贪心最少件数混搭（如 7米→1件3米+2件2米，因为 7件1米 不现实）。
+    1米 规格只在凑数时使用，不作为"同规格优先"的候选（避免 7米→7件1米）。
 
     Args:
         meter: 整数米数（X ≥ 1）。
@@ -68,11 +70,11 @@ def compute_integer_meter_plan(meter: int) -> List[Tuple[int, int]]:
     greedy = _greedy_integer_plan(meter)
     greedy_count = sum(n for _, n in greedy)
 
-    # 同规格候选（最大规格优先，件数更少）
+    # 同规格优先：能整除 3 或 2 时，用同规格多件（件数 ≤ 贪心件数 + 1 才采用）
     for spec in [3, 2]:
         if meter % spec == 0:
             n = meter // spec
-            if n <= greedy_count:
+            if n <= greedy_count + 1:
                 return [(spec, n)]
 
     return greedy
@@ -108,9 +110,19 @@ def compute_0p5_meter_plan(meter: float) -> List[Tuple[float, int]]:
     specs_float = [3.0, 2.5, 2.0, 1.5, 1.0]
     specs_int = sorted([int(round(s * 2)) for s in specs_float], reverse=True)
 
-    # DP：件数最少优先；件数相同时规格种类最少（同规格）优先。
-    # 这样 4米→[(2,2)]（2件同规格胜 1件3米+1件1米）、7.5米→[(2.5,3)]（3件全同规格），
-    # 而 4.5米→[(3,1),(1.5,1)] 或 [(2.5,1),(2,1)]（2件混搭，件数最少胜 3件1.5米）。
+    # 同规格多件覆盖优先（能全部用同一规格就优先，如 4米→2件2米、6米→2件3米、
+    # 4.5米→3件1.5米、7.5米→3件2.5米）。容忍：同规格件数 ≤ ceil(X/3) + 1 才采用
+    # （避免 10.5米→7件1.5米 这种件数过多的同规格方案，此时退回 DP 混搭）。
+    import math
+
+    max_same_count = math.ceil(meter / 3) + 1
+    for spec in specs_float:
+        if abs(meter / spec - round(meter / spec)) < 0.01:
+            n = int(round(meter / spec))
+            if n > 0 and n <= max_same_count:
+                return [(spec, n)]
+
+    # DP：件数最少优先；件数相同时规格种类最少（同规格）优先（兜底混搭路径）。
     # dp[i] = 最少件数；dp_kinds[i] = 同件数下的最少规格种类
     INF = float("inf")
     dp = [INF] * (N + 1)
